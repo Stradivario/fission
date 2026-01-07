@@ -7,6 +7,38 @@ entries:
         url: https://raw.githubusercontent.com/fission/fission-charts/main/public_key/pgp_keys.asc
     apiVersion: v2
     appVersion: v1.22.1-watch-all-namespaces
+    created: "2026-01-07T18:22:42.007778753Z"
+    description: Fission is a fast serverless framework for Kubernetes.
+    digest: efb5915c24c89acf015da7ec7bf10928355fbe11a555f5411e10e1caaf14f9bf
+    home: https://fission.io/
+    icon: https://fission.io/images/fission-logo-white.svg
+    keywords:
+    - fission
+    - serverless
+    - platform
+    - faas
+    - functions
+    - Integration & Delivery
+    kubeVersion: '>=1.28.0-0'
+    maintainers:
+    - email: vishal@infracloud.io
+      name: Vishal Biyani
+    - email: sanket@infracloud.io
+      name: Sanket Sudake
+    name: fission-all
+    sources:
+    - https://github.com/fission/fission
+    - https://github.com/fission/keda-connectors
+    type: application
+    urls:
+    - https://github.com/Stradivario/fission/releases/download/fission-all-1.22.4-watch-all-namespaces/fission-all-1.22.4-watch-all-namespaces.tgz
+    version: 1.22.4-watch-all-namespaces
+  - annotations:
+      artifacthub.io/signKey: |
+        fingerprint: 2EAE29FDF8A387050C82CD5ABBDD4FD6A1FFCBF6
+        url: https://raw.githubusercontent.com/fission/fission-charts/main/public_key/pgp_keys.asc
+    apiVersion: v2
+    appVersion: v1.22.1-watch-all-namespaces
     created: "2026-01-07T18:17:30.127415433Z"
     description: Fission is a fast serverless framework for Kubernetes.
     digest: 1c633d177c8cb314782de7f0a4bc9b8f98e6dc893cf35340eb0a2e543b1cd771
@@ -65,4 +97,4 @@ entries:
     urls:
     - https://github.com/Stradivario/fission/releases/download/fission-all-1.22.2-watch-all-namespaces/fission-all-1.22.2-watch-all-namespaces.tgz
     version: 1.22.2-watch-all-namespaces
-generated: "2026-01-07T18:17:30.127427446Z"
+generated: "2026-01-07T18:22:42.00780397Z"
