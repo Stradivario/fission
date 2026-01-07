@@ -3,9 +3,10 @@ name: Release Charts
 on:
   push:
     branches:
-      - feature/allow-all-namespaces
+      - release/custom-v1.22.1
     paths:
       - 'charts/**'
+
 
 jobs:
   release:
