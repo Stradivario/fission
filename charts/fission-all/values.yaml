@@ -19,7 +19,7 @@ repository: ghcr.io/stradivario
 ## image represents the base image fission-bundle used by multiple Fission components.
 ## We alter arguments to the image to run a particular component.
 ##
-image: fission/fission-bundle
+image: fission-bundle
 
 ## imageTag represents the tag of the base image fission-bundle used by multiple Fission components.
 ## It is also used by the chart to identify version of the few more images apart from fission-bundle.
@@ -129,7 +129,7 @@ fetcher:
   ## By default, it is empty, which means global repository will be used.
   repository: "ghcr.io/stradivario"
   ## image represents the image of the fetcher component.
-  image: fission/fetcher
+  image: fetcher
   ## imageTag represents the tag of the image of the fetcher component.
   imageTag: v1.22.1-watch-all-namespaces
 
@@ -710,14 +710,14 @@ preUpgradeChecks:
   repository: "ghcr.io/stradivario"
   ## pre-install/pre-upgrade checks live in this image
   ##
-  image: fission/pre-upgrade-checks
+  image: pre-upgrade-checks
   ## pre-install/pre-upgrade checks image version
   ##
   imageTag: v1.22.1-watch-all-namespaces
 
 ## Fission post-install/post-upgrade reporting live in this image
 ##
-postInstallReportImage: fission/reporter
+postInstallReportImage: reporter
 
 ## If there are any pod specialization errors when a function is triggered, the error
 ## summary is returned as part of http response if this is set to true.
