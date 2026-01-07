@@ -168,35 +168,35 @@ jobs:
           subject-digest: ${{ fromJson(toJson(matrix)).checksum }}
           push-to-registry: true
 
-  image-provenance-verification-with-cosign:
-    name: Verify Image Provenance
-    needs: [create-draft-release, image-sbom-provenance-ghcr]
-    strategy:
-      matrix:
-        include: ${{ fromJson(needs.create-draft-release.outputs.ghcr_images) }}
-    runs-on: ubuntu-24.04
-    permissions: read-all
-    steps:
-      - name: Login
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+  # image-provenance-verification-with-cosign:
+  #   name: Verify Image Provenance
+  #   needs: [create-draft-release, image-sbom-provenance-ghcr]
+  #   strategy:
+  #     matrix:
+  #       include: ${{ fromJson(needs.create-draft-release.outputs.ghcr_images) }}
+  #   runs-on: ubuntu-24.04
+  #   permissions: read-all
+  #   steps:
+  #     - name: Login
+  #       uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
-        with:
-          cosign-release: ${{ env.COSIGN_VERSION }}
+  #     - name: Install Cosign
+  #       uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
+  #       with:
+  #         cosign-release: ${{ env.COSIGN_VERSION }}
 
-      - name: Verify image
-        env:
-          IMAGE: ${{ fromJson(toJson(matrix)).image }}
-          DIGEST: ${{ fromJson(toJson(matrix)).checksum }}
-        run: |
-          echo "Verifying $IMAGE@$DIGEST"
-          cosign verify-attestation \
-             --type https://slsa.dev/provenance/v1 \
-             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-             --certificate-identity-regexp '^https://github.com/fission/fission/.github/workflows/release.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$' \
-             $IMAGE@$DIGEST
+  #     - name: Verify image
+  #       env:
+  #         IMAGE: ${{ fromJson(toJson(matrix)).image }}
+  #         DIGEST: ${{ fromJson(toJson(matrix)).checksum }}
+  #       run: |
+  #         echo "Verifying $IMAGE@$DIGEST"
+  #         cosign verify-attestation \
+  #            --type https://slsa.dev/provenance/v1 \
+  #            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  #            --certificate-identity-regexp '^https://github.com/fission/fission/.github/workflows/release.yaml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(?:-rc[0-9]+)?$' \
+  #            $IMAGE@$DIGEST

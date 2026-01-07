@@ -14,7 +14,7 @@ routerServiceType: LoadBalancer
 ## repository represents base repository for images used in the chart.
 ## Keep it empty for using existing local image
 ##
-repository: ghcr.io
+repository: ghcr.io/stradivario
 
 ## image represents the base image fission-bundle used by multiple Fission components.
 ## We alter arguments to the image to run a particular component.
@@ -29,7 +29,7 @@ imageTag: v1.22.0
 
 ## pullPolicy represents the pull policy to use for images in the chart.
 ##
-pullPolicy: IfNotPresent
+pullPolicy: Always
 
 ## imagepullsecrets
 imagePullSecrets: []
@@ -127,7 +127,7 @@ fetcher:
   ## repository represents the repository of the fetcher component.
   ##
   ## By default, it is empty, which means global repository will be used.
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## image represents the image of the fetcher component.
   image: fission/fetcher
   ## imageTag represents the tag of the image of the fetcher component.
@@ -707,7 +707,7 @@ preUpgradeChecks:
   ## Repository for pre-install/pre-upgrade checks image
   ## By default it uses the global repository
   ##
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## pre-install/pre-upgrade checks live in this image
   ##
   image: fission/pre-upgrade-checks
