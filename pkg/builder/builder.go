@@ -63,13 +63,15 @@ type (
 	Builder struct {
 		logger           *zap.Logger
 		sharedVolumePath string
+		sem              chan struct{}
 	}
 )
 
-func MakeBuilder(logger *zap.Logger, sharedVolumePath string) *Builder {
+func MakeBuilder(logger *zap.Logger, sharedVolumePath string, maxParallelBuilds int) *Builder {
 	return &Builder{
 		logger:           logger.Named("builder"),
 		sharedVolumePath: sharedVolumePath,
+		sem:              make(chan struct{}, maxParallelBuilds),
 	}
 }
 
@@ -100,6 +102,27 @@ func (builder *Builder) Handler(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		elapsed := time.Since(startTime)
 		logger.Info("build request complete", zap.Duration("elapsed_time", elapsed))
+	}()
+
+	// Try to acquire semaphore - log queue status
+	queuedBuilds := len(builder.sem)
+	if queuedBuilds > 0 {
+		logger.Info("build queued - waiting for semaphore",
+			zap.Int("queued_builds", queuedBuilds),
+			zap.Int("max_parallel_builds", cap(builder.sem)))
+	}
+
+	// Acquire semaphore to ensure max parallel builds
+	builder.sem <- struct{}{}
+	logger.Info("build started - semaphore acquired",
+		zap.Int("active_builds", len(builder.sem)),
+		zap.Int("max_parallel_builds", cap(builder.sem)))
+
+	defer func() {
+		<-builder.sem
+		logger.Info("build finished - semaphore released",
+			zap.Int("remaining_builds", len(builder.sem)),
+			zap.Int("max_parallel_builds", cap(builder.sem)))
 	}()
 
 	// parse request

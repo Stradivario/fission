@@ -84,6 +84,7 @@ func (w *packageBuildWatcher) watch(ctx context.Context) {
 			if pkg.Status.BuildStatus == fv1.BuildStatusNone {
 				continue
 			}
+			// CLI watch must wait for both Pending AND Running builds to complete
 			if pkg.Status.BuildStatus == fv1.BuildStatusPending ||
 				pkg.Status.BuildStatus == fv1.BuildStatusRunning {
 				keepWaiting = true

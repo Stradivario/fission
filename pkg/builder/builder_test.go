@@ -35,7 +35,7 @@ func TestBuilder(t *testing.T) {
 
 	dir, err := os.MkdirTemp("/tmp", "fission-builder-test")
 	require.NoError(t, err)
-	builder := MakeBuilder(logger, dir)
+	builder := MakeBuilder(logger, dir, 1) // Default to 1 for tests
 
 	// Test VersionHandler
 	t.Run("VersionHandler", func(t *testing.T) {

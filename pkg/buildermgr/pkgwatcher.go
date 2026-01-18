@@ -264,7 +264,9 @@ func (pkgw *packageWatcher) packageInformerHandler(ctx context.Context) k8sCache
 			return
 		}
 		// Only build pending state packages.
-		if pkg.Status.BuildStatus == fv1.BuildStatusPending || pkg.Status.BuildStatus == fv1.BuildStatusRunning {
+		// DO NOT build packages with BuildStatusRunning - they are already building!
+		// Building running packages causes infinite loops when builder pod is not ready.
+		if pkg.Status.BuildStatus == fv1.BuildStatusPending {
 			pkgw.buildWithCache(ctx, pkg)
 		}
 	}

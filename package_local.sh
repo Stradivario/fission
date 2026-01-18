@@ -4,11 +4,27 @@ set -e
 VERSION="v1.22.0-local"
 DIST_DIR="./dist-local"
 
-echo "Building Fission Bundle Binary..."
+echo "Building all Fission binaries..."
 mkdir -p $DIST_DIR
+
 # Build binary
 GO_BIN=$HOME/.go_local/go/bin/go
+
+# Build fission-bundle
+echo "  - Building fission-bundle..."
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $GO_BIN build -o $DIST_DIR/fission-bundle ./cmd/fission-bundle
+
+# Build fetcher
+echo "  - Building fetcher..."
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $GO_BIN build -o $DIST_DIR/fetcher ./cmd/fetcher
+
+# Build pre-upgrade-checks
+echo "  - Building pre-upgrade-checks..."
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $GO_BIN build -o $DIST_DIR/pre-upgrade-checks ./cmd/preupgradechecks
+
+# Build reporter
+echo "  - Building reporter..."
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $GO_BIN build -o $DIST_DIR/reporter ./cmd/reporter
 
 echo "Preparing Helm Chart..."
 # Remove old chart copy if exists to prevent nesting
@@ -21,14 +37,41 @@ sed -i "s/watchAllNamespaces: false/watchAllNamespaces: true/" $DIST_DIR/fission
 echo "Packaging Helm Chart..."
 helm package $DIST_DIR/fission-all -d $DIST_DIR --version 1.22.0-local --app-version 1.22.0-local
 
-echo "Done!"
 TIMESTAMP=$(date +%s)
 TAG="local-$TIMESTAMP"
 
-echo "Building Docker Image with tag $TAG..."
+echo "Building Docker images with tag $TAG..."
+
+# Build fission-bundle
 docker build -t ghcr.io/fission/fission-bundle:$TAG -f cmd/fission-bundle/Dockerfile --build-arg TARGETPLATFORM=dist-local .
 minikube image load ghcr.io/fission/fission-bundle:$TAG
 
-echo "Artifacts are in $DIST_DIR"
-echo "To install the chart run:"
-echo "  helm upgrade --install fission $DIST_DIR/fission-all-1.22.0-local.tgz --namespace fission --create-namespace --set imageTag=$TAG --set preUpgradeChecks.imageTag=v1.22.0 --set analytics=false --set pullPolicy=Never"
+# Build fetcher
+docker build -t ghcr.io/fission/fetcher:$TAG -f cmd/fetcher/Dockerfile --build-arg TARGETPLATFORM=dist-local .
+minikube image load ghcr.io/fission/fetcher:$TAG
+
+# Build pre-upgrade-checks
+docker build -t ghcr.io/fission/pre-upgrade-checks:$TAG -f cmd/preupgradechecks/Dockerfile --build-arg TARGETPLATFORM=dist-local .
+minikube image load ghcr.io/fission/pre-upgrade-checks:$TAG
+
+# Build reporter
+docker build -t ghcr.io/fission/reporter:$TAG -f cmd/reporter/Dockerfile --build-arg TARGETPLATFORM=dist-local .
+minikube image load ghcr.io/fission/reporter:$TAG
+
+echo ""
+echo "✓ All images built and loaded into Minikube!"
+echo "✓ Artifacts are in $DIST_DIR"
+echo ""
+echo "To install the chart, run:"
+echo ""
+echo "  helm upgrade --install fission $DIST_DIR/fission-all-1.22.0-local.tgz \\"
+echo "    --namespace fission --create-namespace \\"
+echo "    --set repository=ghcr.io/fission \\"
+echo "    --set imageTag=$TAG \\"
+echo "    --set fetcher.repository=ghcr.io/fission \\"
+echo "    --set fetcher.imageTag=$TAG \\"
+echo "    --set preUpgradeChecks.repository=ghcr.io/fission \\"
+echo "    --set preUpgradeChecks.imageTag=$TAG \\"
+echo "    --set analytics=false \\"
+echo "    --set pullPolicy=Never"
+echo ""

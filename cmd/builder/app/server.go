@@ -19,6 +19,8 @@ package app
 import (
 	"context"
 	"net/http"
+	"os"
+	"strconv"
 
 	"go.uber.org/zap"
 
@@ -29,7 +31,21 @@ import (
 
 // Usage: builder <shared volume path>
 func Run(ctx context.Context, logger *zap.Logger, mgr manager.Interface, shareVolume string) {
-	builder := builder.MakeBuilder(logger, shareVolume)
+	// Parse MAX_PARALLEL_BUILDS from env
+	maxParallelBuilds := 1
+	if envMaxParallelBuilds := os.Getenv("MAX_PARALLEL_BUILDS"); envMaxParallelBuilds != "" {
+		if val, err := strconv.Atoi(envMaxParallelBuilds); err == nil {
+			if val > 0 {
+				maxParallelBuilds = val
+			} else {
+				logger.Warn("MAX_PARALLEL_BUILDS must be greater than 0, defaulting to 1", zap.Int("invalid_value", val))
+			}
+		} else {
+			logger.Warn("Invalid MAX_PARALLEL_BUILDS value, defaulting to 1", zap.String("error", err.Error()))
+		}
+	}
+
+	builder := builder.MakeBuilder(logger, shareVolume, maxParallelBuilds)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", builder.Handler)
 	mux.HandleFunc("/clean", builder.Clean)
