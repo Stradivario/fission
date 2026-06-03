@@ -17,7 +17,7 @@ tag drives the images and the branch push drives the chart.
 
 ---
 
-## TL;DR — cut version `X.Y.Z` (example below uses `1.22.6 → 1.22.7`)
+## TL;DR — cut version `X.Y.Z` (example below uses `1.22.7 → 1.22.8`)
 
 ```bash
 # 0. clean tree on the fork branch
@@ -34,25 +34,25 @@ git add -A
 git commit -m "fix(...): what you changed"
 
 # 3. tag THAT commit + push the TAG -> release.yaml builds & pushes images, draft release
-git tag v1.22.7-watch-all-namespaces
-git push origin v1.22.7-watch-all-namespaces
+git tag v1.22.8-watch-all-namespaces
+git push origin v1.22.8-watch-all-namespaces
 #    ...watch Actions "Create Draft release"; when green, confirm images in GHCR,
 #    then MANUALLY publish the draft release on GitHub.
 
 # 4. NOW bump the FOUR version fields, in a commit that is NEWER than the tag
-#    Chart.yaml: version 1.22.7-watch-all-namespaces, appVersion v1.22.7-watch-all-namespaces
-#    values.yaml: imageTag, fetcher.imageTag, preUpgradeChecks.imageTag = v1.22.7-watch-all-namespaces
+#    Chart.yaml: version 1.22.8-watch-all-namespaces, appVersion v1.22.8-watch-all-namespaces
+#    values.yaml: imageTag, fetcher.imageTag, preUpgradeChecks.imageTag = v1.22.8-watch-all-namespaces
 git add charts/
-git commit -m "Bump to v1.22.7-watch-all-namespaces"
+git commit -m "Bump to v1.22.8-watch-all-namespaces"
 
 # 5. push the BRANCH (charts changed) -> chart-publish.yaml publishes the chart
 git push origin release/custom-v1.22.1
 
 # 6. verify + upgrade a cluster
 helm repo update
-helm search repo fission-custom/fission-all --versions    # 1.22.7 should appear
+helm search repo fission-custom/fission-all --versions    # 1.22.8 should appear
 helm upgrade --install fission fission-custom/fission-all -n fission \
-  --version 1.22.7-watch-all-namespaces
+  --version 1.22.8-watch-all-namespaces
 ```
 
 > **Why this exact order (read the "chart didn't publish" gotcha below):**
@@ -66,15 +66,15 @@ helm upgrade --install fission fission-custom/fission-all -n fission \
 
 ## Version source of truth (bump these by hand — CI does not)
 
-| File | Field(s) | Approx. line | Value for `1.22.7` |
+| File | Field(s) | Approx. line | Value for `1.22.8` |
 |------|----------|--------------|--------------------|
-| `charts/fission-all/Chart.yaml` | `version` | 3 | `1.22.7-watch-all-namespaces` (no leading `v`) |
-| `charts/fission-all/Chart.yaml` | `appVersion` | 4 | `v1.22.7-watch-all-namespaces` (with `v`) |
-| `charts/fission-all/values.yaml` | `imageTag` | ~28 | `v1.22.7-watch-all-namespaces` |
-| `charts/fission-all/values.yaml` | `fetcher.imageTag` | ~134 | `v1.22.7-watch-all-namespaces` |
-| `charts/fission-all/values.yaml` | `preUpgradeChecks.imageTag` | ~716 | `v1.22.7-watch-all-namespaces` |
+| `charts/fission-all/Chart.yaml` | `version` | 3 | `1.22.8-watch-all-namespaces` (no leading `v`) |
+| `charts/fission-all/Chart.yaml` | `appVersion` | 4 | `v1.22.8-watch-all-namespaces` (with `v`) |
+| `charts/fission-all/values.yaml` | `imageTag` | ~28 | `v1.22.8-watch-all-namespaces` |
+| `charts/fission-all/values.yaml` | `fetcher.imageTag` | ~134 | `v1.22.8-watch-all-namespaces` |
+| `charts/fission-all/values.yaml` | `preUpgradeChecks.imageTag` | ~716 | `v1.22.8-watch-all-namespaces` |
 
-**Tag format:** `vX.Y.Z-watch-all-namespaces` (e.g. `v1.22.7-watch-all-namespaces`).
+**Tag format:** `vX.Y.Z-watch-all-namespaces` (e.g. `v1.22.8-watch-all-namespaces`).
 The git tag and `appVersion` keep the leading `v`; `Chart.yaml` `version` omits it.
 
 ### ⚠️ The imageTag gotcha (read this)
@@ -140,7 +140,7 @@ together** (and realign them if they have drifted).
 
 ```bash
 # the tags should resolve in GHCR once "Create Draft release" is green
-docker manifest inspect ghcr.io/stradivario/fission-bundle:v1.22.7-watch-all-namespaces >/dev/null && echo OK
+docker manifest inspect ghcr.io/stradivario/fission-bundle:v1.22.8-watch-all-namespaces >/dev/null && echo OK
 # or browse: https://github.com/orgs/Stradivario/packages
 ```
 
@@ -172,7 +172,7 @@ helm repo update
   changed **since the latest git tag** (`git diff <latest-tag> -- charts/`). If you
   put the version bump in the **same commit** you tag, that diff is empty and the
   chart is silently skipped — the images publish but the chart does not (this hit
-  1.22.7). **Prevent:** keep the bump in a commit *newer* than the tag (steps 3→4
+  1.22.8). **Prevent:** keep the bump in a commit *newer* than the tag (steps 3→4
   above). **Recover:** make any fresh `charts/` commit (e.g. add an
   `artifacthub.io/changes` annotation to `Chart.yaml`) and push the branch — the
   diff is now non-empty, so chart-releaser publishes `fission-all-<version>`.
