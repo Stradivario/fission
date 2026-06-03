@@ -91,6 +91,64 @@ kubectl get pods -n fission
 
 ---
 
+## 3b. Alternative: build & deploy to minikube (`package_local.sh`)
+
+The section above targets **kind** via skaffold. `package_local.sh` is a
+self-contained script for a **minikube** cluster: it builds the control-plane
+binaries from this checkout, bakes them into images, side-loads them into
+minikube, and prints the `helm upgrade` command. Use it to test a local code
+change (e.g. an `executor`/`buildermgr` edit) on minikube.
+
+Prereqs: a running minikube (`minikube status`), Docker, and Helm. The script
+bootstraps with `$HOME/.go_local/go/bin/go`; with `GOTOOLCHAIN=auto` (the
+default) that older Go auto-fetches the toolchain pinned in `go.mod`, so the
+binaries still build with the right version.
+
+```bash
+./package_local.sh
+```
+
+What it does:
+
+1. Builds `fission-bundle`, `fetcher`, `pre-upgrade-checks`, `reporter` into
+   `./dist-local` (`CGO_ENABLED=0`, linux/amd64). `dist-local/` is gitignored.
+2. Copies `charts/fission-all` into `dist-local`, flips `watchAllNamespaces` to
+   `true`, and `helm package`s it as `fission-all-1.22.0-local.tgz`.
+3. Builds the four images as `ghcr.io/fission/<name>:local-<timestamp>` and
+   `minikube image load`s each into the cluster.
+4. Prints the `helm upgrade --install` command to copy/paste.
+
+Then deploy with the printed command — note `pullPolicy=Never` (use the
+side-loaded images, never pull) and `repository=ghcr.io/fission` (match the
+local tags), substituting the `local-<timestamp>` it printed:
+
+```bash
+helm upgrade --install fission ./dist-local/fission-all-1.22.0-local.tgz \
+  --namespace fission --create-namespace \
+  --set repository=ghcr.io/fission \
+  --set imageTag=local-<timestamp> \
+  --set fetcher.repository=ghcr.io/fission \
+  --set fetcher.imageTag=local-<timestamp> \
+  --set preUpgradeChecks.repository=ghcr.io/fission \
+  --set preUpgradeChecks.imageTag=local-<timestamp> \
+  --set analytics=false \
+  --set pullPolicy=Never
+```
+
+Verify the control plane rolled onto the new image:
+
+```bash
+kubectl get pods -n fission
+kubectl get pod -n fission -l svc=executor \
+  -o jsonpath='{.items[0].spec.containers[0].image}'   # -> ...:local-<timestamp>
+```
+
+> `package_local.sh` rebuilds only the four control-plane binaries, **not** the
+> `fission` CLI — build that via section 2. It does not push to a registry; the
+> images live only in minikube.
+
+---
+
 ## 4. Smoke-test a function
 
 Uses the upstream Node environment image (same images the CI uses in
