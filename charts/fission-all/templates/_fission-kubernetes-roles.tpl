@@ -25,9 +25,18 @@ rules:
   - apps
   resources:
   - deployments
+  # deployments/scale is required by the builder scale-to-zero reaper
+  # (GetScale/UpdateScale): the reaper scales idle builders to 0 and the build
+  # path scales them back to 1. Without get/update on the scale subresource the
+  # buildermgr SA is RBAC-forbidden and builds fail to dispatch.
+  - deployments/scale
   verbs:
+  - get
   - list
+  - watch
   - create
+  - update
+  - patch
   - delete
 - apiGroups:
   - apiextensions.k8s.io

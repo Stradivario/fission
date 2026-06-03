@@ -67,13 +67,14 @@ How often the reaper checks for idle builders. Resolved by
 | `pkg/executor/util/util.go` | `GetBuilderIdleReaperInterval` |
 | `pkg/fission-cli/flag/key/key.go`, `flag/flag.go`, `cmd/environment/{command,create,update}.go` | `--builder-idletimeout` CLI flag |
 | `pkg/buildermgr/scaletozero_test.go` | Unit tests |
+| `charts/fission-all/templates/_fission-kubernetes-roles.tpl` | buildermgr ClusterRole: `deployments/scale` + `deployments` `get`/`update` — **required**, else `GetScale`/`UpdateScale` are RBAC-forbidden and builds fail |
 
 > Regeneration: after changing `pkg/apis/core/v1/types.go`, run
 > `make generate-crds` and `make generate-swagger-doc`.
 
 ## Correctness fixes applied during review
 
-The initial implementation had three bugs that were fixed:
+The initial implementation had four bugs that were fixed:
 
 1. **`lastBuildTime` was never initialized**, so every freshly created builder was
    scaled to 0 on the first reaper tick regardless of the timeout. Now set to
@@ -85,6 +86,15 @@ The initial implementation had three bugs that were fixed:
    per tick.** It now snapshots the cache under the lock and scales outside it, and
    caches `idleTimeout` in `builderInfo` instead of fetching the Environment each
    tick.
+4. **Missing RBAC for the scale subresource.** The chart's buildermgr ClusterRole
+   granted only `deployments [list, create, delete]`, so `GetScale`/`UpdateScale`
+   were forbidden: the reaper could not scale builders down and — worse —
+   `ensureBuilderReady` could not scale a 0-replica builder back to 1, so **every
+   build whose builder was idle failed** at "ensuring builder ready"
+   (`cannot get resource deployments/scale`). The package was marked `failed`, the
+   function never specialized, and the router returned "error sending request to
+   function" for both poolmgr and newdeploy. Fixed by adding `deployments/scale`
+   (`get`/`update`) to `buildermgr-kuberules`.
 
 ## Testing
 
