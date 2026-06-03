@@ -31,11 +31,12 @@ func (AuthLogin) SwaggerDoc() map[string]string {
 }
 
 var map_Builder = map[string]string{
-	"":          "Builder is the setting for environment builder.",
-	"image":     "Image for containing the language compilation environment.",
-	"command":   "(Optional) Default build command to run for this build environment.",
-	"container": "(Optional) Container allows the modification of the deployed builder container using the Kubernetes Container spec. Fission overrides the following fields: - Name - Image; set to the Builder.Image - Command; set to the Builder.Command - TerminationMessagePath - ImagePullPolicy - ReadinessProbe",
-	"podspec":   "PodSpec will store the spec of the pod that will be applied to the pod created for the builder",
+	"":            "Builder is the setting for environment builder.",
+	"image":       "Image for containing the language compilation environment.",
+	"command":     "(Optional) Default build command to run for this build environment.",
+	"container":   "(Optional) Container allows the modification of the deployed builder container using the Kubernetes Container spec. Fission overrides the following fields: - Name - Image; set to the Builder.Image - Command; set to the Builder.Command - TerminationMessagePath - ImagePullPolicy - ReadinessProbe",
+	"podspec":     "PodSpec will store the spec of the pod that will be applied to the pod created for the builder",
+	"idleTimeout": "IdleTimeout specifies the length of time (in seconds) that a builder is idle before it is eligible for scaling to zero. If no builds are triggered within the idle timeout, the builder deployment will be scaled to zero to release resources. Defaults to 600 seconds (10 minutes) if not set.",
 }
 
 func (Builder) SwaggerDoc() map[string]string {

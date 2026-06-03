@@ -60,7 +60,9 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger *
 		logger.Warn("error reading data for pod spec patch", zap.String("path", fv1.BuilderPodSpecPath), zap.Error(err))
 	}
 
-	envWatcher, err := makeEnvironmentWatcher(ctx, bmLogger, fissionClient, kubernetesClient, fetcherConfig, podSpecPatch)
+	builderReaperInterval := time.Duration(util.GetBuilderIdleReaperInterval(bmLogger, 10)) * time.Second
+
+	envWatcher, err := makeEnvironmentWatcher(ctx, bmLogger, fissionClient, kubernetesClient, fetcherConfig, podSpecPatch, builderReaperInterval)
 	if err != nil {
 		return err
 	}
@@ -69,7 +71,8 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger *
 	pkgWatcher := makePackageWatcher(bmLogger, fissionClient,
 		kubernetesClient, storageSvcUrl,
 		utils.GetK8sInformersForNamespaces(kubernetesClient, time.Minute*30, fv1.Pods),
-		utils.GetInformersForNamespaces(fissionClient, time.Minute*30, fv1.PackagesResource))
+		utils.GetInformersForNamespaces(fissionClient, time.Minute*30, fv1.PackagesResource),
+		envWatcher)
 	err = pkgWatcher.Run(ctx, mgr)
 	if err != nil {
 		return err

@@ -128,20 +128,21 @@ const (
 	MqtSecret          = "secret"
 	MqtKind            = "mqtkind"
 
-	EnvName            = resourceName
-	EnvPoolsize        = "poolsize"
-	EnvImage           = "image"
-	EnvBuilderImage    = "builder"
-	EnvBuildcommand    = "buildcmd"
-	EnvKeeparchive     = "keeparchive"
-	EnvExternalNetwork = "externalnetwork"
-	EnvGracePeriod     = "graceperiod"
-	EnvVersion         = "version"
-	EnvImagePullSecret = "imagepullsecret"
-	EnvExecutorType    = "executortype"
-	EnvForce           = force
-	EnvBuilder         = "builder-env"
-	EnvRuntime         = "runtime-env"
+	EnvName               = resourceName
+	EnvPoolsize           = "poolsize"
+	EnvImage              = "image"
+	EnvBuilderImage       = "builder"
+	EnvBuildcommand       = "buildcmd"
+	EnvBuilderIdleTimeout = "builder-idletimeout"
+	EnvKeeparchive        = "keeparchive"
+	EnvExternalNetwork    = "externalnetwork"
+	EnvGracePeriod        = "graceperiod"
+	EnvVersion            = "version"
+	EnvImagePullSecret    = "imagepullsecret"
+	EnvExecutorType       = "executortype"
+	EnvForce              = force
+	EnvBuilder            = "builder-env"
+	EnvRuntime            = "runtime-env"
 
 	KwName      = resourceName
 	KwFnName    = "function"

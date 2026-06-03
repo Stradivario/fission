@@ -21,16 +21,20 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	k8sCache "k8s.io/client-go/tools/cache"
 
@@ -49,6 +53,9 @@ const (
 	LABEL_ENV_RESOURCEVERSION = "envResourceVersion"
 	LABEL_DEPLOYMENT_OWNER    = "owner"
 	BUILDER_MGR               = "buildermgr"
+
+	// DefaultBuilderIdleTimeout is the default idle timeout in seconds for builders
+	DefaultBuilderIdleTimeout = 600
 )
 
 var (
@@ -58,15 +65,19 @@ var (
 
 type (
 	builderInfo struct {
-		envMetadata *metav1.ObjectMeta
-		deployment  *appsv1.Deployment
-		service     *apiv1.Service
+		envMetadata     *metav1.ObjectMeta
+		deployment      *appsv1.Deployment
+		service         *apiv1.Service
+		idleTimeout     int64
+		lastBuildTime   time.Time
+		buildInProgress atomic.Bool
+		mu              sync.Mutex
 	}
 
 	environmentWatcher struct {
 		logger                 *zap.Logger
 		cache                  map[types.UID]*builderInfo
-		fissionClient          versioned.Interface
+		cacheMu                sync.RWMutex
 		kubernetesClient       kubernetes.Interface
 		nsResolver             *utils.NamespaceResolver
 		fetcherConfig          *fetcherConfig.Config
@@ -75,6 +86,7 @@ type (
 		podSpecPatch           *apiv1.PodSpec
 		envWatchInformer       map[string]k8sCache.SharedIndexInformer
 		enableOwnerReferences  bool
+		builderReaperInterval  time.Duration
 	}
 )
 
@@ -84,7 +96,8 @@ func makeEnvironmentWatcher(
 	fissionClient versioned.Interface,
 	kubernetesClient kubernetes.Interface,
 	fetcherConfig *fetcherConfig.Config,
-	podSpecPatch *apiv1.PodSpec) (*environmentWatcher, error) {
+	podSpecPatch *apiv1.PodSpec,
+	builderReaperInterval time.Duration) (*environmentWatcher, error) {
 
 	useIstio := false
 	enableIstio := os.Getenv("ENABLE_ISTIO")
@@ -101,7 +114,6 @@ func makeEnvironmentWatcher(
 	envWatcher := &environmentWatcher{
 		logger:                 logger.Named("environment_watcher"),
 		cache:                  make(map[types.UID]*builderInfo),
-		fissionClient:          fissionClient,
 		kubernetesClient:       kubernetesClient,
 		nsResolver:             utils.DefaultNSResolver(),
 		builderImagePullPolicy: builderImagePullPolicy,
@@ -110,6 +122,7 @@ func makeEnvironmentWatcher(
 		podSpecPatch:           podSpecPatch,
 		envWatchInformer:       utils.GetInformersForNamespaces(fissionClient, time.Minute*30, fv1.EnvironmentResource),
 		enableOwnerReferences:  utils.IsOwnerReferencesEnabled(),
+		builderReaperInterval:  builderReaperInterval,
 	}
 
 	err := envWatcher.EnvWatchEventHandlers(ctx)
@@ -137,6 +150,7 @@ func (envw *environmentWatcher) getLabels(envName string, envNamespace string, e
 
 func (envw *environmentWatcher) Run(ctx context.Context, mgr manager.Interface) {
 	mgr.AddInformers(ctx, envw.envWatchInformer)
+	go envw.idleBuilderReaper(ctx)
 }
 
 func (envw *environmentWatcher) EnvWatchEventHandlers(ctx context.Context) error {
@@ -167,36 +181,33 @@ func (envw *environmentWatcher) EnvWatchEventHandlers(ctx context.Context) error
 
 func (envw *environmentWatcher) AddUpdateBuilder(ctx context.Context, env *fv1.Environment) {
 	// builder is not supported with v1 interface and ignore env without builder image
-	if env.Spec.Version != 1 && len(env.Spec.Builder.Image) != 0 {
-		if _, ok := envw.cache[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)]; !ok {
-			builderInfo, err := envw.createBuilder(ctx, env, envw.nsResolver.GetBuilderNS(env.Namespace))
-			if err != nil {
-				envw.logger.Error("error creating builder service", zap.Error(err))
-				return
-			}
-			envw.cache[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)] = builderInfo
-		} else {
-			envw.DeleteBuilder(ctx, env)
-			// once older builder deleted then add new builder service
-			builderInfo, err := envw.createBuilder(ctx, env, envw.nsResolver.GetBuilderNS(env.Namespace))
-			if err != nil {
-				envw.logger.Error("error updating builder service", zap.Error(err))
-				return
-			}
-			envw.cache[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)] = builderInfo
-		}
+	if env.Spec.Version == 1 || len(env.Spec.Builder.Image) == 0 {
+		return
 	}
+	key := crd.CacheKeyUIDFromMeta(&env.ObjectMeta)
+	// On update the older builder is deleted before the new one is created.
+	if _, ok := envw.getBuilderInfo(key); ok {
+		envw.DeleteBuilder(ctx, env)
+	}
+	// createBuilder performs API calls, so it runs without holding cacheMu.
+	builderInfo, err := envw.createBuilder(ctx, env, envw.nsResolver.GetBuilderNS(env.Namespace))
+	if err != nil {
+		envw.logger.Error("error creating/updating builder service", zap.Error(err))
+		return
+	}
+	envw.setBuilderInfo(key, builderInfo)
 }
 
 func (envw *environmentWatcher) DeleteBuilder(ctx context.Context, env *fv1.Environment) {
-	if _, ok := envw.cache[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)]; ok {
-		envw.DeleteBuilderService(ctx, env)
-		envw.DeleteBuilderDeployment(ctx, env)
-		delete(envw.cache, crd.CacheKeyUIDFromMeta(&env.ObjectMeta))
-		envw.logger.Info("builder service deleted", zap.String("env_name", env.Name), zap.String("namespace", envw.nsResolver.GetBuilderNS(env.Namespace)))
-	} else {
+	key := crd.CacheKeyUIDFromMeta(&env.ObjectMeta)
+	if _, ok := envw.getBuilderInfo(key); !ok {
 		envw.logger.Debug("builder service not found", zap.String("env_name", env.Name), zap.String("namespace", envw.nsResolver.GetBuilderNS(env.Namespace)))
+		return
 	}
+	envw.DeleteBuilderService(ctx, env)
+	envw.DeleteBuilderDeployment(ctx, env)
+	envw.deleteBuilderInfo(key)
+	envw.logger.Info("builder service deleted", zap.String("env_name", env.Name), zap.String("namespace", envw.nsResolver.GetBuilderNS(env.Namespace)))
 }
 
 func (envw *environmentWatcher) DeleteBuilderService(ctx context.Context, env *fv1.Environment) {
@@ -206,21 +217,14 @@ func (envw *environmentWatcher) DeleteBuilderService(ctx context.Context, env *f
 		envw.logger.Error("error getting the builder service list", zap.Error(err))
 	}
 	for _, svc := range svcList {
-		envName := svc.Labels[LABEL_ENV_NAME]
-		if _, ok := envw.cache[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)]; ok {
-			err := envw.deleteBuilderServiceByName(ctx, svc.Name, svc.Namespace)
-			if err != nil {
-				envw.logger.Error("error removing builder service", zap.Error(err),
-					zap.String("service_name", svc.Name),
-					zap.String("service_namespace", svc.Namespace),
-					zap.String("env_name", envName))
-			}
-			break
-		} else {
-			envw.logger.Error("builder service not found",
+		err := envw.deleteBuilderServiceByName(ctx, svc.Name, svc.Namespace)
+		if err != nil {
+			envw.logger.Error("error removing builder service", zap.Error(err),
 				zap.String("service_name", svc.Name),
-				zap.String("service_namespace", svc.Namespace))
+				zap.String("service_namespace", svc.Namespace),
+				zap.String("env_name", svc.Labels[LABEL_ENV_NAME]))
 		}
+		break
 	}
 }
 
@@ -231,20 +235,48 @@ func (envw *environmentWatcher) DeleteBuilderDeployment(ctx context.Context, env
 		envw.logger.Error("error getting the builder deployment list", zap.Error(err))
 	}
 	for _, deploy := range deployList {
-		if _, ok := envw.cache[crd.CacheKeyUIDFromMeta(&env.ObjectMeta)]; ok {
-			err := envw.deleteBuilderDeploymentByName(ctx, deploy.Name, deploy.Namespace)
-			if err != nil {
-				envw.logger.Error("error removing builder deployment", zap.Error(err),
-					zap.String("deployment_name", deploy.Name),
-					zap.String("deployment_namespace", deploy.Namespace))
-			}
-			break
-		} else {
-			envw.logger.Error("builder deployment not found", zap.Error(err),
+		err := envw.deleteBuilderDeploymentByName(ctx, deploy.Name, deploy.Namespace)
+		if err != nil {
+			envw.logger.Error("error removing builder deployment", zap.Error(err),
 				zap.String("deployment_name", deploy.Name),
 				zap.String("deployment_namespace", deploy.Namespace))
 		}
+		break
 	}
+}
+
+// getBuilderInfo returns the cached builderInfo for an environment UID.
+func (envw *environmentWatcher) getBuilderInfo(uid types.UID) (*builderInfo, bool) {
+	envw.cacheMu.RLock()
+	defer envw.cacheMu.RUnlock()
+	bi, ok := envw.cache[uid]
+	return bi, ok
+}
+
+// setBuilderInfo stores the builderInfo for an environment UID.
+func (envw *environmentWatcher) setBuilderInfo(uid types.UID, bi *builderInfo) {
+	envw.cacheMu.Lock()
+	defer envw.cacheMu.Unlock()
+	envw.cache[uid] = bi
+}
+
+// deleteBuilderInfo removes the cached builderInfo for an environment UID.
+func (envw *environmentWatcher) deleteBuilderInfo(uid types.UID) {
+	envw.cacheMu.Lock()
+	defer envw.cacheMu.Unlock()
+	delete(envw.cache, uid)
+}
+
+// listBuilderInfo returns a snapshot of all cached builders so callers can
+// iterate without holding cacheMu across slow operations.
+func (envw *environmentWatcher) listBuilderInfo() []*builderInfo {
+	envw.cacheMu.RLock()
+	defer envw.cacheMu.RUnlock()
+	out := make([]*builderInfo, 0, len(envw.cache))
+	for _, bi := range envw.cache {
+		out = append(out, bi)
+	}
+	return out
 }
 
 func (envw *environmentWatcher) createBuilder(ctx context.Context, env *fv1.Environment, ns string) (*builderInfo, error) {
@@ -288,10 +320,17 @@ func (envw *environmentWatcher) createBuilder(ctx context.Context, env *fv1.Envi
 		return nil, fmt.Errorf("found more than one builder deployment for environment in namespace %s %s", env.Name, ns)
 	}
 
+	idleTimeout := int64(DefaultBuilderIdleTimeout)
+	if env.Spec.Builder.IdleTimeout != nil {
+		idleTimeout = *env.Spec.Builder.IdleTimeout
+	}
+
 	return &builderInfo{
-		envMetadata: &env.ObjectMeta,
-		service:     svc,
-		deployment:  deploy,
+		envMetadata:   &env.ObjectMeta,
+		service:       svc,
+		deployment:    deploy,
+		idleTimeout:   idleTimeout,
+		lastBuildTime: time.Now(),
 	}, nil
 }
 
@@ -500,4 +539,114 @@ func (envw *environmentWatcher) createBuilderDeployment(ctx context.Context, env
 	envw.logger.Info("creating builder deployment", zap.String("deployment", name))
 
 	return deployment, nil
+}
+
+// ScaleBuilderDeployment scales a builder deployment to the specified number of replicas
+func (envw *environmentWatcher) ScaleBuilderDeployment(ctx context.Context, ns, name string, replicas int32) error {
+	scale := &autoscalingv1.Scale{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+		},
+		Spec: autoscalingv1.ScaleSpec{
+			Replicas: replicas,
+		},
+	}
+	_, err := envw.kubernetesClient.AppsV1().Deployments(ns).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+	if err != nil {
+		envw.logger.Error("error scaling builder deployment",
+			zap.String("deployment", name),
+			zap.String("namespace", ns),
+			zap.Int32("replicas", replicas),
+			zap.Error(err))
+		return err
+	}
+	envw.logger.Info("scaled builder deployment",
+		zap.String("deployment", name),
+		zap.String("namespace", ns),
+		zap.Int32("replicas", replicas))
+	return nil
+}
+
+// idleBuilderReaper runs the builder reaper loop to scale down idle builders
+func (envw *environmentWatcher) idleBuilderReaper(ctx context.Context) {
+	envw.logger.Info("starting idle builder reaper",
+		zap.Duration("interval", envw.builderReaperInterval))
+	wait.UntilWithContext(ctx, envw.doIdleBuilderReaper, envw.builderReaperInterval)
+}
+
+// doIdleBuilderReaper checks all cached builders and scales idle ones to zero.
+// It snapshots the cache under cacheMu and then performs the scale calls without
+// holding the lock, so env add/update/delete events are not blocked by the sweep.
+func (envw *environmentWatcher) doIdleBuilderReaper(ctx context.Context) {
+	for _, bi := range envw.listBuilderInfo() {
+		// Skip if a build is in progress.
+		if bi.buildInProgress.Load() {
+			continue
+		}
+
+		// idleTimeout of 0 means "never scale to zero".
+		if bi.idleTimeout == 0 {
+			continue
+		}
+
+		envMeta := bi.envMetadata
+		if envMeta == nil {
+			continue
+		}
+
+		bi.mu.Lock()
+		lastBuildTime := bi.lastBuildTime
+		bi.mu.Unlock()
+
+		if time.Since(lastBuildTime) < time.Duration(bi.idleTimeout)*time.Second {
+			continue
+		}
+
+		// Re-check just before scaling to narrow the race with a build that
+		// started after the snapshot was taken.
+		if bi.buildInProgress.Load() {
+			continue
+		}
+
+		builderNS := envw.nsResolver.GetBuilderNS(envMeta.Namespace)
+		builderName := fmt.Sprintf("%v-%v", envMeta.Name, envMeta.ResourceVersion)
+		if err := envw.ScaleBuilderDeployment(ctx, builderNS, builderName, 0); err != nil {
+			envw.logger.Error("failed to scale builder to zero",
+				zap.String("builder", builderName),
+				zap.String("namespace", builderNS),
+				zap.Error(err))
+		}
+	}
+}
+
+// GetLastBuildTime returns the last build time for a builder
+func (envw *environmentWatcher) GetLastBuildTime(envUID types.UID) time.Time {
+	bi, ok := envw.getBuilderInfo(envUID)
+	if !ok {
+		return time.Time{}
+	}
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	return bi.lastBuildTime
+}
+
+// UpdateLastBuildTime updates the last build time for a builder
+func (envw *environmentWatcher) UpdateLastBuildTime(envUID types.UID) {
+	bi, ok := envw.getBuilderInfo(envUID)
+	if !ok {
+		return
+	}
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	bi.lastBuildTime = time.Now()
+}
+
+// SetBuildInProgress sets the build in progress flag for a builder
+func (envw *environmentWatcher) SetBuildInProgress(envUID types.UID, inProgress bool) {
+	bi, ok := envw.getBuilderInfo(envUID)
+	if !ok {
+		return
+	}
+	bi.buildInProgress.Store(inProgress)
 }

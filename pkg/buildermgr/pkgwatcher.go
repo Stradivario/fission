@@ -47,12 +47,14 @@ type (
 		pkgInformer   map[string]k8sCache.SharedIndexInformer
 		storageSvcUrl string
 		buildCache    *cache.Cache[crd.CacheKeyUR, *fv1.Package]
+		envWatcher    *environmentWatcher
 	}
 )
 
 func makePackageWatcher(logger *zap.Logger, fissionClient versioned.Interface, k8sClientSet kubernetes.Interface,
 	storageSvcUrl string, podInformer,
-	pkgInformer map[string]k8sCache.SharedIndexInformer) *packageWatcher {
+	pkgInformer map[string]k8sCache.SharedIndexInformer,
+	envWatcher *environmentWatcher) *packageWatcher {
 	pkgw := &packageWatcher{
 		logger:        logger.Named("package_watcher"),
 		fissionClient: fissionClient,
@@ -62,6 +64,7 @@ func makePackageWatcher(logger *zap.Logger, fissionClient versioned.Interface, k
 		pkgInformer:   pkgInformer,
 		storageSvcUrl: storageSvcUrl,
 		buildCache:    cache.MakeCache[crd.CacheKeyUR, *fv1.Package](0, 0),
+		envWatcher:    envWatcher,
 	}
 	return pkgw
 }
@@ -117,6 +120,21 @@ func (pkgw *packageWatcher) build(ctx context.Context, srcpkg *fv1.Package) {
 				"error updating package",
 				zap.Error(er),
 			)
+		}
+		return
+	}
+
+	// Set build in progress flag to prevent reaper from scaling down builder
+	pkgw.envWatcher.SetBuildInProgress(env.UID, true)
+	defer pkgw.envWatcher.SetBuildInProgress(env.UID, false)
+
+	// Ensure builder is scaled to 1 before building
+	err = pkgw.ensureBuilderReady(ctx, env)
+	if err != nil {
+		logger.Error("error ensuring builder is ready", zap.Error(err))
+		_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, fmt.Sprintf("error ensuring builder ready: %v", err), nil)
+		if er != nil {
+			logger.Error("error updating package", zap.Error(er))
 		}
 		return
 	}
@@ -332,4 +350,35 @@ func setInitialBuildStatus(ctx context.Context, fissionClient versioned.Interfac
 
 	// TODO: use UpdateStatus to update status
 	return fissionClient.CoreV1().Packages(pkg.Namespace).Update(ctx, pkg, metav1.UpdateOptions{})
+}
+
+// ensureBuilderReady ensures the builder deployment is scaled to 1 and the pod is ready
+func (pkgw *packageWatcher) ensureBuilderReady(ctx context.Context, env *fv1.Environment) error {
+	builderNs := pkgw.nsResolver.GetBuilderNS(env.Namespace)
+	builderName := fmt.Sprintf("%v-%v", env.Name, env.ResourceVersion)
+
+	// Get current scale of the builder deployment
+	scale, err := pkgw.k8sClient.AppsV1().Deployments(builderNs).GetScale(ctx, builderName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get builder deployment scale: %w", err)
+	}
+
+	// If already at 0 or any non-1 value, scale to 1
+	if scale.Spec.Replicas != 1 {
+		pkgw.logger.Info("scaling builder deployment to 1",
+			zap.String("builder", builderName),
+			zap.String("namespace", builderNs),
+			zap.Int32("currentReplicas", scale.Spec.Replicas))
+
+		scale.Spec.Replicas = 1
+		_, err = pkgw.k8sClient.AppsV1().Deployments(builderNs).UpdateScale(ctx, builderName, scale, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to scale builder deployment: %w", err)
+		}
+	}
+
+	// Update last build time to prevent reaper from scaling down during build
+	pkgw.envWatcher.UpdateLastBuildTime(env.UID)
+
+	return nil
 }

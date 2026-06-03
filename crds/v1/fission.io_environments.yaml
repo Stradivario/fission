@@ -1599,6 +1599,14 @@ spec:
                     required:
                     - name
                     type: object
+                  idleTimeout:
+                    description: |-
+                      IdleTimeout specifies the length of time (in seconds) that a builder is idle
+                      before it is eligible for scaling to zero. If no builds are triggered within
+                      the idle timeout, the builder deployment will be scaled to zero to release resources.
+                      Defaults to 600 seconds (10 minutes) if not set.
+                    format: int64
+                    type: integer
                   image:
                     description: Image for containing the language compilation environment.
                     type: string

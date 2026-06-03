@@ -580,6 +580,13 @@ type (
 
 		// PodSpec will store the spec of the pod that will be applied to the pod created for the builder
 		PodSpec *apiv1.PodSpec `json:"podspec,omitempty"`
+
+		// IdleTimeout specifies the length of time (in seconds) that a builder is idle
+		// before it is eligible for scaling to zero. If no builds are triggered within
+		// the idle timeout, the builder deployment will be scaled to zero to release resources.
+		// Defaults to 600 seconds (10 minutes) if not set.
+		// +optional
+		IdleTimeout *int64 `json:"idleTimeout,omitempty"`
 	}
 
 	// EnvironmentSpec contains with builder, runtime and some other related environment settings.

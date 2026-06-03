@@ -150,6 +150,14 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 		}
 	}
 
+	// Only set the pointer when the user provided a value so that an unset
+	// timeout falls back to the buildermgr default (600s).
+	var builderIdleTimeout *int64
+	if input.IsSet(flagkey.EnvBuilderIdleTimeout) {
+		v := input.Int64(flagkey.EnvBuilderIdleTimeout)
+		builderIdleTimeout = &v
+	}
+
 	builderEnvParams := input.StringSlice(flagkey.EnvBuilder)
 	builderEnvList := util.GetEnvVarFromStringSlice(builderEnvParams)
 
@@ -190,8 +198,9 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 				},
 			},
 			Builder: fv1.Builder{
-				Image:   envBuilderImg,
-				Command: envBuildCmd,
+				Image:       envBuilderImg,
+				Command:     envBuildCmd,
+				IdleTimeout: builderIdleTimeout,
 				Container: &apiv1.Container{
 					Name: fv1.BuilderContainerName,
 					Env:  builderEnvList,

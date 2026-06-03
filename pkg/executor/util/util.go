@@ -161,6 +161,21 @@ func getExecutorEnvVarName(executor fv1.ExecutorType) string {
 	return strings.ToUpper(string(executor)) + "_OBJECT_REAPER_INTERVAL"
 }
 
+// GetBuilderIdleReaperInterval returns the interval for the builder idle reaper.
+// It checks BUILDER_IDLE_REAPER_INTERVAL env var first, then falls back to OBJECT_REAPER_INTERVAL.
+func GetBuilderIdleReaperInterval(logger *zap.Logger, defaultReaperInterval uint) uint {
+	keys := []string{"BUILDER_IDLE_REAPER_INTERVAL", "OBJECT_REAPER_INTERVAL"}
+	for _, k := range keys {
+		interval, err := utils.GetUIntValueFromEnv(k)
+		if err != nil {
+			logger.Debug(fmt.Sprintf("Failed to parse %s", k))
+		} else {
+			return interval
+		}
+	}
+	return defaultReaperInterval
+}
+
 // CreateDumpFile => create dump file inside temp directory
 func CreateDumpFile(logger *zap.Logger) (*os.File, error) {
 	dumpPath := os.TempDir()
