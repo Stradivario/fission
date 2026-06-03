@@ -29,19 +29,21 @@ git status                                   # working tree clean
 go build ./pkg/... && go test ./pkg/buildermgr/... ./pkg/executor/...
 # make generate-crds && make generate-swagger-doc   # only if types.go changed
 
-# 2. bump the FOUR version fields (see "Version source of truth")
-#    Chart.yaml: version 1.22.7-watch-all-namespaces, appVersion v1.22.7-watch-all-namespaces
-#    values.yaml: imageTag, fetcher.imageTag, preUpgradeChecks.imageTag = v1.22.7-watch-all-namespaces
+# 2. commit your CODE change (NOT the version bump yet)
+git add -A
+git commit -m "fix(...): what you changed"
 
-# 3. commit the bump
-git add charts/ docs/
-git commit -m "Bump to v1.22.7-watch-all-namespaces"
-
-# 4. tag + push the TAG  -> release.yaml builds & pushes images, makes a DRAFT release
+# 3. tag THAT commit + push the TAG -> release.yaml builds & pushes images, draft release
 git tag v1.22.7-watch-all-namespaces
 git push origin v1.22.7-watch-all-namespaces
 #    ...watch Actions "Create Draft release"; when green, confirm images in GHCR,
 #    then MANUALLY publish the draft release on GitHub.
+
+# 4. NOW bump the FOUR version fields, in a commit that is NEWER than the tag
+#    Chart.yaml: version 1.22.7-watch-all-namespaces, appVersion v1.22.7-watch-all-namespaces
+#    values.yaml: imageTag, fetcher.imageTag, preUpgradeChecks.imageTag = v1.22.7-watch-all-namespaces
+git add charts/
+git commit -m "Bump to v1.22.7-watch-all-namespaces"
 
 # 5. push the BRANCH (charts changed) -> chart-publish.yaml publishes the chart
 git push origin release/custom-v1.22.1
@@ -53,8 +55,12 @@ helm upgrade --install fission fission-custom/fission-all -n fission \
   --version 1.22.7-watch-all-namespaces
 ```
 
-> **Order matters:** push the tag (images) **before** pushing the chart, so users
-> never get a chart that references an image tag that doesn't exist yet.
+> **Why this exact order (read the "chart didn't publish" gotcha below):**
+> 1. Images must exist before the chart references them → **tag first**.
+> 2. chart-releaser only publishes charts that changed **since the latest git tag**,
+>    so the **version-bump commit must be newer than the tag**. If the bump and the
+>    tag are the same commit, chart-releaser sees an empty `charts/` diff, logs
+>    `Nothing to do. No chart changes detected.`, and silently skips publishing.
 
 ---
 
@@ -161,6 +167,16 @@ helm repo update
 
 ## Gotchas
 
+- **"Release Charts" is green but the chart didn't publish** (`Nothing to do. No
+  chart changes detected.`). chart-releaser publishes only charts whose files
+  changed **since the latest git tag** (`git diff <latest-tag> -- charts/`). If you
+  put the version bump in the **same commit** you tag, that diff is empty and the
+  chart is silently skipped — the images publish but the chart does not (this hit
+  1.22.7). **Prevent:** keep the bump in a commit *newer* than the tag (steps 3→4
+  above). **Recover:** make any fresh `charts/` commit (e.g. add an
+  `artifacthub.io/changes` annotation to `Chart.yaml`) and push the branch — the
+  diff is now non-empty, so chart-releaser publishes `fission-all-<version>`.
+  Confirm with a `fission-all-<version>` tag appearing on the remote.
 - **imageTag vs appVersion** — the chart uses `.Values.imageTag`; bump `values.yaml`
   too (see the ⚠️ section above).
 - The GoReleaser GitHub release is a **draft** — invisible until you publish it.

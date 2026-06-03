@@ -61,7 +61,20 @@ git add -A
 git commit -m "fix(...): what you changed"
 ```
 
-## 5. Bump the version (all FOUR fields — keep them in sync)
+## 5. Tag + push the TAG → builds & pushes images (draft release)
+
+Tag the commit from step 4 (your code change):
+
+```bash
+git tag v1.22.8-watch-all-namespaces
+git push origin v1.22.8-watch-all-namespaces
+```
+
+Watch **GitHub → Actions → "Create Draft release"**. When it's green, confirm the
+images appear in GHCR, then **manually publish the draft release** on GitHub
+(GoReleaser leaves it as a draft).
+
+## 6. Bump the version (all FOUR fields) — in a NEW commit, AFTER the tag
 
 Pick the next version (e.g. `1.22.7` → `1.22.8`) and set:
 
@@ -75,19 +88,12 @@ git add charts/
 git commit -m "Bump to v1.22.8-watch-all-namespaces"
 ```
 
-> ⚠️ The chart reads the image tag from `values.yaml` `imageTag`, **not**
-> `appVersion`. Bump Chart.yaml only and the new chart ships the old images.
-
-## 6. Tag + push the TAG → builds & pushes images (draft release)
-
-```bash
-git tag v1.22.8-watch-all-namespaces
-git push origin v1.22.8-watch-all-namespaces
-```
-
-Watch **GitHub → Actions → "Create Draft release"**. When it's green, confirm the
-images appear in GHCR, then **manually publish the draft release** on GitHub
-(GoReleaser leaves it as a draft).
+> ⚠️ Two traps here:
+> - The chart reads the image tag from `values.yaml` `imageTag`, **not**
+>   `appVersion` — bump Chart.yaml only and the new chart ships the old images.
+> - This bump **must be a commit newer than the tag** from step 5. chart-releaser
+>   only publishes charts that changed *since the latest git tag*; if the bump and
+>   the tag are the same commit it logs `No chart changes detected` and skips.
 
 ## 7. Push the BRANCH → publishes the Helm chart
 
@@ -96,6 +102,7 @@ git push origin release/custom-v1.22.1
 ```
 
 Fires **"Release Charts"** (because `charts/**` changed) and updates the helm repo.
+Confirm a `fission-all-1.22.8-watch-all-namespaces` tag appears on the remote.
 
 ## 8. Install / upgrade from the published chart
 
@@ -108,6 +115,9 @@ helm upgrade --install fission fission-custom/fission-all \
 ---
 
 ### Remember
-- **Tag first, branch second** (so the chart never points at missing images).
+- **Tag the code commit first** (images), **then bump the chart in a newer commit**
+  (chart). Images must exist before the chart points at them, and chart-releaser
+  only publishes charts changed *since the latest tag*.
 - The GitHub release is a **draft** until you publish it.
-- Bump **all four** version fields together.
+- Bump **all four** version fields together (the chart reads `imageTag` from
+  `values.yaml`, not `appVersion`).
