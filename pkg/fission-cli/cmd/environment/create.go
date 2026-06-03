@@ -158,6 +158,14 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 		builderIdleTimeout = &v
 	}
 
+	// Only set the pointer when the user provided a value so that an unset
+	// pool size falls back to the buildermgr default (1 builder pod).
+	var builderPoolSize *int32
+	if input.IsSet(flagkey.EnvBuilderPoolsize) {
+		v := int32(input.Int(flagkey.EnvBuilderPoolsize))
+		builderPoolSize = &v
+	}
+
 	builderEnvParams := input.StringSlice(flagkey.EnvBuilder)
 	builderEnvList := util.GetEnvVarFromStringSlice(builderEnvParams)
 
@@ -201,6 +209,7 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 				Image:       envBuilderImg,
 				Command:     envBuildCmd,
 				IdleTimeout: builderIdleTimeout,
+				PoolSize:    builderPoolSize,
 				Container: &apiv1.Container{
 					Name: fv1.BuilderContainerName,
 					Env:  builderEnvList,

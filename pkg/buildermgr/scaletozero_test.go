@@ -124,7 +124,7 @@ func TestDoIdleBuilderReaper(t *testing.T) {
 
 	idle := newBuilderInfo("idle-env", "1000", 600, old)
 	busy := newBuilderInfo("busy-env", "1000", 600, old)
-	busy.buildInProgress.Store(true)
+	busy.activeBuilds = 1
 	fresh := newBuilderInfo("fresh-env", "1000", 600, time.Now())
 	never := newBuilderInfo("never-env", "1000", 0, old)
 
@@ -150,23 +150,27 @@ func TestDoIdleBuilderReaper(t *testing.T) {
 	}
 }
 
-func TestEnsureBuilderReady(t *testing.T) {
+func TestScaleBuilderForDemand(t *testing.T) {
 	logger := loggerfactory.GetLogger()
 	nsResolver := utils.DefaultNSResolver()
 	bns := nsResolver.GetBuilderNS("default")
-
-	env := &fv1.Environment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "nodejs",
-			Namespace:       "default",
-			ResourceVersion: "1000",
-			UID:             types.UID("nodejs"),
-		},
-	}
 	builderKey := bns + "/nodejs-1000"
 
-	t.Run("scales from zero to one", func(t *testing.T) {
-		cs, st := newScaleFake(map[string]int32{builderKey: 0})
+	newEnv := func(poolSize *int32) *fv1.Environment {
+		e := &fv1.Environment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "nodejs",
+				Namespace:       "default",
+				ResourceVersion: "1000",
+				UID:             types.UID("nodejs"),
+			},
+		}
+		e.Spec.Builder.PoolSize = poolSize
+		return e
+	}
+
+	setup := func(initial int32) (*environmentWatcher, *packageWatcher, *scaleTracker) {
+		cs, st := newScaleFake(map[string]int32{builderKey: initial})
 		envw := &environmentWatcher{
 			logger:           logger,
 			cache:            map[types.UID]*builderInfo{},
@@ -174,37 +178,112 @@ func TestEnsureBuilderReady(t *testing.T) {
 			nsResolver:       nsResolver,
 		}
 		// Seed a cache entry so UpdateLastBuildTime has somewhere to write.
-		bi := newBuilderInfo("nodejs", "1000", 600, time.Time{})
-		envw.cache[env.UID] = bi
+		envw.cache[types.UID("nodejs")] = newBuilderInfo("nodejs", "1000", 600, time.Time{})
 		pkgw := &packageWatcher{logger: logger, k8sClient: cs, nsResolver: nsResolver, envWatcher: envw}
+		return envw, pkgw, st
+	}
 
-		if err := pkgw.ensureBuilderReady(t.Context(), env); err != nil {
-			t.Fatalf("ensureBuilderReady returned error: %v", err)
+	size3 := int32(3)
+
+	t.Run("scales from zero to one on first build", func(t *testing.T) {
+		envw, pkgw, st := setup(0)
+		if err := pkgw.scaleBuilderForDemand(t.Context(), newEnv(nil), 1); err != nil {
+			t.Fatalf("scaleBuilderForDemand returned error: %v", err)
 		}
 		if r, _ := st.get(builderKey); r != 1 {
 			t.Errorf("expected builder scaled to 1, got %d", r)
 		}
-		if envw.GetLastBuildTime(env.UID).IsZero() {
+		if envw.GetLastBuildTime(types.UID("nodejs")).IsZero() {
 			t.Errorf("expected lastBuildTime to be updated")
 		}
 	})
 
-	t.Run("no scale when already at one", func(t *testing.T) {
-		cs, st := newScaleFake(map[string]int32{builderKey: 1})
-		envw := &environmentWatcher{
-			logger:           logger,
-			cache:            map[types.UID]*builderInfo{},
-			kubernetesClient: cs,
-			nsResolver:       nsResolver,
+	t.Run("scales up to concurrent build count within cap", func(t *testing.T) {
+		_, pkgw, st := setup(1)
+		if err := pkgw.scaleBuilderForDemand(t.Context(), newEnv(&size3), 2); err != nil {
+			t.Fatalf("scaleBuilderForDemand returned error: %v", err)
 		}
-		envw.cache[env.UID] = newBuilderInfo("nodejs", "1000", 600, time.Time{})
-		pkgw := &packageWatcher{logger: logger, k8sClient: cs, nsResolver: nsResolver, envWatcher: envw}
-
-		if err := pkgw.ensureBuilderReady(t.Context(), env); err != nil {
-			t.Fatalf("ensureBuilderReady returned error: %v", err)
-		}
-		if c := st.updateCount(builderKey); c != 0 {
-			t.Errorf("expected no scale call when already at 1, got %d", c)
+		if r, _ := st.get(builderKey); r != 2 {
+			t.Errorf("expected builder scaled to 2, got %d", r)
 		}
 	})
+
+	t.Run("caps at builder pool size", func(t *testing.T) {
+		_, pkgw, st := setup(1)
+		if err := pkgw.scaleBuilderForDemand(t.Context(), newEnv(&size3), 10); err != nil {
+			t.Fatalf("scaleBuilderForDemand returned error: %v", err)
+		}
+		if r, _ := st.get(builderKey); r != 3 {
+			t.Errorf("expected builder capped at 3, got %d", r)
+		}
+	})
+
+	t.Run("never scales down", func(t *testing.T) {
+		_, pkgw, st := setup(3)
+		if err := pkgw.scaleBuilderForDemand(t.Context(), newEnv(&size3), 1); err != nil {
+			t.Fatalf("scaleBuilderForDemand returned error: %v", err)
+		}
+		if c := st.updateCount(builderKey); c != 0 {
+			t.Errorf("expected no scale-down call, got %d", c)
+		}
+		if r, _ := st.get(builderKey); r != 3 {
+			t.Errorf("expected builder to stay at 3, got %d", r)
+		}
+	})
+}
+
+func TestClaimReleaseBuilderPod(t *testing.T) {
+	logger := loggerfactory.GetLogger()
+	envw := &environmentWatcher{
+		logger: logger,
+		cache:  map[types.UID]*builderInfo{},
+	}
+	uid := types.UID("nodejs")
+	envw.cache[uid] = newBuilderInfo("nodejs", "1000", 600, time.Now())
+
+	ips := []string{"10.0.0.1", "10.0.0.2"}
+
+	// Two concurrent builds must claim two distinct pods.
+	ip1, ok1 := envw.ClaimFreeBuilderPod(uid, ips)
+	ip2, ok2 := envw.ClaimFreeBuilderPod(uid, ips)
+	if !ok1 || !ok2 || ip1 == ip2 {
+		t.Fatalf("expected two distinct claimed pods, got %q (%v) and %q (%v)", ip1, ok1, ip2, ok2)
+	}
+
+	// A third build finds no free pod (both busy) — it must queue.
+	if ip3, ok3 := envw.ClaimFreeBuilderPod(uid, ips); ok3 {
+		t.Errorf("expected no free pod when all are busy, got %q", ip3)
+	}
+
+	// Releasing one frees it for the next build.
+	envw.ReleaseBuilderPod(uid, ip1)
+	if ip4, ok4 := envw.ClaimFreeBuilderPod(uid, ips); !ok4 || ip4 != ip1 {
+		t.Errorf("expected to reclaim released pod %q, got %q (%v)", ip1, ip4, ok4)
+	}
+}
+
+func TestActiveBuildsCounter(t *testing.T) {
+	logger := loggerfactory.GetLogger()
+	envw := &environmentWatcher{
+		logger: logger,
+		cache:  map[types.UID]*builderInfo{},
+	}
+	uid := types.UID("nodejs")
+	bi := newBuilderInfo("nodejs", "1000", 600, time.Now())
+	envw.cache[uid] = bi
+
+	if n := envw.IncActiveBuilds(uid); n != 1 {
+		t.Errorf("expected 1 active build, got %d", n)
+	}
+	if n := envw.IncActiveBuilds(uid); n != 2 {
+		t.Errorf("expected 2 active builds, got %d", n)
+	}
+	if !bi.isBuilding() {
+		t.Errorf("expected isBuilding to be true with active builds")
+	}
+	envw.DecActiveBuilds(uid)
+	envw.DecActiveBuilds(uid)
+	if bi.isBuilding() {
+		t.Errorf("expected isBuilding to be false after all builds finished")
+	}
 }

@@ -22,7 +22,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -56,7 +55,22 @@ const (
 
 	// DefaultBuilderIdleTimeout is the default idle timeout in seconds for builders
 	DefaultBuilderIdleTimeout = 600
+
+	// DefaultBuilderPoolSize is the default maximum number of builder pods per environment
+	DefaultBuilderPoolSize int32 = 1
 )
+
+// builderPoolSize returns the MAXIMUM number of builder pods allowed for an
+// environment. Builder pods are provisioned on demand (one per concurrent
+// build) up to this cap; it is not a fixed replica count. Defaults to
+// DefaultBuilderPoolSize (1) when unset or < 1, which preserves the original
+// single-builder, one-build-at-a-time behaviour.
+func builderPoolSize(env *fv1.Environment) int32 {
+	if env.Spec.Builder.PoolSize != nil && *env.Spec.Builder.PoolSize >= 1 {
+		return *env.Spec.Builder.PoolSize
+	}
+	return DefaultBuilderPoolSize
+}
 
 var (
 	deletePropagation = metav1.DeletePropagationBackground
@@ -65,13 +79,20 @@ var (
 
 type (
 	builderInfo struct {
-		envMetadata     *metav1.ObjectMeta
-		deployment      *appsv1.Deployment
-		service         *apiv1.Service
-		idleTimeout     int64
-		lastBuildTime   time.Time
-		buildInProgress atomic.Bool
-		mu              sync.Mutex
+		envMetadata   *metav1.ObjectMeta
+		deployment    *appsv1.Deployment
+		service       *apiv1.Service
+		idleTimeout   int64
+		lastBuildTime time.Time
+		// activeBuilds is the number of in-flight builds for this environment.
+		// It drives demand-based scaling (one builder pod per concurrent build,
+		// capped by the env's builder pool size) and keeps the idle reaper from
+		// scaling the builder down while builds are running.
+		activeBuilds int
+		// busyPodIPs is the set of builder pod IPs currently assigned to a build,
+		// so concurrent builds each get their own dedicated pod.
+		busyPodIPs map[string]bool
+		mu         sync.Mutex
 	}
 
 	environmentWatcher struct {
@@ -331,6 +352,7 @@ func (envw *environmentWatcher) createBuilder(ctx context.Context, env *fv1.Envi
 		deployment:    deploy,
 		idleTimeout:   idleTimeout,
 		lastBuildTime: time.Now(),
+		busyPodIPs:    make(map[string]bool),
 	}, nil
 }
 
@@ -434,6 +456,9 @@ func (envw *environmentWatcher) getBuilderDeploymentList(ctx context.Context, se
 func (envw *environmentWatcher) createBuilderDeployment(ctx context.Context, env *fv1.Environment, ns string) (*appsv1.Deployment, error) {
 	name := fmt.Sprintf("%v-%v", env.Name, env.ResourceVersion)
 	sel := envw.getLabels(env.Name, ns, env.ResourceVersion)
+	// Start with a single warm builder pod. Additional pods are provisioned on
+	// demand (up to spec.builder.poolsize) when concurrent builds arrive, and
+	// the idle reaper scales back to zero once builds stop.
 	var replicas int32 = 1
 
 	podAnnotations := env.Annotations
@@ -580,8 +605,8 @@ func (envw *environmentWatcher) idleBuilderReaper(ctx context.Context) {
 // holding the lock, so env add/update/delete events are not blocked by the sweep.
 func (envw *environmentWatcher) doIdleBuilderReaper(ctx context.Context) {
 	for _, bi := range envw.listBuilderInfo() {
-		// Skip if a build is in progress.
-		if bi.buildInProgress.Load() {
+		// Skip if any build is in progress for this environment.
+		if bi.isBuilding() {
 			continue
 		}
 
@@ -605,7 +630,7 @@ func (envw *environmentWatcher) doIdleBuilderReaper(ctx context.Context) {
 
 		// Re-check just before scaling to narrow the race with a build that
 		// started after the snapshot was taken.
-		if bi.buildInProgress.Load() {
+		if bi.isBuilding() {
 			continue
 		}
 
@@ -642,11 +667,73 @@ func (envw *environmentWatcher) UpdateLastBuildTime(envUID types.UID) {
 	bi.lastBuildTime = time.Now()
 }
 
-// SetBuildInProgress sets the build in progress flag for a builder
-func (envw *environmentWatcher) SetBuildInProgress(envUID types.UID, inProgress bool) {
+// isBuilding reports whether any build is currently in progress for this builder.
+func (bi *builderInfo) isBuilding() bool {
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	return bi.activeBuilds > 0
+}
+
+// IncActiveBuilds records that a build has started for an environment and
+// returns the new in-flight build count. It also refreshes lastBuildTime so the
+// idle reaper does not scale the builder down underneath an active build.
+func (envw *environmentWatcher) IncActiveBuilds(envUID types.UID) int32 {
+	bi, ok := envw.getBuilderInfo(envUID)
+	if !ok {
+		return 1
+	}
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	bi.activeBuilds++
+	bi.lastBuildTime = time.Now()
+	return int32(bi.activeBuilds)
+}
+
+// DecActiveBuilds records that a build has finished for an environment and
+// refreshes lastBuildTime so the idle timer starts from the last completed build.
+func (envw *environmentWatcher) DecActiveBuilds(envUID types.UID) {
 	bi, ok := envw.getBuilderInfo(envUID)
 	if !ok {
 		return
 	}
-	bi.buildInProgress.Store(inProgress)
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	if bi.activeBuilds > 0 {
+		bi.activeBuilds--
+	}
+	bi.lastBuildTime = time.Now()
+}
+
+// ClaimFreeBuilderPod picks the first candidate builder pod IP that is not
+// already assigned to another in-flight build, marks it busy, and returns it.
+// Returns false if every candidate is already busy (caller should wait/retry).
+func (envw *environmentWatcher) ClaimFreeBuilderPod(envUID types.UID, candidateIPs []string) (string, bool) {
+	bi, ok := envw.getBuilderInfo(envUID)
+	if !ok {
+		return "", false
+	}
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	if bi.busyPodIPs == nil {
+		bi.busyPodIPs = make(map[string]bool)
+	}
+	for _, ip := range candidateIPs {
+		if ip == "" || bi.busyPodIPs[ip] {
+			continue
+		}
+		bi.busyPodIPs[ip] = true
+		return ip, true
+	}
+	return "", false
+}
+
+// ReleaseBuilderPod frees a builder pod IP previously claimed via ClaimFreeBuilderPod.
+func (envw *environmentWatcher) ReleaseBuilderPod(envUID types.UID, podIP string) {
+	bi, ok := envw.getBuilderInfo(envUID)
+	if !ok {
+		return
+	}
+	bi.mu.Lock()
+	defer bi.mu.Unlock()
+	delete(bi.busyPodIPs, podIP)
 }

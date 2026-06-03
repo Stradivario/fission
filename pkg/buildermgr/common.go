@@ -44,7 +44,7 @@ import (
 // 4. Return upload response and build logs.
 // *. Return build logs and error if any one of steps above failed.
 func buildPackage(ctx context.Context, logger *zap.Logger, fissionClient versioned.Interface, envBuilderNamespace string,
-	storageSvcUrl string, pkg *fv1.Package) (uploadResp *fetcher.ArchiveUploadResponse, buildLogs string, err error) {
+	builderPodIP string, storageSvcUrl string, pkg *fv1.Package) (uploadResp *fetcher.ArchiveUploadResponse, buildLogs string, err error) {
 
 	env, err := fissionClient.CoreV1().Environments(pkg.Spec.Environment.Namespace).Get(ctx, pkg.Spec.Environment.Name, metav1.GetOptions{})
 	if err != nil {
@@ -54,10 +54,14 @@ func buildPackage(ctx context.Context, logger *zap.Logger, fissionClient version
 		return nil, e, ferror.MakeError(http.StatusInternalServerError, e)
 	}
 
-	svcName := fmt.Sprintf("%s-%s.%s", env.Name, env.ResourceVersion, envBuilderNamespace)
+	// Address the chosen builder pod directly by IP rather than via the builder
+	// Service. With more than one builder replica, kube-proxy would load-balance
+	// each of the fetch/build/upload calls independently and could send them to
+	// different pods — but the source archive fetched in step 1 lives on the
+	// pod's local volume, so all three calls must hit the SAME pod.
 	srcPkgFilename := fmt.Sprintf("%s-%s", pkg.Name, strings.ToLower(uniuri.NewLen(6)))
-	fetcherUrl := fmt.Sprintf("http://%s:8000", svcName)
-	builderUrl := fmt.Sprintf("http://%s:8001", svcName)
+	fetcherUrl := fmt.Sprintf("http://%s:8000", builderPodIP)
+	builderUrl := fmt.Sprintf("http://%s:8001", builderPodIP)
 	logger.Info("Constructed Builder/Fetcher URLs", zap.String("fetcher_url", fetcherUrl), zap.String("builder_url", builderUrl))
 
 	fetcherC := fetcherClient.MakeClient(logger, fetcherUrl)

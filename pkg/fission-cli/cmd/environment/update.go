@@ -121,6 +121,11 @@ func updateExistingEnvironmentWithCmd(env *fv1.Environment, input cli.Input) (*f
 		env.Spec.Builder.IdleTimeout = &v
 	}
 
+	if input.IsSet(flagkey.EnvBuilderPoolsize) {
+		v := int32(input.Int(flagkey.EnvBuilderPoolsize))
+		env.Spec.Builder.PoolSize = &v
+	}
+
 	if env.Spec.Version == 1 && (len(env.Spec.Builder.Image) > 0 || len(env.Spec.Builder.Command) > 0) {
 		errs = errors.Join(errs, errors.New("version 1 Environments do not support builders. Must specify --version=2"))
 	}

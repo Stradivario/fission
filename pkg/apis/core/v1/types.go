@@ -587,6 +587,17 @@ type (
 		// Defaults to 600 seconds (10 minutes) if not set.
 		// +optional
 		IdleTimeout *int64 `json:"idleTimeout,omitempty"`
+
+		// PoolSize is the MAXIMUM number of builder pods for this environment.
+		// Builder pods are provisioned on demand — one dedicated pod per
+		// concurrent package build — and scaled up to this cap as concurrent
+		// builds arrive, then scaled back to zero by the idle reaper once builds
+		// stop. It is a ceiling, not a fixed replica count: building a single
+		// package always uses a single pod regardless of this value. Each pod is
+		// an independent isolation domain, so an OOM in one build does not affect
+		// the others. Defaults to 1 if not set or less than 1.
+		// +optional
+		PoolSize *int32 `json:"poolsize,omitempty"`
 	}
 
 	// EnvironmentSpec contains with builder, runtime and some other related environment settings.

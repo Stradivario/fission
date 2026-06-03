@@ -134,6 +134,7 @@ const (
 	EnvBuilderImage       = "builder"
 	EnvBuildcommand       = "buildcmd"
 	EnvBuilderIdleTimeout = "builder-idletimeout"
+	EnvBuilderPoolsize    = "builder-poolsize"
 	EnvKeeparchive        = "keeparchive"
 	EnvExternalNetwork    = "externalnetwork"
 	EnvGracePeriod        = "graceperiod"

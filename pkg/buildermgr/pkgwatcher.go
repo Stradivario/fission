@@ -124,148 +124,107 @@ func (pkgw *packageWatcher) build(ctx context.Context, srcpkg *fv1.Package) {
 		return
 	}
 
-	// Set build in progress flag to prevent reaper from scaling down builder
-	pkgw.envWatcher.SetBuildInProgress(env.UID, true)
-	defer pkgw.envWatcher.SetBuildInProgress(env.UID, false)
+	// Track this build for demand-based scaling. activeBuilds is the number of
+	// in-flight builds for this environment; it drives how many builder pods we
+	// provision (one pod per concurrent build, capped by the env's builder pool
+	// size) and keeps the idle reaper from scaling the builder down mid-build.
+	activeBuilds := pkgw.envWatcher.IncActiveBuilds(env.UID)
+	defer pkgw.envWatcher.DecActiveBuilds(env.UID)
 
-	// Ensure builder is scaled to 1 before building
-	err = pkgw.ensureBuilderReady(ctx, env)
+	builderNs := pkgw.nsResolver.GetBuilderNS(env.Namespace)
+	logger = logger.With(zap.String("environment", env.Name), zap.String("builder_namespace", builderNs), zap.String("environment_namespace", env.Namespace))
+
+	// Scale the builder deployment up toward the number of concurrent builds,
+	// capped at the env's builder pool size. Only scales up; the idle reaper
+	// returns it to zero once all builds finish (so in-flight builds are never
+	// terminated by a scale-down).
+	err = pkgw.scaleBuilderForDemand(ctx, env, activeBuilds)
 	if err != nil {
-		logger.Error("error ensuring builder is ready", zap.Error(err))
-		_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, fmt.Sprintf("error ensuring builder ready: %v", err), nil)
+		logger.Error("error scaling builder for demand", zap.Error(err))
+		_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, fmt.Sprintf("error scaling builder: %v", err), nil)
 		if er != nil {
 			logger.Error("error updating package", zap.Error(er))
 		}
 		return
 	}
 
-	// Create a new BackOff for health check on environment builder pod
-	healthCheckBackOff := utils.NewDefaultBackOff()
-	builderNs := pkgw.nsResolver.GetBuilderNS(env.Namespace)
-
-	logger = logger.With(zap.String("environment", env.Name), zap.String("builder_namespace", builderNs), zap.String("environment_namespace", env.Namespace))
-
-	// if err != nil {
-	//	pkgw.logger.Error("Unable to create BackOff for Health Check", zap.Error(err))
-	//}
-	// Do health check for environment builder pod
-	for healthCheckBackOff.NextExists() {
-		// Informer store is not able to use label to find the pod,
-		// iterate all available environment builders.
-		var informer k8sCache.SharedIndexInformer
-		var ok bool
-		if informer, ok = pkgw.podInformer[builderNs]; !ok {
-			if informer, ok = pkgw.podInformer[metav1.NamespaceAll]; !ok {
-				logger.Error("no pod informer found for namespace", zap.String("namespace", builderNs))
-				return
-			}
-		}
-
-		items := informer.GetStore().List()
-
-		if len(items) == 0 {
-			logger.Info("builder pod does not exist for environment, will retry again later")
-			time.Sleep(healthCheckBackOff.GetCurrentBackoffDuration())
-			continue
-		}
-
-		for _, item := range items {
-			pod := item.(*apiv1.Pod)
-
-			// Filter non-matching pods
-			if pod.Labels[LABEL_ENV_NAME] != env.Name ||
-				pod.Labels[LABEL_ENV_NAMESPACE] != builderNs ||
-				pod.Labels[LABEL_ENV_RESOURCEVERSION] != env.ResourceVersion {
-				continue
-			}
-
-			// Pod may become "Running" state but still failed at health check, so use
-			// pod.Status.ContainerStatuses instead of pod.Status.Phase to check pod readiness states.
-			podIsReady := true
-
-			for _, cStatus := range pod.Status.ContainerStatuses {
-				podIsReady = podIsReady && cStatus.Ready
-			}
-
-			if !podIsReady {
-				logger.Info("builder pod is not ready for environment, will retry again later")
-				time.Sleep(healthCheckBackOff.GetCurrentBackoffDuration())
-				break
-			}
-
-			uploadResp, buildLogs, err := buildPackage(ctx, pkgw.logger, pkgw.fissionClient, builderNs, pkgw.storageSvcUrl, pkg)
-			if err != nil {
-				logger.Error("error building package", zap.Error(err))
-				_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
-				if er != nil {
-					logger.Error("error updating package", zap.Error(er))
-				}
-				return
-			}
-
-			logger.Info("starting package info update")
-
-			fnList, err := pkgw.fissionClient.CoreV1().
-				Functions(pkg.Namespace).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				e := "error getting function list"
-				pkgw.logger.Error(e, zap.Error(err))
-				buildLogs += fmt.Sprintf("%s: %v\n", e, err)
-				_, er := updatePackage(ctx, pkgw.logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
-				if er != nil {
-					pkgw.logger.Error(
-						"error updating package",
-						zap.Error(er),
-					)
-				}
-			}
-
-			// A package may be used by multiple functions. Update
-			// functions with old package resource version
-			for _, fn := range fnList.Items {
-				if fn.Spec.Package.PackageRef.Name == pkg.Name &&
-					fn.Spec.Package.PackageRef.Namespace == pkg.Namespace &&
-					fn.Spec.Package.PackageRef.ResourceVersion != pkg.ResourceVersion {
-					fn.Spec.Package.PackageRef.ResourceVersion = pkg.ResourceVersion
-					// update CRD
-					_, err = pkgw.fissionClient.CoreV1().Functions(fn.Namespace).Update(ctx, &fn, metav1.UpdateOptions{})
-					if err != nil {
-						e := "error updating function package resource version"
-						logger.Error(e, zap.Error(err))
-						buildLogs += fmt.Sprintf("%s: %v\n", e, err)
-						_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
-						if er != nil {
-							logger.Error("error updating package", zap.Error(er))
-						}
-						return
-					}
-				}
-			}
-
-			_, err = updatePackage(ctx, logger, pkgw.fissionClient, pkg,
-				fv1.BuildStatusSucceeded, buildLogs, uploadResp)
-			if err != nil {
-				logger.Error("error updating package info", zap.Error(err))
-				_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
-				if er != nil {
-					logger.Error("error updating package", zap.Error(er))
-				}
-				return
-			}
-
-			logger.Info("completed package build request")
-			return
-		}
-		time.Sleep(healthCheckBackOff.GetNext())
-	}
-	// build timeout
-	_, err = updatePackage(ctx, logger, pkgw.fissionClient, pkg,
-		fv1.BuildStatusFailed, "Build timeout due to environment builder not ready", nil)
+	// Wait for a Ready builder pod that is not already running another build and
+	// claim it, so this build gets its own dedicated pod. Pinning fetch+build+
+	// upload to one pod IP is required for correctness with more than one replica
+	// (the fetched source lives on the pod's local volume).
+	podIP, err := pkgw.acquireReadyBuilderPod(ctx, logger, env, builderNs)
 	if err != nil {
-		logger.Error("error updating package", zap.Error(err))
+		logger.Error("error acquiring a ready builder pod", zap.Error(err))
+		_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, fmt.Sprintf("%v", err), nil)
+		if er != nil {
+			logger.Error("error updating package", zap.Error(er))
+		}
+		return
+	}
+	defer pkgw.envWatcher.ReleaseBuilderPod(env.UID, podIP)
+	logger = logger.With(zap.String("builder_pod_ip", podIP))
+
+	uploadResp, buildLogs, err := buildPackage(ctx, pkgw.logger, pkgw.fissionClient, builderNs, podIP, pkgw.storageSvcUrl, pkg)
+	if err != nil {
+		logger.Error("error building package", zap.Error(err))
+		_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
+		if er != nil {
+			logger.Error("error updating package", zap.Error(er))
+		}
+		return
 	}
 
-	logger.Error("max retries exceeded in building source package, timeout due to environment builder not ready")
+	logger.Info("starting package info update")
+
+	fnList, err := pkgw.fissionClient.CoreV1().
+		Functions(pkg.Namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		e := "error getting function list"
+		pkgw.logger.Error(e, zap.Error(err))
+		buildLogs += fmt.Sprintf("%s: %v\n", e, err)
+		_, er := updatePackage(ctx, pkgw.logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
+		if er != nil {
+			pkgw.logger.Error(
+				"error updating package",
+				zap.Error(er),
+			)
+		}
+	}
+
+	// A package may be used by multiple functions. Update
+	// functions with old package resource version
+	for _, fn := range fnList.Items {
+		if fn.Spec.Package.PackageRef.Name == pkg.Name &&
+			fn.Spec.Package.PackageRef.Namespace == pkg.Namespace &&
+			fn.Spec.Package.PackageRef.ResourceVersion != pkg.ResourceVersion {
+			fn.Spec.Package.PackageRef.ResourceVersion = pkg.ResourceVersion
+			// update CRD
+			_, err = pkgw.fissionClient.CoreV1().Functions(fn.Namespace).Update(ctx, &fn, metav1.UpdateOptions{})
+			if err != nil {
+				e := "error updating function package resource version"
+				logger.Error(e, zap.Error(err))
+				buildLogs += fmt.Sprintf("%s: %v\n", e, err)
+				_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
+				if er != nil {
+					logger.Error("error updating package", zap.Error(er))
+				}
+				return
+			}
+		}
+	}
+
+	_, err = updatePackage(ctx, logger, pkgw.fissionClient, pkg,
+		fv1.BuildStatusSucceeded, buildLogs, uploadResp)
+	if err != nil {
+		logger.Error("error updating package info", zap.Error(err))
+		_, er := updatePackage(ctx, logger, pkgw.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil)
+		if er != nil {
+			logger.Error("error updating package", zap.Error(er))
+		}
+		return
+	}
+
+	logger.Info("completed package build request")
 }
 
 func (pkgw *packageWatcher) packageInformerHandler(ctx context.Context) k8sCache.ResourceEventHandlerFuncs {
@@ -352,33 +311,109 @@ func setInitialBuildStatus(ctx context.Context, fissionClient versioned.Interfac
 	return fissionClient.CoreV1().Packages(pkg.Namespace).Update(ctx, pkg, metav1.UpdateOptions{})
 }
 
-// ensureBuilderReady ensures the builder deployment is scaled to 1 and the pod is ready
-func (pkgw *packageWatcher) ensureBuilderReady(ctx context.Context, env *fv1.Environment) error {
+// scaleBuilderForDemand scales the builder deployment UP toward the number of
+// concurrent in-flight builds, capped at the environment's builder pool size
+// (spec.builder.poolsize, default 1). It never scales down — that is left to the
+// idle reaper (which returns the deployment to zero once idle) so that a pod
+// running a build is never terminated underneath it.
+func (pkgw *packageWatcher) scaleBuilderForDemand(ctx context.Context, env *fv1.Environment, activeBuilds int32) error {
 	builderNs := pkgw.nsResolver.GetBuilderNS(env.Namespace)
 	builderName := fmt.Sprintf("%v-%v", env.Name, env.ResourceVersion)
 
-	// Get current scale of the builder deployment
+	maxPods := builderPoolSize(env)
+	desired := activeBuilds
+	if desired < 1 {
+		desired = 1
+	}
+	if desired > maxPods {
+		desired = maxPods
+	}
+
 	scale, err := pkgw.k8sClient.AppsV1().Deployments(builderNs).GetScale(ctx, builderName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get builder deployment scale: %w", err)
 	}
 
-	// If already at 0 or any non-1 value, scale to 1
-	if scale.Spec.Replicas != 1 {
-		pkgw.logger.Info("scaling builder deployment to 1",
+	if scale.Spec.Replicas < desired {
+		pkgw.logger.Info("scaling builder deployment up for concurrent builds",
 			zap.String("builder", builderName),
 			zap.String("namespace", builderNs),
-			zap.Int32("currentReplicas", scale.Spec.Replicas))
+			zap.Int32("currentReplicas", scale.Spec.Replicas),
+			zap.Int32("desiredReplicas", desired),
+			zap.Int32("activeBuilds", activeBuilds),
+			zap.Int32("maxPods", maxPods))
 
-		scale.Spec.Replicas = 1
+		scale.Spec.Replicas = desired
 		_, err = pkgw.k8sClient.AppsV1().Deployments(builderNs).UpdateScale(ctx, builderName, scale, metav1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to scale builder deployment: %w", err)
 		}
 	}
 
-	// Update last build time to prevent reaper from scaling down during build
+	// Refresh last build time so the idle reaper does not scale down during the build.
 	pkgw.envWatcher.UpdateLastBuildTime(env.UID)
 
 	return nil
+}
+
+// acquireReadyBuilderPod blocks (with backoff) until a builder pod for the
+// environment is Ready and not already assigned to another in-flight build, then
+// claims it and returns its pod IP. The caller MUST release the pod with
+// ReleaseBuilderPod when the build finishes. Returns an error if no free, ready
+// pod becomes available before the backoff is exhausted.
+func (pkgw *packageWatcher) acquireReadyBuilderPod(ctx context.Context, logger *zap.Logger, env *fv1.Environment, builderNs string) (string, error) {
+	backOff := utils.NewDefaultBackOff()
+	for backOff.NextExists() {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+		}
+
+		var informer k8sCache.SharedIndexInformer
+		var ok bool
+		if informer, ok = pkgw.podInformer[builderNs]; !ok {
+			if informer, ok = pkgw.podInformer[metav1.NamespaceAll]; !ok {
+				return "", fmt.Errorf("no pod informer found for namespace %s", builderNs)
+			}
+		}
+
+		// Collect Ready builder pod IPs for this environment.
+		var readyIPs []string
+		for _, item := range informer.GetStore().List() {
+			pod, ok := item.(*apiv1.Pod)
+			if !ok {
+				continue
+			}
+			if pod.Labels[LABEL_ENV_NAME] != env.Name ||
+				pod.Labels[LABEL_ENV_NAMESPACE] != builderNs ||
+				pod.Labels[LABEL_ENV_RESOURCEVERSION] != env.ResourceVersion {
+				continue
+			}
+			if pod.Status.PodIP == "" {
+				continue
+			}
+			// Pod may be "Running" but not yet pass health checks, so use
+			// ContainerStatuses readiness rather than pod.Status.Phase.
+			podIsReady := len(pod.Status.ContainerStatuses) > 0
+			for _, cStatus := range pod.Status.ContainerStatuses {
+				podIsReady = podIsReady && cStatus.Ready
+			}
+			if podIsReady {
+				readyIPs = append(readyIPs, pod.Status.PodIP)
+			}
+		}
+
+		// Claim a ready pod that no other build is using.
+		if ip, claimed := pkgw.envWatcher.ClaimFreeBuilderPod(env.UID, readyIPs); claimed {
+			return ip, nil
+		}
+
+		// No free ready pod yet: pods may still be starting up, or every ready
+		// pod is busy with another build (we are at the pool cap and must queue).
+		logger.Info("waiting for a free ready builder pod",
+			zap.Int("readyPods", len(readyIPs)))
+		time.Sleep(backOff.GetNext())
+	}
+	return "", fmt.Errorf("timed out waiting for a free builder pod")
 }
