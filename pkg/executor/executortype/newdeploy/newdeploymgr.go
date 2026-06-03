@@ -448,6 +448,15 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 				zap.String("namespace", ns), zap.String("name", name))
 		}
 	}
+
+	// Do not provision the deployment until the function's package has finished
+	// building. Otherwise the pod's fetcher sidecar specializes on startup,
+	// fails to fetch a deploy archive that does not exist yet, and the pod
+	// CrashLoopBackOffs until the build eventually lands.
+	if err := deploy.waitForBuild(ctx, fn); err != nil {
+		return nil, err
+	}
+
 	env, err := deploy.fissionClient.CoreV1().
 		Environments(fn.Spec.Environment.Namespace).
 		Get(ctx, fn.Spec.Environment.Name, metav1.GetOptions{})
@@ -537,6 +546,68 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 	metrics.ColdStarts.WithLabelValues(fn.Name, fn.Namespace).Inc()
 
 	return fsvc, nil
+}
+
+// defaultBuildWaitTimeout is how long (in seconds) waitForBuild polls for a
+// function's package to finish building before giving up and provisioning the
+// deployment anyway. It can be overridden with the NEWDEPLOY_BUILD_WAIT_TIMEOUT
+// environment variable.
+const defaultBuildWaitTimeout uint = 600
+
+// waitForBuild blocks until the package referenced by fn is ready to be fetched,
+// so that newdeploy never provisions a deployment whose fetcher sidecar would
+// CrashLoopBackOff fetching a deploy archive that has not been built yet
+// (see fetcher.Fetch, which rejects packages whose BuildStatus is not
+// "succeeded"/"none").
+//
+//   - succeeded / none -> build is ready, return nil and provision.
+//   - failed           -> build failed, return an error and skip provisioning;
+//     the pod would crash-loop forever anyway.
+//   - pending / running / empty -> keep polling until the build settles or the
+//     wait window elapses, after which we fall back to provisioning anyway so an
+//     unusually slow build can never permanently block the function (this is the
+//     legacy behaviour: the fetcher sidecar retries until the build lands).
+func (deploy *NewDeploy) waitForBuild(ctx context.Context, fn *fv1.Function) error {
+	pkgRef := fn.Spec.Package.PackageRef
+	if pkgRef.Name == "" {
+		return nil
+	}
+
+	logger := otelUtils.LoggerWithTraceID(ctx, deploy.logger)
+
+	timeoutSec, err := utils.GetUIntValueFromEnv("NEWDEPLOY_BUILD_WAIT_TIMEOUT")
+	if err != nil {
+		timeoutSec = defaultBuildWaitTimeout
+	}
+
+	for i := uint(0); i < timeoutSec; i++ {
+		pkg, err := deploy.fissionClient.CoreV1().Packages(pkgRef.Namespace).Get(ctx, pkgRef.Name, metav1.GetOptions{})
+		if err != nil {
+			// Just after the package is created the API server may briefly
+			// return NotFound; keep waiting for it to become visible.
+			if k8sErrs.IsNotFound(err) {
+				time.Sleep(time.Second)
+				continue
+			}
+			return fmt.Errorf("error getting package %s.%s while waiting for build: %w", pkgRef.Name, pkgRef.Namespace, err)
+		}
+
+		switch pkg.Status.BuildStatus {
+		case fv1.BuildStatusSucceeded, fv1.BuildStatusNone:
+			return nil
+		case fv1.BuildStatusFailed:
+			return fmt.Errorf("package %s.%s build failed, not provisioning deployment", pkg.Name, pkg.Namespace)
+		}
+
+		// pending / running / empty -> not built yet, keep polling.
+		time.Sleep(time.Second)
+	}
+
+	logger.Warn("package build did not finish within the wait window, provisioning deployment anyway",
+		zap.String("package", pkgRef.Name),
+		zap.String("namespace", pkgRef.Namespace),
+		zap.Uint("timeout_seconds", timeoutSec))
+	return nil
 }
 
 func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function, newFn *fv1.Function) error {
@@ -667,6 +738,13 @@ func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function
 }
 
 func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment) error {
+	// When the update points the function at a freshly created package (e.g. a new
+	// revision), wait for that package to finish building before rolling the
+	// deployment, so the new pod does not crash-loop fetching an unbuilt archive.
+	if err := deploy.waitForBuild(ctx, fn); err != nil {
+		return err
+	}
+
 	fsvc, err := deploy.fsCache.GetByFunctionUID(fn.UID)
 	if err != nil {
 		return fmt.Errorf("error updating function due to unable to find function service cache: %s: %w", k8sCache.MetaObjectToName(fn), err)

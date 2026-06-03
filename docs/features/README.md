@@ -17,4 +17,5 @@ GitHub PRs and should not be hand-edited.
 
 | Date | Type | Title | Details | Status |
 |------|------|-------|---------|--------|
+| 2026-06-03 | Fix | newdeploy: wait for package build before provisioning | [newdeploy-wait-for-build.md](newdeploy-wait-for-build.md) | Implemented; build/unit verified. Live e2e pending. |
 | 2026-05-30 | Feature | Scale-to-zero for builders | [builder-scale-to-zero.md](builder-scale-to-zero.md) | Implemented; unit-tested. Live-cluster e2e pending. |
