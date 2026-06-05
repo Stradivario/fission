@@ -59,12 +59,44 @@ rules:
   - list
   - watch
 - apiGroups:
+  - ""
+  resources:
+  # The buildermgr provisions the fission-internal-auth Secret (the shared HMAC
+  # secret) on demand in each builder namespace under watch-all-namespaces, so the
+  # builder's fetcher can sign storagesvc requests. Needs create/update in addition
+  # to the get/list/watch above.
+  - secrets
+  verbs:
+  - create
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  # delete is scoped by name: the buildermgr removes the tenant fission-internal-auth
+  # copy when internal auth is turned off, so leftover copies don't make fetchers
+  # enforce HMAC against an unsigned control plane.
+  resourceNames:
+  - fission-internal-auth
+  verbs:
+  - delete
+- apiGroups:
   - apps
   resources:
   - deployments
+  # deployments/scale is required by the builder pool: the package reconciler
+  # scales builder deployments UP on demand (reads replicas via deployments/get,
+  # writes via deployments/scale UpdateScale) and the idle reaper scales them
+  # back to zero. Without get on deployments and update on the scale subresource
+  # the buildermgr SA is RBAC-forbidden and builds fail to dispatch.
+  - deployments/scale
   verbs:
+  - get
   - list
+  - watch
   - create
+  - update
+  - patch
   - delete
 - apiGroups:
   - apiextensions.k8s.io
@@ -151,7 +183,29 @@ rules:
   - get
   - list
   - watch
-{{- if .Values.executor.serviceAccountCheck.enabled }}  
+- apiGroups:
+  - ""
+  resources:
+  # The executor provisions the fission-internal-auth Secret (the shared HMAC
+  # secret) on demand in each function namespace under watch-all-namespaces, so the
+  # fetcher sidecar can sign storagesvc requests. Needs create/update in addition
+  # to the get/list/watch above.
+  - secrets
+  verbs:
+  - create
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  # delete is scoped by name: the executor removes the tenant fission-internal-auth
+  # copy when internal auth is turned off, so leftover copies don't make fetchers
+  # enforce HMAC against an unsigned control plane.
+  resourceNames:
+  - fission-internal-auth
+  verbs:
+  - delete
+{{- if .Values.executor.serviceAccountCheck.enabled }}
 - apiGroups:
   - ""
   resources:

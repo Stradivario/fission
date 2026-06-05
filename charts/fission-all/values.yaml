@@ -14,22 +14,22 @@ routerServiceType: LoadBalancer
 ## repository represents base repository for images used in the chart.
 ## Keep it empty for using existing local image
 ##
-repository: ghcr.io
+repository: ghcr.io/stradivario
 
 ## image represents the base image fission-bundle used by multiple Fission components.
 ## We alter arguments to the image to run a particular component.
 ##
-image: fission/fission-bundle
+image: fission-bundle
 
 ## imageTag represents the tag of the base image fission-bundle used by multiple Fission components.
 ## It is also used by the chart to identify version of the few more images apart from fission-bundle.
 ## Keep it empty for using latest tag.
 ##
-imageTag: v1.25.0
+imageTag: v1.23.0-watch-all-namespaces
 
 ## pullPolicy represents the pull policy to use for images in the chart.
 ##
-pullPolicy: IfNotPresent
+pullPolicy: Always
 
 ## imagepullsecrets
 imagePullSecrets: []
@@ -86,6 +86,16 @@ functionNamespace: ""
 ## - namespace3
 additionalFissionNamespaces: []
 
+## watchAllNamespaces makes Fission watch custom resources across ALL namespaces
+## instead of only defaultNamespace + additionalFissionNamespaces. The component
+## managers' controller-runtime caches go cluster-wide (FISSION_WATCH_ALL_NAMESPACES),
+## so this REQUIRES cluster-scoped RBAC: the chart emits ClusterRole/ClusterRoleBinding
+## instead of per-namespace Role/RoleBinding when this is true. Useful when you have
+## many (or dynamically created) function namespaces and don't want to enumerate them
+## in additionalFissionNamespaces and re-upgrade the chart each time.
+##
+watchAllNamespaces: true
+
 ## createNamespace decides to create namespaces by the chart.
 ## If set to true, functionNamespace and builderNamespace namespaces mentioned above will be created by the chart.
 ## Set to false if you want to create the namespaces manually.
@@ -135,11 +145,11 @@ fetcher:
   ## repository represents the repository of the fetcher component.
   ##
   ## By default, it is empty, which means global repository will be used.
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## image represents the image of the fetcher component.
-  image: fission/fetcher
+  image: fetcher
   ## imageTag represents the tag of the image of the fetcher component.
-  imageTag: v1.25.0
+  imageTag: v1.23.0-watch-all-namespaces
 
   ## Fetcher is only for to downloading or uploading archive.
   ## Normally, you don't need to change the value here, unless necessary.
@@ -276,6 +286,18 @@ router:
   ## canaryconfig / buildermgr) only.
   ##
   internalPort: 8889
+  ## enforceSameNamespaceInvocation locks the internal listener
+  ## (/fission-function/<ns>/<name>) so a caller may only invoke a function in
+  ## its OWN namespace — unless the caller is an internal Fission component (a pod
+  ## in this release's namespace). This closes the cross-namespace invocation gap:
+  ## with it off, any pod that can reach router-internal:8889 (and, with
+  ## internalAuth disabled, without any signature) can invoke a private function
+  ## in another namespace. The router attributes the caller's pod IP to a
+  ## namespace via a cluster-wide pod cache, so enabling this grants the router
+  ## `pods` get/list/watch cluster-wide. Intended for multi-tenant clusters
+  ## (typically alongside watchAllNamespaces). Default off.
+  ##
+  enforceSameNamespaceInvocation: true
   ## strategy is the Deployment rollout strategy for the router (ignored when
   ## deployAsDaemonSet is true). Leave unset for the Kubernetes default. The
   ## router is stateless, so a surge strategy gives zero-downtime rollouts:
@@ -812,17 +834,17 @@ preUpgradeChecks:
   ## Repository for pre-install/pre-upgrade checks image
   ## By default it uses the global repository
   ##
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## pre-install/pre-upgrade checks live in this image
   ##
-  image: fission/pre-upgrade-checks
+  image: pre-upgrade-checks
   ## pre-install/pre-upgrade checks image version
   ##
-  imageTag: v1.25.0
+  imageTag: v1.23.0-watch-all-namespaces
 
 ## Fission post-install/post-upgrade reporting live in this image
 ##
-postInstallReportImage: fission/reporter
+postInstallReportImage: reporter
 
 ## If there are any pod specialization errors when a function is triggered, the error
 ## summary is returned as part of http response if this is set to true.
@@ -1116,8 +1138,17 @@ networkPolicy:
 ##
 ## Disabled here means the cluster falls back to NetworkPolicy + namespace
 ## isolation only, matching pre-1.(N+1) behaviour.
+##
+## FORK DEFAULT: disabled. Upstream defaults this ON, but the HMAC verifier on
+## router-internal (and storagesvc) rejects unsigned requests from the upstream
+## KEDA HTTP connectors and the GraphQL federation gateway — neither signs — so
+## with it enabled, MessageQueueTrigger (RabbitMQ/Kafka/…) message delivery and
+## federated subgraph calls fail with 401. This fork ran for its whole v1.22.x
+## life with no HMAC at all, so off-by-default preserves that behaviour and keeps
+## those integrations working. Re-enable it (and use signing-aware connector
+## images) if you need internal-channel signing. See docs/features/internal-auth.md.
 internalAuth:
-  enabled: true
+  enabled: false
   # secret: "" — auto-generated on first install; preserved on upgrade.
   # oldSecret: "" — set during rotation; accepted by the verifier alongside `secret`.
 

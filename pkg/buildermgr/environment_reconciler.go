@@ -67,6 +67,7 @@ type EnvironmentReconciler struct {
 	useIstio               bool
 	podSpecPatch           *apiv1.PodSpec
 	enableOwnerReferences  bool
+	poolMgr                *BuilderPoolManager
 }
 
 func makeEnvironmentReconciler(
@@ -74,7 +75,8 @@ func makeEnvironmentReconciler(
 	client client.Client,
 	kubernetesClient kubernetes.Interface,
 	fetcherConfig *fetcherConfig.Config,
-	podSpecPatch *apiv1.PodSpec) *EnvironmentReconciler {
+	podSpecPatch *apiv1.PodSpec,
+	poolMgr *BuilderPoolManager) *EnvironmentReconciler {
 
 	useIstio := false
 	enableIstio := os.Getenv("ENABLE_ISTIO")
@@ -96,6 +98,7 @@ func makeEnvironmentReconciler(
 		fetcherConfig:          fetcherConfig,
 		podSpecPatch:           podSpecPatch,
 		enableOwnerReferences:  utils.IsOwnerReferencesEnabled(),
+		poolMgr:                poolMgr,
 	}
 }
 
@@ -108,6 +111,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// too; this explicit delete is the primary path when they are
 			// disabled (the default) and a harmless no-op once GC has run.
 			r.deleteBuilder(ctx, req.Namespace, req.Name)
+			// Drop the pool state so the idle reaper stops tracking the gone env.
+			r.poolMgr.ForgetByName(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -128,6 +133,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		r.logger.Error(err, "error ensuring builder service", "env_name", env.Name, "builder_namespace", ns)
 		return ctrl.Result{}, err
 	}
+
+	// Register the environment in the builder pool so the idle reaper tracks it
+	// and the PackageReconciler shares its build/pod-claim state. Idempotent, and
+	// it repopulates the in-memory pool after a buildermgr restart (every
+	// Environment re-lists as a Create on startup).
+	r.poolMgr.Ensure(env, ns)
 
 	// NOTE: writing EnvironmentConditionReady here would bump env.RV via the
 	// status subresource, but the builder service name (and its DNS lookup in
@@ -160,6 +171,14 @@ func (r *EnvironmentReconciler) getLabels(envName string, envNamespace string, e
 // createBuilderDeployment are skipped when a matching (current-RV) object is
 // already present, so this is idempotent across repeated reconciles.
 func (r *EnvironmentReconciler) ensureBuilder(ctx context.Context, env *fv1.Environment, ns string) error {
+	// Ensure the fission-builder ServiceAccount and the fission-internal-auth
+	// Secret exist in the builder namespace. Under watch-all-namespaces the builder
+	// can be created in any namespace and its pod needs both present there — the
+	// builder's fetcher sidecar uploads the built archive to storagesvc, which
+	// fails with HTTP 401 without the HMAC secret. Idempotent.
+	utils.EnsureBuilderSA(ctx, r.kubernetesClient, r.logger, ns)
+	utils.EnsureInternalAuthSecret(ctx, r.kubernetesClient, r.logger, ns)
+
 	sel := r.getLabels(env.Name, ns, env.ResourceVersion)
 
 	svcList, err := r.getBuilderServiceList(ctx, sel, ns)
