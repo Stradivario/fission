@@ -58,6 +58,53 @@ entries:
           description: "newdeploy waits for the package build before provisioning"
         - kind: fixed
           description: "Router will not be accessible for pods trying to access it from outside their namespace"
+        - kind: fixed
+          description: "Router now has option to add allowed namespaces to access internal fission router"
+      artifacthub.io/signKey: |
+        fingerprint: 2EAE29FDF8A387050C82CD5ABBDD4FD6A1FFCBF6
+        url: https://raw.githubusercontent.com/fission/fission-charts/main/public_key/pgp_keys.asc
+    apiVersion: v2
+    appVersion: v1.23.1-watch-all-namespaces
+    created: "2026-06-16T19:06:54.27942822Z"
+    description: Fission is a fast serverless framework for Kubernetes.
+    digest: d5417ac9fea7e07be27ade4ef2dcdbbdad61f9c32bc1bae6e74beedca4b07983
+    home: https://fission.io/
+    icon: https://fission.io/images/fission-logo-white.svg
+    keywords:
+    - fission
+    - serverless
+    - platform
+    - faas
+    - functions
+    - Integration & Delivery
+    kubeVersion: '>=1.32.0-0'
+    maintainers:
+    - email: vishal@infracloud.io
+      name: Vishal Biyani
+    - email: sanket@infracloud.io
+      name: Sanket Sudake
+    name: fission-all
+    sources:
+    - https://github.com/fission/fission
+    - https://github.com/fission/keda-connectors
+    type: application
+    urls:
+    - https://github.com/Stradivario/fission/releases/download/fission-all-1.23.1-watch-all-namespaces/fission-all-1.23.1-watch-all-namespaces.tgz
+    version: 1.23.1-watch-all-namespaces
+  - annotations:
+      artifacthub.io/changes: |
+        - kind: added
+          description: "Concurrent builder pods: demand-based builder pool (spec.builder.poolsize)"
+        - kind: added
+          description: "Builder scale-to-zero: idle builders scale to 0 and scale back up on build (spec.builder.idleTimeout)"
+        - kind: added
+          description: "Watch all namespaces: cluster-wide watching of Fission resources (watchAllNamespaces)"
+        - kind: fixed
+          description: "buildermgr RBAC for deployments/scale (required by the builder pool)"
+        - kind: fixed
+          description: "newdeploy waits for the package build before provisioning"
+        - kind: fixed
+          description: "Router will not be accessible for pods trying to access it from outside their namespace"
       artifacthub.io/signKey: |
         fingerprint: 2EAE29FDF8A387050C82CD5ABBDD4FD6A1FFCBF6
         url: https://raw.githubusercontent.com/fission/fission-charts/main/public_key/pgp_keys.asc
@@ -295,4 +342,4 @@ entries:
     urls:
     - https://github.com/Stradivario/fission/releases/download/fission-all-1.22.2-watch-all-namespaces/fission-all-1.22.2-watch-all-namespaces.tgz
     version: 1.22.2-watch-all-namespaces
-generated: "2026-06-05T12:40:56.240062611Z"
+generated: "2026-06-16T19:06:54.279503071Z"
