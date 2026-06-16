@@ -39,3 +39,5 @@ annotations:
       description: "newdeploy waits for the package build before provisioning"
     - kind: fixed
       description: "Router will not be accessible for pods trying to access it from outside their namespace"
+    - kind: fixed
+      description: "Router now has option to add allowed namespaces to access internal fission router"
