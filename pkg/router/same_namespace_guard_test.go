@@ -29,17 +29,22 @@ func TestSameNamespaceGuard(t *testing.T) {
 	const installNS = "fission"
 
 	cases := []struct {
-		name       string
-		callerIP   string
-		lookup     mapLookup
-		targetNS   string
-		wantStatus int
-		wantInner  bool
+		name              string
+		callerIP          string
+		lookup            mapLookup
+		targetNS          string
+		allowedNamespaces []string
+		wantStatus        int
+		wantInner         bool
 	}{
-		{"same namespace allowed", "10.0.0.1:5000", mapLookup{"10.0.0.1": "tenant-a"}, "tenant-a", http.StatusOK, true},
-		{"internal component (install ns) may invoke any namespace", "10.0.0.2:5000", mapLookup{"10.0.0.2": installNS}, "tenant-b", http.StatusOK, true},
-		{"cross-namespace forbidden", "10.0.0.3:5000", mapLookup{"10.0.0.3": "tenant-a"}, "tenant-b", http.StatusForbidden, false},
-		{"unresolved caller IP forbidden (fail closed)", "10.0.0.9:5000", mapLookup{}, "tenant-a", http.StatusForbidden, false},
+		{"same namespace allowed", "10.0.0.1:5000", mapLookup{"10.0.0.1": "tenant-a"}, "tenant-a", nil, http.StatusOK, true},
+		{"internal component (install ns) may invoke any namespace", "10.0.0.2:5000", mapLookup{"10.0.0.2": installNS}, "tenant-b", nil, http.StatusOK, true},
+		{"cross-namespace forbidden", "10.0.0.3:5000", mapLookup{"10.0.0.3": "tenant-a"}, "tenant-b", nil, http.StatusForbidden, false},
+		{"unresolved caller IP forbidden (fail closed)", "10.0.0.9:5000", mapLookup{}, "tenant-a", nil, http.StatusForbidden, false},
+		{"allowed namespace bypasses guard", "10.0.0.4:5000", mapLookup{"10.0.0.4": "monitoring"}, "tenant-b", []string{"monitoring"}, http.StatusOK, true},
+		{"allowed namespace not in list still forbidden", "10.0.0.5:5000", mapLookup{"10.0.0.5": "monitoring"}, "tenant-b", []string{"logging"}, http.StatusForbidden, false},
+		{"allowed namespace + same namespace still allowed", "10.0.0.6:5000", mapLookup{"10.0.0.6": "tenant-a"}, "tenant-a", []string{"monitoring"}, http.StatusOK, true},
+		{"install namespace takes precedence over allowed list", "10.0.0.7:5000", mapLookup{"10.0.0.7": installNS}, "tenant-c", []string{"other"}, http.StatusOK, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -48,7 +53,11 @@ func TestSameNamespaceGuard(t *testing.T) {
 				innerCalled = true
 				w.WriteHeader(http.StatusOK)
 			})
-			g := &sameNamespaceGuard{lookup: tc.lookup, installNamespace: installNS, logger: loggerfactory.GetLogger()}
+			allowed := make(map[string]struct{})
+			for _, ns := range tc.allowedNamespaces {
+				allowed[ns] = struct{}{}
+			}
+			g := &sameNamespaceGuard{lookup: tc.lookup, installNamespace: installNS, allowedNamespaces: allowed, logger: loggerfactory.GetLogger()}
 			h := g.wrap(inner, tc.targetNS)
 
 			req := httptest.NewRequest(http.MethodPost, "/fission-function/"+tc.targetNS+"/fn", nil)
@@ -58,6 +67,31 @@ func TestSameNamespaceGuard(t *testing.T) {
 
 			assert.Equal(t, tc.wantStatus, rec.Code)
 			assert.Equal(t, tc.wantInner, innerCalled, "inner handler reached?")
+		})
+	}
+}
+
+func TestParseAllowedNamespaces(t *testing.T) {
+	tests := []struct {
+		name  string
+		raw   string
+		want  map[string]struct{}
+		count int
+	}{
+		{"empty string", "", map[string]struct{}{}, 0},
+		{"single namespace", "monitoring", map[string]struct{}{"monitoring": {}}, 1},
+		{"multiple namespaces", "monitoring,logging", map[string]struct{}{"monitoring": {}, "logging": {}}, 2},
+		{"with spaces", "  monitoring , logging ", map[string]struct{}{"monitoring": {}, "logging": {}}, 2},
+		{"trailing comma", "monitoring,", map[string]struct{}{"monitoring": {}}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseAllowedNamespaces(tt.raw)
+			assert.Equal(t, tt.count, len(got))
+			for k := range tt.want {
+				_, ok := got[k]
+				assert.True(t, ok, "expected key %q not found", k)
+			}
 		})
 	}
 }

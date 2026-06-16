@@ -342,12 +342,15 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		if err != nil {
 			return fmt.Errorf("error starting pod-ip cache for same-namespace guard: %w", err)
 		}
+		allowedNSRaw := os.Getenv(AllowedNamespacesEnv)
 		triggers.callerNSGuard = &sameNamespaceGuard{
-			lookup:           ipCache,
-			installNamespace: installNS,
-			logger:           logger.WithName("same_namespace_guard"),
+			lookup:            ipCache,
+			installNamespace:  installNS,
+			allowedNamespaces: parseAllowedNamespaces(allowedNSRaw),
+			logger:            logger.WithName("same_namespace_guard"),
 		}
-		logger.Info("router internal listener: same-namespace invocation guard enabled", "install_namespace", installNS)
+		logger.Info("router internal listener: same-namespace invocation guard enabled",
+			"install_namespace", installNS, "allowed_namespaces", allowedNSRaw)
 	}
 
 	// Register the trigger + function reconcilers. Each signals a debounced mux

@@ -298,6 +298,13 @@ router:
   ## (typically alongside watchAllNamespaces). Default off.
   ##
   enforceSameNamespaceInvocation: true
+  ## allowedNamespaces lists extra namespaces whose pods may invoke
+  ## /fission-function/<ns>/<name> on the internal listener regardless of the
+  ## target namespace. Useful for cross-namespace monitoring or webhook callers
+  ## (e.g. a Prometheus stack deployed in "monitoring"). The router passes this
+  ## list as the ROUTER_ALLOWED_NAMESPACES env var (comma-separated).
+  ##
+  allowedNamespaces: []
   ## strategy is the Deployment rollout strategy for the router (ignored when
   ## deployAsDaemonSet is true). Leave unset for the Kubernetes default. The
   ## router is stateless, so a surge strategy gives zero-downtime rollouts:

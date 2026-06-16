@@ -73,6 +73,10 @@ spec:
         - name: ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION
           value: "true"
         {{- end }}
+        {{- if .Values.router.allowedNamespaces }}
+        - name: ROUTER_ALLOWED_NAMESPACES
+          value: {{ join "," .Values.router.allowedNamespaces | quote }}
+        {{- end }}
         - name: ROUTER_ROUND_TRIP_TIMEOUT
           value: {{ .Values.router.roundTrip.timeout | default "50ms" | quote }}
         - name: ROUTER_ROUNDTRIP_TIMEOUT_EXPONENT

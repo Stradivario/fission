@@ -13,17 +13,22 @@ private function in another namespace.
 ## What it does
 
 When enabled, the internal listener rejects (`403`) any
-`/fission-function/<ns>/<name>` request unless **either**:
+`/fission-function/<ns>/<name>` request unless **one of**:
 
 - the caller's pod is in the **same namespace** as the target function, or
 - the caller is an **internal Fission component** — a pod in the Fission install
   namespace (executor, kubewatcher, timer, mqtrigger, …), which legitimately
-  invoke functions across namespaces.
+  invoke functions across namespaces, or
+- the caller's namespace is listed in `router.allowedNamespaces` (e.g.
+  `"monitoring"`), which lets cross-namespace infrastructure like Prometheus
+  invoke private functions in any namespace.
 
 This fits the common patterns exactly: a GraphQL federation gateway invoking its
 own-namespace subgraphs passes; a KEDA connector (deployed in the function's
 namespace) invoking that function passes; internal triggers pass; a function in
-namespace A invoking a private function in namespace B is blocked.
+namespace A invoking a private function in namespace B is blocked; a webhook
+receiver in the monitoring namespace that needs to invoke quota-alert functions
+in any tenant namespace passes when monitoring is in `allowedNamespaces`.
 
 ## How it decides the caller
 
@@ -49,8 +54,20 @@ path. A caller IP that cannot be resolved to a pod is **rejected** (fail closed)
 helm upgrade fission ... --set router.enforceSameNamespaceInvocation=true
 ```
 
+Or with an allowed namespace for cross-namespace monitoring:
+```bash
+helm upgrade fission ... --set router.enforceSameNamespaceInvocation=true --set router.allowedNamespaces={monitoring}
+```
+
+Multiple namespaces (Helm `--set` array syntax):
+```bash
+helm upgrade fission ... --set router.enforceSameNamespaceInvocation=true --set router.allowedNamespaces={monitoring,logging}
+```
+
 This:
 - sets `ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION=true` on the router;
+- sets `ROUTER_ALLOWED_NAMESPACES=<value>` on the router when `allowedNamespaces`
+  is non-empty;
 - creates a cluster-scoped ClusterRole granting the router `pods` get/list/watch
   (needed for the IP→namespace cache — a caller can be in any namespace).
 
@@ -73,7 +90,11 @@ to their own namespace's functions.
 
 ## Key files
 
-- `pkg/router/same_namespace_guard.go` — the guard + pod-IP cache
+- `pkg/router/same_namespace_guard.go` — the guard + pod-IP cache +
+  `ROUTER_ALLOWED_NAMESPACES` parsing
 - `pkg/router/httpTriggers.go` — per-function handler wrapping in `buildMuxes`
-- `pkg/router/router.go` — wiring (`ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION`)
+- `pkg/router/router.go` — wiring (`ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION`,
+  `ROUTER_ALLOWED_NAMESPACES`)
+- `charts/fission-all/templates/router/deployment.yaml` — env var injection
 - `charts/fission-all/templates/router/same-namespace-guard-rbac.yaml` — pods ClusterRole
+- `charts/fission-all/values.yaml` — `allowedNamespaces` setting

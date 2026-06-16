@@ -31,6 +31,12 @@ import (
 // (when internalAuth is disabled) unauthenticated internal listener.
 const EnforceSameNamespaceInvocationEnv = "ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION"
 
+// AllowedNamespacesEnv lists extra namespaces (comma-separated) whose pods may
+// invoke /fission-function/<ns>/<name> on the internal listener regardless of
+// the target namespace. Useful for cross-namespace monitoring or webhook callers
+// (e.g. a Prometheus stack deployed in "monitoring").
+const AllowedNamespacesEnv = "ROUTER_ALLOWED_NAMESPACES"
+
 // callerNamespaceLookup resolves a caller pod IP to its namespace.
 type callerNamespaceLookup interface {
 	lookup(ip string) (namespace string, found bool)
@@ -43,27 +49,30 @@ type callerNamespaceLookup interface {
 type sameNamespaceGuard struct {
 	lookup           callerNamespaceLookup
 	installNamespace string
+	allowedNamespaces map[string]struct{}
 	logger           logr.Logger
 }
 
 // wrap returns inner guarded so it only serves callers whose namespace is
-// targetNamespace, or the install namespace (internal Fission components such as
+// targetNamespace, the install namespace (internal Fission components such as
 // timer / kubewatcher / mqtrigger / executor, which legitimately invoke
-// functions in any namespace). Everything else gets 403.
+// functions in any namespace), or one of the explicitly allowed namespaces
+// (e.g. "monitoring"). Everything else gets 403.
 func (g *sameNamespaceGuard) wrap(inner http.Handler, targetNamespace string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callerIP := clientIP(r.RemoteAddr)
 		callerNS, found := g.lookup.lookup(callerIP)
 		if !found {
-			// Fail closed: a source we cannot attribute to a namespace must not be
-			// allowed to invoke cross-namespace. Pods — internal components and
-			// functions alike — all have resolvable IPs.
 			g.logger.Info("rejecting internal invocation: caller namespace unresolved",
 				"caller_ip", callerIP, "target_namespace", targetNamespace, "path", r.URL.Path)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
 		if callerNS != g.installNamespace && callerNS != targetNamespace {
+			if _, ok := g.allowedNamespaces[callerNS]; ok {
+				inner.ServeHTTP(w, r)
+				return
+			}
 			g.logger.Info("rejecting cross-namespace internal invocation",
 				"caller_namespace", callerNS, "target_namespace", targetNamespace,
 				"caller_ip", callerIP, "path", r.URL.Path)
@@ -72,6 +81,19 @@ func (g *sameNamespaceGuard) wrap(inner http.Handler, targetNamespace string) ht
 		}
 		inner.ServeHTTP(w, r)
 	})
+}
+
+// parseAllowedNamespaces parses a comma-separated env var value into a set for
+// O(1) lookups. Empty input returns an empty set (no additional namespaces).
+func parseAllowedNamespaces(raw string) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	for _, ns := range strings.Split(raw, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			allowed[ns] = struct{}{}
+		}
+	}
+	return allowed
 }
 
 // clientIP extracts the IP from a net/http RemoteAddr ("ip:port"). X-Forwarded-For
