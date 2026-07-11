@@ -733,7 +733,17 @@ tenancy:
   ##           single-tenant/trusted clusters.
   ## dynamic and cluster set FISSION_TENANCY_MODE on the data-plane components and
   ## render the tenant controller; static renders neither.
-  mode: static
+  ##
+  ## This fork defaults to "dynamic": lambforge.com runs Fission as a shared,
+  ## multi-tenant control plane where tenant namespaces must NOT be able to read
+  ## each other's Secrets/ConfigMaps, which is exactly the posture "dynamic"
+  ## provides (and "cluster" explicitly does not — see its warning above). This
+  ## replaces the fork's old custom watch-all-namespaces mechanism; unlike that
+  ## mechanism, onboarding is explicit (fission.io/enabled=true label or
+  ## `fission tenant enable <ns>`), not automatic for every namespace in the
+  ## cluster. See docs/features/watch-all-namespaces.md for the migration note
+  ## (existing tenant namespaces need a one-time backfill before cutover).
+  mode: dynamic
 
 ## The tenant controller is the multi-namespace tenancy lifecycle controller
 ## (docs/multiple-namespace). It is rendered automatically when tenancy.mode is
@@ -1336,8 +1346,20 @@ networkPolicy:
 ##
 ## Disabled here means the cluster falls back to NetworkPolicy + namespace
 ## isolation only, matching pre-1.(N+1) behaviour.
+##
+## This fork defaults this OFF (upstream defaults it on): the unsigned KEDA
+## HTTP connector images and the GraphQL federation gateway this fork's
+## deployments rely on do not sign their calls to router-internal, and would
+## 401 if HMAC verification were enforced. See docs/features/internal-auth.md.
+## Note this also means tenancy.mode=dynamic's per-namespace derived-key
+## provisioning is a no-op (pkg/tenant/provision_auth.go: EnsureNamespaceAuthSecret
+## short-circuits when the master secret is empty) — dynamic mode's RBAC/cache
+## isolation (Tier A/B split, no cluster-wide Secrets/ConfigMaps read) still
+## fully applies regardless; only the additional per-namespace-HMAC-key layer
+## is inactive until internalAuth is opted back on (which requires the KEDA
+## connectors + federation gateway to sign, same prerequisite as before).
 internalAuth:
-  enabled: true
+  enabled: false
   # secret: "" — auto-generated on first install; preserved on upgrade.
   # oldSecret: "" — set during rotation; accepted by the verifier alongside `secret`.
 
