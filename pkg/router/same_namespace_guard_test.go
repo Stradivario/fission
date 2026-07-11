@@ -8,13 +8,23 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/fission/fission/pkg/utils/loggerfactory"
+)
+
+// testUnresolvedRetries/testUnresolvedRetryInterval keep the unresolved-caller
+// test cases fast and deterministic instead of eating the real ~250ms default
+// retry budget (defaultUnresolvedRetries * defaultUnresolvedRetryInterval).
+const (
+	testUnresolvedRetries       = 1
+	testUnresolvedRetryInterval = time.Millisecond
 )
 
 // mapLookup is a static callerNamespaceLookup for tests: ip -> namespace.
@@ -57,7 +67,14 @@ func TestSameNamespaceGuard(t *testing.T) {
 			for _, ns := range tc.allowedNamespaces {
 				allowed[ns] = struct{}{}
 			}
-			g := &sameNamespaceGuard{lookup: tc.lookup, installNamespace: installNS, allowedNamespaces: allowed, logger: loggerfactory.GetLogger()}
+			g := &sameNamespaceGuard{
+				lookup:                  tc.lookup,
+				installNamespace:        installNS,
+				allowedNamespaces:       allowed,
+				logger:                  loggerfactory.GetLogger(),
+				unresolvedRetries:       testUnresolvedRetries,
+				unresolvedRetryInterval: testUnresolvedRetryInterval,
+			}
 			h := g.wrap(inner, tc.targetNS)
 
 			req := httptest.NewRequest(http.MethodPost, "/fission-function/"+tc.targetNS+"/fn", nil)
@@ -69,6 +86,87 @@ func TestSameNamespaceGuard(t *testing.T) {
 			assert.Equal(t, tc.wantInner, innerCalled, "inner handler reached?")
 		})
 	}
+}
+
+// eventuallyResolvingLookup reports unresolved for the first missBeforeHit
+// lookups of a given IP, then resolves to ns thereafter -- simulating a
+// brand-new caller pod whose IP becomes observable (via the informer or the
+// API fallback) only after a short delay, confirmed live against a real
+// cluster (see resolveCallerNamespace's doc comment).
+type eventuallyResolvingLookup struct {
+	ip            string
+	ns            string
+	missBeforeHit int
+	calls         int
+}
+
+func (e *eventuallyResolvingLookup) lookup(ip string) (string, bool) {
+	if ip != e.ip {
+		return "", false
+	}
+	e.calls++
+	if e.calls <= e.missBeforeHit {
+		return "", false
+	}
+	return e.ns, true
+}
+
+// TestResolveCallerNamespaceRetriesBeforeFailingClosed pins the fix for a
+// 100%-reproducible race confirmed live: a pod's very first request to the
+// internal listener, fired the instant its container starts, was rejected
+// every time because neither the informer cache nor the direct API-list
+// fallback had observed the pod's own status.podIP yet. resolveCallerNamespace
+// must retry briefly instead of failing closed on the first miss.
+func TestResolveCallerNamespaceRetriesBeforeFailingClosed(t *testing.T) {
+	t.Run("resolves within the retry budget", func(t *testing.T) {
+		lookup := &eventuallyResolvingLookup{ip: "10.0.0.1", ns: "tenant-a", missBeforeHit: 2}
+		g := &sameNamespaceGuard{
+			lookup:                  lookup,
+			logger:                  loggerfactory.GetLogger(),
+			unresolvedRetries:       testUnresolvedRetries + 2,
+			unresolvedRetryInterval: testUnresolvedRetryInterval,
+		}
+		ns, found := g.resolveCallerNamespace("10.0.0.1")
+		require.True(t, found, "must resolve once the lookup starts succeeding, not fail closed on the first miss")
+		assert.Equal(t, "tenant-a", ns)
+		assert.Greater(t, lookup.calls, 1, "must have actually retried, not just the first bare lookup")
+	})
+
+	t.Run("still fails closed once the retry budget is exhausted", func(t *testing.T) {
+		lookup := &eventuallyResolvingLookup{ip: "10.0.0.1", ns: "tenant-a", missBeforeHit: 1000}
+		g := &sameNamespaceGuard{
+			lookup:                  lookup,
+			logger:                  loggerfactory.GetLogger(),
+			unresolvedRetries:       testUnresolvedRetries,
+			unresolvedRetryInterval: testUnresolvedRetryInterval,
+		}
+		_, found := g.resolveCallerNamespace("10.0.0.1")
+		assert.False(t, found, "a caller that never resolves must still fail closed, not retry forever")
+	})
+
+	t.Run("wrap() end-to-end: a request from an initially-unresolved caller succeeds once it resolves", func(t *testing.T) {
+		lookup := &eventuallyResolvingLookup{ip: "10.0.0.1", ns: "tenant-a", missBeforeHit: 2}
+		innerCalled := false
+		inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			innerCalled = true
+			w.WriteHeader(http.StatusOK)
+		})
+		g := &sameNamespaceGuard{
+			lookup:                  lookup,
+			logger:                  loggerfactory.GetLogger(),
+			unresolvedRetries:       testUnresolvedRetries + 2,
+			unresolvedRetryInterval: testUnresolvedRetryInterval,
+		}
+		h := g.wrap(inner, "tenant-a")
+
+		req := httptest.NewRequest(http.MethodPost, "/fission-function/tenant-a/fn", nil)
+		req.RemoteAddr = "10.0.0.1:5000"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		assert.Equal(t, http.StatusOK, rec.Code, "must not 403 a same-namespace caller just because its first lookup missed")
+		assert.True(t, innerCalled)
+	})
 }
 
 func TestParseAllowedNamespaces(t *testing.T) {
