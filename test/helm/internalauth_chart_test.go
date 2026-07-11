@@ -28,7 +28,7 @@ func TestInternalAuthExistingSecret(t *testing.T) {
 	const defaultName = "fission-internal-auth"
 
 	t.Run("default: the chart renders the master and points at it", func(t *testing.T) {
-		docs := render(t)
+		docs := renderAuth(t)
 		assert.Positive(t, docs.countByKindName("Secret", defaultName),
 			"with no existingSecret the chart must generate the master itself")
 		names := internalAuthEnvNames(t, docs)
@@ -40,7 +40,7 @@ func TestInternalAuthExistingSecret(t *testing.T) {
 	})
 
 	t.Run("existingSecret: the chart renders no master and points at theirs", func(t *testing.T) {
-		docs := render(t, "--set", "internalAuth.existingSecret=my-master")
+		docs := renderAuth(t, "--set", "internalAuth.existingSecret=my-master")
 		assert.Zero(t, docs.countByKindName("Secret", defaultName),
 			"the chart must not generate a master when the operator supplies one")
 		names := internalAuthEnvNames(t, docs)
@@ -61,7 +61,7 @@ func TestInternalAuthExistingSecret(t *testing.T) {
 			{nil, defaultName},
 			{[]string{"--set", "internalAuth.existingSecret=my-master"}, "my-master"},
 		} {
-			vals := envValues(t, render(t, tc.args...), "FISSION_INTERNAL_AUTH_SECRET_NAME")
+			vals := envValues(t, renderAuth(t, tc.args...), "FISSION_INTERNAL_AUTH_SECRET_NAME")
 			require.NotEmptyf(t, vals, "FISSION_INTERNAL_AUTH_SECRET_NAME must be set (%v)", tc.args)
 			for _, v := range vals {
 				assert.Equal(t, tc.want, v)
@@ -76,7 +76,7 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 	const master = "fission-internal-auth"
 
 	t.Run("off by default: the template still renders the master", func(t *testing.T) {
-		docs := render(t)
+		docs := renderAuth(t)
 		assert.Positive(t, docs.countByKindName("Secret", master),
 			"autoGenerate defaults off, so existing installs must be untouched")
 		assert.Zero(t, docs.countByKindName("Role", "fission-preupgrade-authgen"),
@@ -84,7 +84,7 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 	})
 
 	t.Run("on: the template stops rendering and the hook is wired", func(t *testing.T) {
-		docs := render(t, "--set", "internalAuth.autoGenerate=true")
+		docs := renderAuth(t, "--set", "internalAuth.autoGenerate=true")
 		assert.Zero(t, docs.countByKindName("Secret", master),
 			"generation moves in-cluster, so the template must render no master — "+
 				"the retention hook is what stops Helm pruning the live one")
@@ -99,7 +99,8 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 	// master must NOT reach tenant namespaces — they get controller-owned
 	// derived keys, and a master there would defeat the isolation end state.
 	t.Run("static tenancy fans out; dynamic does not", func(t *testing.T) {
-		static := render(t,
+		static := renderAuth(t,
+			"--set", "tenancy.mode=static", // explicit: this fork defaults to dynamic
 			"--set", "internalAuth.autoGenerate=true",
 			"--set", "additionalFissionNamespaces={fission-fn}")
 		staticNS := envValues(t, static, "GENERATE_AUTH_SECRET_NAMESPACES")
@@ -107,7 +108,7 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 		assert.Contains(t, staticNS[0], "fission-fn",
 			"static tenancy replicates the master: kubelet cannot resolve a cross-namespace secretKeyRef")
 
-		dynamic := render(t,
+		dynamic := renderAuth(t,
 			"--set", "internalAuth.autoGenerate=true",
 			"--set", "tenancy.mode=dynamic",
 			"--set", "additionalFissionNamespaces={fission-fn}")
@@ -134,7 +135,7 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 			{"an operator-owned secret under another name", []string{"--set", "internalAuth.existingSecret=my-own"}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				vals := envValues(t, render(t, tc.args...), "ADOPT_SECRETS")
+				vals := envValues(t, renderAuth(t, tc.args...), "ADOPT_SECRETS")
 				require.NotEmpty(t, vals, "the retention hook must render")
 				assert.Containsf(t, vals[0], master,
 					"the chart-generated master must stay in the retention set (%s), "+
@@ -151,6 +152,7 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 	// does for crds.mode=hook with the same Job disabled.
 	t.Run("autoGenerate without the hook Job refuses to render", func(t *testing.T) {
 		_, err := renderErr(t,
+			"--set", "internalAuth.enabled=true", // this fork defaults it off
 			"--set", "internalAuth.autoGenerate=true",
 			"--set", "preUpgradeChecks.enabled=false",
 			// Otherwise the pre-existing crds.mode guard fires first and we
@@ -171,7 +173,7 @@ func TestInternalAuthAutoGenerate(t *testing.T) {
 	// create looks safer and is actually inert, which is precisely the kind of
 	// mistake that survives review, so pin both halves.
 	t.Run("the generation grant is fenced to the master alone", func(t *testing.T) {
-		docs := render(t, "--set", "internalAuth.autoGenerate=true")
+		docs := renderAuth(t, "--set", "internalAuth.autoGenerate=true")
 		var checked, sawGet, sawCreate int
 		for _, role := range roles(t, docs) {
 			if role.Kind != "Role" || role.Name != "fission-preupgrade-authgen" {
@@ -231,4 +233,12 @@ func envValues(t *testing.T, docs manifests, envName string) []string {
 		}
 	})
 	return out
+}
+
+// renderAuth is render with internal auth enabled: this fork defaults
+// internalAuth.enabled to false (docs/features/internal-auth.md), so the
+// internal-auth chart contracts above are exercised with it opted in.
+func renderAuth(t *testing.T, args ...string) manifests {
+	t.Helper()
+	return render(t, append([]string{"--set", "internalAuth.enabled=true"}, args...)...)
 }

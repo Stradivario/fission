@@ -18,7 +18,8 @@ func TestWebhookEnvReaderRBACScopesByTenancy(t *testing.T) {
 	const roleName = "fission-webhook-env-reader" // render() uses release name "fission"
 
 	t.Run("static: namespaced Roles, no ClusterRole", func(t *testing.T) {
-		docs := render(t, "--set", "additionalFissionNamespaces={fission-fn}")
+		// explicit: this fork defaults tenancy.mode to dynamic
+		docs := render(t, "--set", "tenancy.mode=static", "--set", "additionalFissionNamespaces={fission-fn}")
 		assert.GreaterOrEqual(t, docs.countByKindName("Role", roleName), 2,
 			"a Role in defaultNamespace + each additionalFissionNamespaces")
 		assert.Zero(t, docs.countByKindName("ClusterRole", roleName),
