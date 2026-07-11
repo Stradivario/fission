@@ -142,6 +142,18 @@ var poolmgrWarmPodPredicate = predicate.NewPredicateFuncs(func(obj client.Object
 // change (GenerationChangedPredicate), and the istio Service is keyed on the
 // stable function name/uid, so it only needs create/delete.
 func (gpm *GenericPoolManager) ReconcileFunction(ctx context.Context, old, fn *fv1.Function) error {
+	// Mark this function as awaiting a deploy-event outcome on both create and
+	// update, mirroring the newdeploy executor's coverage (fnCreate AND
+	// updateFuncDeployment both fire). poolmgr has no per-function Deployment
+	// to wait on here — the mark is consumed at the actual specialize choke
+	// point (GenericPool.getFuncSvc, gp.go) whenever that next happens, which
+	// may be immediately (if the function is already receiving traffic) or
+	// much later (on the next cold start). Gated on Enabled() so this costs
+	// nothing when eventHooks.functionDeploy isn't configured. See
+	// deploypending.go and docs/features/build-deploy-webhooks.md.
+	if gpm.deployEventHook.Enabled() {
+		gpm.deployPending.mark(fn.UID)
+	}
 	return reconcilePoolmgrFunc(ctx, gpm, gpm.enableIstio, old, fn)
 }
 

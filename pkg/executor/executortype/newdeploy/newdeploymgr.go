@@ -30,6 +30,7 @@ import (
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	ferror "github.com/fission/fission/pkg/error"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/executor/executortype"
 	"github.com/fission/fission/pkg/executor/fscache"
 	"github.com/fission/fission/pkg/executor/metrics"
@@ -81,6 +82,8 @@ type (
 		objectReaperIntervalSecond time.Duration
 
 		enableOwnerReferences bool
+
+		deployEventHook *eventhook.Dispatcher
 
 		// imageVolumeOK is the once-evaluated RFC-0001 Path B gate:
 		// ENABLE_OCI_IMAGE_VOLUME opted in AND the cluster supports
@@ -135,6 +138,8 @@ func MakeNewDeploy(
 		podSpecPatch: podSpecPatch,
 
 		enableOwnerReferences: utils.IsOwnerReferencesEnabled(),
+
+		deployEventHook: eventhook.NewFunctionDeployDispatcher(logger),
 	}
 
 	// The Function and Environment watches are controller-runtime reconcilers now
@@ -570,6 +575,13 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 	metrics.RecordColdStart(ctx, fn.Name, fn.Namespace)
 	executorUtils.SetFunctionReady(ctx, deploy.logger, deploy.fissionClient, fn, fv1.FunctionReasonReady, "newdeploy deployment is ready")
 
+	deploy.deployEventHook.Send(ctx, eventhook.Event{
+		Event:                eventhook.EventFunctionDeployReady,
+		Namespace:            fn.Namespace,
+		Function:             fn.Name,
+		DeploymentGeneration: strconv.FormatInt(depl.Generation, 10),
+	})
+
 	return fsvc, nil
 }
 
@@ -903,6 +915,71 @@ func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Funct
 	if err != nil {
 		deploy.updateStatus(fn, err, "failed to update deployment while updating function")
 		return err
+	}
+
+	// Unlike fnCreate (which always waits for the Deployment to become
+	// available via createOrGetDeployment's own WaitForDeployment call), this
+	// update path has historically returned immediately after patching the
+	// spec — the rolling update then proceeds in the background, outside this
+	// reconcile. That's fine when nothing is watching for the outcome. But
+	// when a function.deploy event consumer IS configured, only waiting here
+	// closes the race described in docs/features/build-deploy-webhooks.md: an
+	// event fired right after updateDeployment would race the actual rollout
+	// and could be observed before the new pod is even scheduled, let alone
+	// ready. So this wait is entirely gated on deployEventHook.Enabled() — an
+	// install that hasn't configured it sees byte-for-byte the same behavior
+	// as before this change.
+	if deploy.deployEventHook.Enabled() {
+		// Wait for the SAME replica count this update actually asked for —
+		// newDeployment.Spec.Replicas, which getDeploymentSpec set to
+		// existingDepl.Spec.Replicas above ("use current replicas instead of
+		// minscale"), not fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale.
+		// A scale-to-zero function (MinScale 0) legitimately has 0 replicas
+		// between invocations; updateFuncDeployment does not scale it up (only
+		// createOrGetDeployment does, and only at create time). Flooring to 1
+		// here would wait for a replica that is never going to appear on its
+		// own, falsely firing function.deploy.failed even though the spec
+		// patch fully succeeded and is correctly served on the next on-demand
+		// specialize. Waiting for 0 succeeds immediately (0 >= 0) and
+		// correctly fires function.deploy.ready right away: the new spec IS
+		// live, there is just no pod expected to exist yet.
+		desiredReplicas := int32(1)
+		if newDeployment.Spec.Replicas != nil {
+			desiredReplicas = *newDeployment.Spec.Replicas
+		}
+		latestDepl, werr := executorUtils.WaitForDeployment(ctx, deploy.kubernetesClient, deploy.logger,
+			newDeployment, desiredReplicas, fn.Spec.InvokeStrategy.ExecutionStrategy.SpecializationTimeout)
+		if werr != nil {
+			// Do NOT return werr here. This wait is an observation, not a
+			// mutation — updateDeployment above already succeeded, so there is
+			// nothing left for a reconcile requeue to usefully retry; the
+			// rolling update keeps progressing in the background regardless of
+			// what WE observed. Returning the error instead turns a single
+			// slow/stuck rollout into an unbounded requeue loop (controller-
+			// runtime requeues a failed Reconcile with exponential backoff),
+			// which re-runs this whole wait AND re-fires this event on every
+			// attempt. Same "never permanently block, never keep
+			// re-litigating" posture as waitForBuild's own timeout fallback.
+			//
+			// A timeout also isn't proof of a genuine failure (crash-loop,
+			// image pull error) — on a loaded/slow cluster it just as often
+			// means "still coming up" — so this is a best-effort "we gave up
+			// waiting" signal, not a confirmed failure.
+			deploy.logger.Error(werr, "gave up waiting for deployment to become available after update; not retrying this reconcile for it",
+				"deployment", fnObjName, "function", fn.Name)
+			deploy.deployEventHook.Send(ctx, eventhook.Event{
+				Event:     eventhook.EventFunctionDeployFailed,
+				Namespace: fn.Namespace,
+				Function:  fn.Name,
+			})
+			return nil
+		}
+		deploy.deployEventHook.Send(ctx, eventhook.Event{
+			Event:                eventhook.EventFunctionDeployReady,
+			Namespace:            fn.Namespace,
+			Function:             fn.Name,
+			DeploymentGeneration: strconv.FormatInt(latestDepl.Generation, 10),
+		})
 	}
 
 	return nil

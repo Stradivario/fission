@@ -1382,3 +1382,46 @@ internalAuth:
   # secret: "" — auto-generated on first install; preserved on upgrade.
   # oldSecret: "" — set during rotation; accepted by the verifier alongside `secret`.
 
+## eventHooks pushes package-build and function-deploy lifecycle events to a
+## designated target, so consumers stop polling `fission package info` /
+## `kubectl rollout status` to find out when a build finished or a new pod
+## actually specialized. See docs/features/build-deploy-webhooks.md.
+##
+## Two independent targets, one per event family — leave either unset to
+## disable just that family. For each, set EITHER (namespace + function [+
+## subpath]) — the recommended mode: the event is delivered by invoking that
+## Fission function through the router's internal listener, the same
+## mechanism timer/mqtrigger/kubewatcher already use — OR `url`, an escape
+## hatch for a non-Fission / out-of-cluster receiver. Setting both on the same
+## family is invalid; namespace/function wins if both happen to be set.
+##
+## `subpath` matters when the target function is a full app with its own
+## router rather than a single-purpose function: the router only strips
+## `/fission-function/<ns>/<fn>` and forwards the rest, so subpath is what
+## lets the event land on a specific route (e.g. graphql-server-lambdas
+## registers POST /webhooks/fission-events for exactly this — see
+## src/app/webhooks/fission-events.plugin.ts there). Empty means the
+## function's root path.
+##
+## Delivery reuses the existing internal webhook publisher: async, retried
+## with backoff, and automatically HMAC-signed whenever internalAuth.enabled
+## is true (same FISSION_INTERNAL_AUTH_SECRET already used for every other
+## internal call to the router) — there is no separate auth toggle here.
+##
+## Disabled by default: zero behavior change, and on the update path
+## (function.deploy.* only) enabling it makes the executor wait for the new
+## pod to actually become available before returning, closing a race that
+## does not matter unless something is listening (see newdeploymgr.go).
+eventHooks:
+  enabled: false
+  packageBuild:
+    namespace: ""
+    function: ""
+    subpath: ""
+    url: ""
+  functionDeploy:
+    namespace: ""
+    function: ""
+    subpath: ""
+    url: ""
+
