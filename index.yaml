@@ -46,6 +46,57 @@ entries:
     version: 2.0.0-watch-all-namespaces
   - annotations:
       artifacthub.io/changes: |
+        - kind: changed
+          description: "Rebuilt on current upstream fission/fission (RFC-0001-0020: OCI-native packaging, EndpointSlice data plane, incremental routes, streaming invocation, MCP tools, OTLP observability, and more)"
+        - kind: added
+          description: "Concurrent builder pods: demand-based builder pool (spec.builder.poolsize)"
+        - kind: added
+          description: "Builder scale-to-zero: idle builders scale to 0 and scale back up on build (spec.builder.idleTimeout)"
+        - kind: added
+          description: "Multi-namespace tenancy via upstream's tenancy.mode=dynamic (default), superseding the fork's old watch-all-namespaces mechanism"
+        - kind: added
+          description: "Same-namespace invocation guard on the router's internal listener (router.enforceSameNamespaceInvocation, default on)"
+        - kind: added
+          description: "Build/deploy lifecycle event webhooks (eventHooks.*)"
+        - kind: fixed
+          description: "buildermgr RBAC for deployments/scale (required by the builder pool)"
+        - kind: fixed
+          description: "newdeploy waits for the package build before provisioning; a genuinely-missing package now fails fast instead of hanging up to 10 minutes"
+        - kind: fixed
+          description: "executor client no longer retries 429 back-pressure responses on the new httpretry transport"
+      artifacthub.io/signKey: |
+        fingerprint: 2EAE29FDF8A387050C82CD5ABBDD4FD6A1FFCBF6
+        url: https://raw.githubusercontent.com/fission/fission-charts/main/public_key/pgp_keys.asc
+    apiVersion: v2
+    appVersion: v1.24.0-watch-all-namespaces
+    created: "2026-07-11T23:00:52.715842858Z"
+    description: Fission is a fast serverless framework for Kubernetes.
+    digest: dfb5b839b65fea7c5dfecff021a87d04e4c3844a907765ea87f1f758ade8f392
+    home: https://fission.io/
+    icon: https://fission.io/images/fission-logo-white.svg
+    keywords:
+    - fission
+    - serverless
+    - platform
+    - faas
+    - functions
+    - Integration & Delivery
+    kubeVersion: '>=1.32.0-0'
+    maintainers:
+    - email: vishal@infracloud.io
+      name: Vishal Biyani
+    - email: sanket@infracloud.io
+      name: Sanket Sudake
+    name: fission-all
+    sources:
+    - https://github.com/fission/fission
+    - https://github.com/fission/keda-connectors
+    type: application
+    urls:
+    - https://github.com/Stradivario/fission/releases/download/fission-all-1.24.0-watch-all-namespaces/fission-all-1.24.0-watch-all-namespaces.tgz
+    version: 1.24.0-watch-all-namespaces
+  - annotations:
+      artifacthub.io/changes: |
         - kind: added
           description: "Concurrent builder pods: demand-based builder pool (spec.builder.poolsize)"
         - kind: added
@@ -389,4 +440,4 @@ entries:
     urls:
     - https://github.com/Stradivario/fission/releases/download/fission-all-1.22.2-watch-all-namespaces/fission-all-1.22.2-watch-all-namespaces.tgz
     version: 1.22.2-watch-all-namespaces
-generated: "2026-07-11T13:34:42.279243927Z"
+generated: "2026-07-11T23:00:52.715933948Z"
