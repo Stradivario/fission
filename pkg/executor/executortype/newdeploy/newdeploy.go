@@ -247,7 +247,21 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            deployName,
+			Name:      deployName,
+			Namespace: deployNamespace,
+			// Namespace was never set here before — harmless for every existing
+			// caller, since Create/Update take the namespace from the
+			// .Deployments(ns) client builder, not the object body, and
+			// createOrGetDeployment's own WaitForDeployment call uses the
+			// API SERVER'S returned object (which the server always populates
+			// with the correct namespace), not this raw pre-submission one.
+			// updateFuncDeployment's WaitForDeployment call is the first
+			// caller to read .ObjectMeta.Namespace directly off THIS object,
+			// and with it empty, that call became
+			// `.Deployments("").Get(...)` — a malformed request the API
+			// server answers with a generic 404 ("the server could not find
+			// the requested resource") instantly, on every single call,
+			// regardless of MinScale or replica count.
 			Labels:          deployLabels,
 			Annotations:     deployAnnotations,
 			OwnerReferences: ownerReferences,
