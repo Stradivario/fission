@@ -171,6 +171,64 @@ func TestUpdatePackageOCIMutualExclusion(t *testing.T) {
 	require.Error(t, err, "--oci combined with --code must be rejected")
 }
 
+// TestUpdatePackageSameEnvDoesNotRebuild pins the fix for a real incident:
+// `fission function update` always passes --env (see cmd/function/update.go),
+// whether or not the environment is actually changing. Before this fix,
+// UpdatePackage force-rebuilt the package on every single function update
+// (needToRebuild=true merely because the flag was set), even when reusing an
+// already-built package unchanged — producing a second, real rollout on every
+// update. Comparing against the package's current environment closes the gap.
+func TestUpdatePackageSameEnvDoesNotRebuild(t *testing.T) {
+	pkg := &fv1.Package{
+		ObjectMeta: metav1.ObjectMeta{Name: "unchanged-env-pkg", Namespace: "default"},
+		Spec: fv1.PackageSpec{
+			Environment: fv1.EnvironmentReference{Name: "nodejs", Namespace: "default"},
+			Source:      fv1.Archive{Type: fv1.ArchiveTypeUrl, URL: "http://storage/src.zip"},
+		},
+		Status: fv1.PackageStatus{BuildStatus: fv1.BuildStatusSucceeded},
+	}
+	fc := fissionfake.NewSimpleClientset(pkg) //nolint:staticcheck
+	client := cmd.Client{FissionClientSet: fc, Namespace: "default"}
+
+	in := dummy.TestFlagSet()
+	in.Set(flagkey.PkgEnvironment, "nodejs") // same value the package already has
+
+	_, err := UpdatePackage(in, client, "", pkg.DeepCopy())
+	require.NoError(t, err)
+
+	got, err := fc.CoreV1().Packages("default").Get(t.Context(), "unchanged-env-pkg", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, fv1.BuildStatus(fv1.BuildStatusSucceeded), got.Status.BuildStatus,
+		"passing --env with its current value must not force a rebuild of an already-built package")
+}
+
+// TestUpdatePackageChangedEnvRebuilds confirms the fix is scoped correctly: a
+// genuinely different --env value must still trigger a rebuild.
+func TestUpdatePackageChangedEnvRebuilds(t *testing.T) {
+	pkg := &fv1.Package{
+		ObjectMeta: metav1.ObjectMeta{Name: "changed-env-pkg", Namespace: "default"},
+		Spec: fv1.PackageSpec{
+			Environment: fv1.EnvironmentReference{Name: "nodejs", Namespace: "default"},
+			Source:      fv1.Archive{Type: fv1.ArchiveTypeUrl, URL: "http://storage/src.zip"},
+		},
+		Status: fv1.PackageStatus{BuildStatus: fv1.BuildStatusSucceeded},
+	}
+	fc := fissionfake.NewSimpleClientset(pkg) //nolint:staticcheck
+	client := cmd.Client{FissionClientSet: fc, Namespace: "default"}
+
+	in := dummy.TestFlagSet()
+	in.Set(flagkey.PkgEnvironment, "python")
+
+	_, err := UpdatePackage(in, client, "", pkg.DeepCopy())
+	require.NoError(t, err)
+
+	got, err := fc.CoreV1().Packages("default").Get(t.Context(), "changed-env-pkg", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "python", got.Spec.Environment.Name)
+	assert.Equal(t, fv1.BuildStatus(fv1.BuildStatusPending), got.Status.BuildStatus,
+		"an actual environment change must still trigger a rebuild")
+}
+
 func TestIsClusterLocalRef(t *testing.T) {
 	cases := map[string]bool{
 		"test-registry.default.svc.cluster.local:5000/x/y:v1": true,
