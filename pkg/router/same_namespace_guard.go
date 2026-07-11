@@ -42,6 +42,25 @@ type callerNamespaceLookup interface {
 	lookup(ip string) (namespace string, found bool)
 }
 
+// defaultUnresolvedRetries/defaultUnresolvedRetryInterval bound how long wrap
+// retries an unresolved caller before failing closed. This absorbs a real,
+// 100%-reproducible race (confirmed live: a curl fired the instant a pod's
+// container starts, 4ms round trip, always 403s on the first attempt) between
+// a brand-new pod's first outbound request and its own status.podIP becoming
+// observable to the guard -- both via the informer watch (which lags a fresh
+// Add event) and the direct API-list fallback (which can itself race the
+// apiserver's own internal propagation of a just-created pod's status; the
+// fallback is not a synchronous read of what the kubelet just reported). A
+// caller whose own retry/backoff is slower than this window (or has none at
+// all) would otherwise see a spurious 403 on every single specialization,
+// which — if the caller treats it as fatal — can cascade into a pod
+// restart-and-repeat loop, since the replacement pod hits exactly the same
+// race with its own new IP.
+const (
+	defaultUnresolvedRetries       = 5
+	defaultUnresolvedRetryInterval = 50 * time.Millisecond
+)
+
 // sameNamespaceGuard enforces same-namespace (or internal-component) invocation
 // on the internal listener. It is applied per function handler so the target
 // namespace comes unambiguously from the function (UrlForFunction folds the
@@ -51,6 +70,33 @@ type sameNamespaceGuard struct {
 	installNamespace  string
 	allowedNamespaces map[string]struct{}
 	logger            logr.Logger
+	// unresolvedRetries/unresolvedRetryInterval override the defaults above;
+	// zero value means "use the default". Tests set these to make the
+	// unresolved-caller case fast and deterministic instead of eating the
+	// real ~250ms default budget.
+	unresolvedRetries       int
+	unresolvedRetryInterval time.Duration
+}
+
+func (g *sameNamespaceGuard) resolveCallerNamespace(callerIP string) (string, bool) {
+	if ns, found := g.lookup.lookup(callerIP); found {
+		return ns, true
+	}
+	retries := g.unresolvedRetries
+	if retries == 0 {
+		retries = defaultUnresolvedRetries
+	}
+	interval := g.unresolvedRetryInterval
+	if interval == 0 {
+		interval = defaultUnresolvedRetryInterval
+	}
+	for i := 0; i < retries; i++ {
+		time.Sleep(interval)
+		if ns, found := g.lookup.lookup(callerIP); found {
+			return ns, true
+		}
+	}
+	return "", false
 }
 
 // wrap returns inner guarded so it only serves callers whose namespace is
@@ -61,7 +107,7 @@ type sameNamespaceGuard struct {
 func (g *sameNamespaceGuard) wrap(inner http.Handler, targetNamespace string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callerIP := clientIP(r.RemoteAddr)
-		callerNS, found := g.lookup.lookup(callerIP)
+		callerNS, found := g.resolveCallerNamespace(callerIP)
 		if !found {
 			g.logger.Info("rejecting internal invocation: caller namespace unresolved",
 				"caller_ip", callerIP, "target_namespace", targetNamespace, "path", r.URL.Path)
