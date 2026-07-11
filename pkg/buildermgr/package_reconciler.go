@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
 	"github.com/fission/fission/pkg/utils"
 )
@@ -51,6 +52,7 @@ type PackageReconciler struct {
 	podPollInterval  time.Duration
 	poolMgr          *BuilderPoolManager
 	scale            deploymentScaler
+	eventHook        *eventhook.Dispatcher
 }
 
 func makePackageReconciler(logger logr.Logger, client client.Client, fissionClient versioned.Interface,
@@ -65,6 +67,7 @@ func makePackageReconciler(logger logr.Logger, client client.Client, fissionClie
 		podPollInterval:  builderPodPollInterval,
 		poolMgr:          poolMgr,
 		scale:            k8sDeploymentScaler(kubernetesClient, logger),
+		eventHook:        eventhook.NewPackageBuildDispatcher(logger),
 	}
 }
 
@@ -249,6 +252,14 @@ func (r *PackageReconciler) build(ctx context.Context, pkg *fv1.Package) (ctrl.R
 	// so its Ready/PackageReady conditions track package readiness.
 	markFunctionsForPackage(ctx, logger, r.fissionClient, fnList.Items, pkg, true)
 	logger.Info("completed package build request")
+
+	r.eventHook.Send(ctx, eventhook.Event{
+		Event:       eventhook.EventPackageBuildSucceeded,
+		Namespace:   pkg.Namespace,
+		Package:     pkg.Name,
+		BuildStatus: string(fv1.BuildStatusSucceeded),
+	})
+
 	return ctrl.Result{}, nil
 }
 
@@ -266,7 +277,14 @@ func (r *PackageReconciler) failBuild(ctx context.Context, logger logr.Logger, p
 func (r *PackageReconciler) markBuildFailed(ctx context.Context, logger logr.Logger, pkg *fv1.Package, buildLogs string) {
 	if _, err := updatePackage(ctx, logger, r.fissionClient, pkg, fv1.BuildStatusFailed, buildLogs, nil); err != nil {
 		logger.Error(err, "error updating package to failed state")
+		return
 	}
+	r.eventHook.Send(ctx, eventhook.Event{
+		Event:       eventhook.EventPackageBuildFailed,
+		Namespace:   pkg.Namespace,
+		Package:     pkg.Name,
+		BuildStatus: string(fv1.BuildStatusFailed),
+	})
 }
 
 // scaleBuilderForDemand raises the environment's builder deployment toward the

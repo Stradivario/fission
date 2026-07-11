@@ -35,6 +35,7 @@ import (
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/cache"
 	"github.com/fission/fission/pkg/crd"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/executor/executortype"
 	"github.com/fission/fission/pkg/executor/fscache"
 	"github.com/fission/fission/pkg/executor/metrics"
@@ -93,6 +94,9 @@ type (
 
 		podSpecPatch               *apiv1.PodSpec
 		objectReaperIntervalSecond time.Duration
+
+		deployEventHook *eventhook.Dispatcher
+		deployPending   *deployPendingSet
 	}
 	request struct {
 		requestType
@@ -146,6 +150,8 @@ func MakeGenericPoolManager(ctx context.Context,
 		poolPodC:                   poolPodC,
 		podSpecPatch:               podSpecPatch,
 		objectReaperIntervalSecond: time.Duration(executorUtils.GetObjectReaperInterval(logger, fv1.ExecutorTypePoolmgr, 5)) * time.Second,
+		deployEventHook:            eventhook.NewFunctionDeployDispatcher(logger),
+		deployPending:              newDeployPendingSet(),
 	}
 
 	gpm.logger.V(1).Info("inside MakeGenericPoolManager")
@@ -501,7 +507,8 @@ func (gpm *GenericPoolManager) service() {
 				ns := gpm.nsResolver.GetFunctionNS(req.env.Namespace)
 				pool = MakeGenericPool(gpm.logger, gpm.fissionClient, gpm.kubernetesClient,
 					gpm.metricsClient, req.env, ns, gpm.fsCache,
-					gpm.fetcherConfig, gpm.instanceID, gpm.enableIstio, gpm.podSpecPatch, gpm.crClient)
+					gpm.fetcherConfig, gpm.instanceID, gpm.enableIstio, gpm.podSpecPatch, gpm.crClient,
+					gpm.deployEventHook, gpm.deployPending)
 				err = pool.setup(req.ctx)
 				if err != nil {
 					req.responseChannel <- &response{error: err}

@@ -153,6 +153,42 @@ forcing the chart to render an empty key.
 {{- end }}
 
 {{/*
+eventHooks.envs renders the EVENTHOOK_* env entries that wire the
+package-build / function-deploy lifecycle event dispatcher into a Fission
+control-plane container (buildermgr, executor). See the design at
+docs/features/build-deploy-webhooks.md. Disabled (the default) when
+eventHooks.enabled is false, matching internalAuth.envs' off-by-default
+pattern above. Not to be confused with .Values.webhook / fission-webhook.svc
+below, which is the unrelated K8s admission webhook.
+*/}}
+{{- define "eventHooks.envs" }}
+{{- if .Values.eventHooks.enabled }}
+- name: EVENTHOOK_ENABLED
+  value: "true"
+{{- if .Values.eventHooks.packageBuild }}
+- name: EVENTHOOK_PACKAGE_BUILD_NAMESPACE
+  value: {{ .Values.eventHooks.packageBuild.namespace | default "" | quote }}
+- name: EVENTHOOK_PACKAGE_BUILD_FUNCTION
+  value: {{ .Values.eventHooks.packageBuild.function | default "" | quote }}
+- name: EVENTHOOK_PACKAGE_BUILD_SUBPATH
+  value: {{ .Values.eventHooks.packageBuild.subpath | default "" | quote }}
+- name: EVENTHOOK_PACKAGE_BUILD_URL
+  value: {{ .Values.eventHooks.packageBuild.url | default "" | quote }}
+{{- end }}
+{{- if .Values.eventHooks.functionDeploy }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_NAMESPACE
+  value: {{ .Values.eventHooks.functionDeploy.namespace | default "" | quote }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_FUNCTION
+  value: {{ .Values.eventHooks.functionDeploy.function | default "" | quote }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_SUBPATH
+  value: {{ .Values.eventHooks.functionDeploy.subpath | default "" | quote }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_URL
+  value: {{ .Values.eventHooks.functionDeploy.url | default "" | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Define the svc's name
 */}}
 {{- define "fission-webhook.svc" -}}

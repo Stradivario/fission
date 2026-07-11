@@ -59,6 +59,13 @@ spec:
         {{- include "opentelemtry.envs" . | indent 8 }}
         {{- include "internalAuth.envs" . | indent 8 }}
         {{- include "coverage.envs" . | indent 8 }}
+        # Only consulted when eventHooks.packageBuild targets a Fission function
+        # (see eventHooks.envs below); same listener/value as timer, kubewatcher,
+        # mqt — /fission-function/<ns>/<name> lives only on the router's internal
+        # listener (GHSA-3g33-6vg6-27m8).
+        - name: ROUTER_INTERNAL_URL
+          value: "http://router-internal.{{ .Release.Namespace }}:{{ .Values.router.internalPort | default 8889 }}"
+        {{- include "eventHooks.envs" . | indent 8 }}
         {{- if or .Values.builderPodSpec.enabled .Values.coverage.enabled }}
         volumeMounts:
         {{- if .Values.builderPodSpec.enabled }}

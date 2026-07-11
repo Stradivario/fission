@@ -12,6 +12,7 @@ architecture (the pre-reconciler informer/watcher versions were removed upstream
 | Watch all namespaces | [watch-all-namespaces.md](watch-all-namespaces.md) | watch Fission CRs cluster-wide without enumerating namespaces |
 | Internal auth (HMAC) off by default | [internal-auth.md](internal-auth.md) | HMAC defaulted off so unsigned KEDA connectors + federation gateway work |
 | Cross-namespace invocation isolation | [internal-invocation-isolation.md](internal-invocation-isolation.md) | router-internal confines callers to their own namespace's functions |
+| Build & deploy lifecycle events | [build-deploy-webhooks.md](build-deploy-webhooks.md) | invoke a designated Fission function on build-succeeded / deploy-ready instead of consumers polling `fission package info` / `kubectl rollout status` |
 
 Design records for the two non-trivial ports live in `docs/spike-buildermgr-port.md`
 and `docs/spike-watch-all-namespaces.md`.
@@ -29,3 +30,4 @@ and `docs/spike-watch-all-namespaces.md`.
 | `watchAllNamespaces` | Helm value | true |
 | `internalAuth.enabled` | Helm value | false (fork default; upstream is true) |
 | `router.enforceSameNamespaceInvocation` | Helm value | false |
+| `eventHooks.enabled` | Helm value | false |

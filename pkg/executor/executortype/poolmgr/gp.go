@@ -34,6 +34,7 @@ import (
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/crd"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/executor/fscache"
 	executorUtil "github.com/fission/fission/pkg/executor/util"
 	fetcherClient "github.com/fission/fission/pkg/fetcher/client"
@@ -73,6 +74,12 @@ type (
 		enableOwnerReferences bool
 		// TODO: move this field into fsCache
 		podFSVCMap sync.Map
+
+		// deployEventHook/deployPending: see deploypending.go. Shared by
+		// pointer with the owning GenericPoolManager, same sharing pattern as
+		// fsCache above.
+		deployEventHook *eventhook.Dispatcher
+		deployPending   *deployPendingSet
 	}
 )
 
@@ -89,7 +96,9 @@ func MakeGenericPool(
 	instanceID string,
 	enableIstio bool,
 	podSpecPatch *apiv1.PodSpec,
-	crClient client.Client) *GenericPool {
+	crClient client.Client,
+	deployEventHook *eventhook.Dispatcher,
+	deployPending *deployPendingSet) *GenericPool {
 
 	gpLogger := logger.WithName("generic_pool")
 
@@ -126,6 +135,8 @@ func MakeGenericPool(
 		podSpecPatch:          podSpecPatch,
 		enableOwnerReferences: utils.IsOwnerReferencesEnabled(),
 		lock:                  sync.Mutex{},
+		deployEventHook:       deployEventHook,
+		deployPending:         deployPending,
 	}
 
 	gp.runtimeImagePullPolicy = utils.GetImagePullPolicy(os.Getenv("RUNTIME_IMAGE_PULL_POLICY"))
@@ -588,10 +599,29 @@ func (gp *GenericPool) getFuncSvc(ctx context.Context, fn *fv1.Function) (*fscac
 	// follow-up work.
 	err = gp.specializePod(ctx, pod, fn)
 	if err != nil {
+		// Only fires if ReconcileFunction marked fn.UID pending (i.e. this
+		// pod's specialize is the first one following a create/update) — a
+		// routine respecialize (idle recycle, health-check failure) for a
+		// function nobody just deployed consumes nothing and fires nothing.
+		// See deploypending.go.
+		if gp.deployEventHook.Enabled() && gp.deployPending.consume(fn.UID) {
+			gp.deployEventHook.Send(ctx, eventhook.Event{
+				Event:     eventhook.EventFunctionDeployFailed,
+				Namespace: fn.Namespace,
+				Function:  fn.Name,
+			})
+		}
 		go gp.scheduleDeletePod(context.Background(), pod.Name)
 		return nil, err
 	}
 	logger.Info("specialized pod", "pod", pod.Name, "podNamespace", pod.Namespace, "podIP", pod.Status.PodIP)
+	if gp.deployEventHook.Enabled() && gp.deployPending.consume(fn.UID) {
+		gp.deployEventHook.Send(ctx, eventhook.Event{
+			Event:     eventhook.EventFunctionDeployReady,
+			Namespace: fn.Namespace,
+			Function:  fn.Name,
+		})
+	}
 
 	var svcHost string
 	if gp.useSvc && !gp.useIstio {
