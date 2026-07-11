@@ -1,7 +1,7 @@
 apiVersion: v2
 name: fission-all
-version: 1.27.0
-appVersion: v1.27.0
+version: 3.0.0-watch-all-namespaces
+appVersion: v3.0.0-watch-all-namespaces
 description: Fission is a fast serverless framework for Kubernetes.
 kubeVersion: ">=1.32.0-0"
 home: https://fission.io/
@@ -26,3 +26,22 @@ annotations:
   artifacthub.io/signKey: |
     fingerprint: 2EAE29FDF8A387050C82CD5ABBDD4FD6A1FFCBF6
     url: https://raw.githubusercontent.com/fission/fission-charts/main/public_key/pgp_keys.asc
+  artifacthub.io/changes: |
+    - kind: changed
+      description: "Rebuilt on current upstream fission/fission (RFC-0001-0020: OCI-native packaging, EndpointSlice data plane, incremental routes, streaming invocation, MCP tools, OTLP observability, and more)"
+    - kind: added
+      description: "Concurrent builder pods: demand-based builder pool (spec.builder.poolsize)"
+    - kind: added
+      description: "Builder scale-to-zero: idle builders scale to 0 and scale back up on build (spec.builder.idleTimeout)"
+    - kind: added
+      description: "Multi-namespace tenancy via upstream's tenancy.mode=dynamic (default), superseding the fork's old watch-all-namespaces mechanism"
+    - kind: added
+      description: "Same-namespace invocation guard on the router's internal listener (router.enforceSameNamespaceInvocation, default on)"
+    - kind: added
+      description: "Build/deploy lifecycle event webhooks (eventHooks.*)"
+    - kind: fixed
+      description: "buildermgr RBAC for deployments/scale (required by the builder pool)"
+    - kind: fixed
+      description: "newdeploy waits for the package build before provisioning; a genuinely-missing package now fails fast instead of hanging up to 10 minutes"
+    - kind: fixed
+      description: "executor client no longer retries 429 back-pressure responses on the new httpretry transport"
