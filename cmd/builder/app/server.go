@@ -31,7 +31,20 @@ func Run(ctx context.Context, logger logr.Logger, mgr *errgroup.Group, shareVolu
 		logger.Error(err, "invalid internal-auth environment")
 		os.Exit(1)
 	}
-	builder := builder.MakeBuilder(logger, shareVolume)
+	// MAX_PARALLEL_BUILDS bounds the number of builds this pod runs at once.
+	// Defaults to 1 (serial), preserving the pre-concurrency behavior.
+	maxParallelBuilds := 1
+	if v := os.Getenv("MAX_PARALLEL_BUILDS"); v != "" {
+		if val, err := strconv.Atoi(v); err != nil {
+			logger.Info("invalid MAX_PARALLEL_BUILDS, defaulting to 1", "value", v, "error", err.Error())
+		} else if val < 1 {
+			logger.Info("MAX_PARALLEL_BUILDS must be greater than 0, defaulting to 1", "value", val)
+		} else {
+			maxParallelBuilds = val
+		}
+	}
+
+	builder := builder.MakeBuilder(logger, shareVolume, maxParallelBuilds)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", builder.Handler)
 	mux.HandleFunc("/clean", builder.Clean)
