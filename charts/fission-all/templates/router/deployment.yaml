@@ -84,6 +84,14 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        {{- if .Values.router.enforceSameNamespaceInvocation }}
+        - name: ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION
+          value: "true"
+        {{- end }}
+        {{- if .Values.router.allowedNamespaces }}
+        - name: ROUTER_ALLOWED_NAMESPACES
+          value: {{ join "," .Values.router.allowedNamespaces | quote }}
+        {{- end }}
         {{- with .Values.router.gracefulShutdownTimeout }}
         # Without this the drain is capped at the code default of 30s, so a
         # larger terminationGracePeriodSeconds would be spent idle while a

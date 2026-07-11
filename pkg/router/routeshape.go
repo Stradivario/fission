@@ -261,7 +261,20 @@ func (ts *HTTPTriggerSet) buildTriggerHandler(trigger *fv1.HTTPTrigger, rr *reso
 func (ts *HTTPTriggerSet) buildInternalFunctionHandler(fn *fv1.Function, fnTimeoutMap map[crd.CacheKeyUG]int) http.Handler {
 	fh := ts.newFunctionHandlerBase(fn.Name, map[string]*fv1.Function{fn.Name: fn}, nil, fnTimeoutMap, fn)
 	fh.function = fn
-	return http.HandlerFunc(fh.handler)
+	return ts.guardCallerNamespace(http.HandlerFunc(fh.handler), fn.Namespace)
+}
+
+// guardCallerNamespace applies the opt-in same-namespace guard: a caller may
+// invoke an internal route only from its own namespace (ns, the function's) or
+// as an internal Fission component. Every internal route builder wraps through
+// it — the function routes and the RFC-0025 `:<alias>` routes alike, so an
+// alias is no way around the guard — and those builders are shared by the
+// one-shot, incremental-apply and resync callers.
+func (ts *HTTPTriggerSet) guardCallerNamespace(handler http.Handler, ns string) http.Handler {
+	if ts.callerNSGuard != nil {
+		return ts.callerNSGuard.wrap(handler, ns)
+	}
+	return handler
 }
 
 // buildInternalAliasHandler constructs the internal listener's proxy handler
@@ -281,7 +294,14 @@ func (ts *HTTPTriggerSet) buildInternalAliasHandler(routeName string, rr *resolv
 			fh.function = fn
 		}
 	}
-	return http.HandlerFunc(fh.handler)
+	// An alias resolves to versions of one function, so every entry shares
+	// that function's namespace.
+	var ns string
+	for _, fn := range fh.functionMap {
+		ns = fn.Namespace
+		break
+	}
+	return ts.guardCallerNamespace(http.HandlerFunc(fh.handler), ns)
 }
 
 // newListenerMuxes creates the public + internal mux skeletons: encoded-path
