@@ -365,6 +365,25 @@ router:
   ## port 80). Mirrored by pkg/svcinfo.PortRouter.
   port: 8888
   internalPort: 8889
+  ## enforceSameNamespaceInvocation (opt-in) rejects (403) a
+  ## /fission-function/<ns>/<name> request on the internal listener unless the
+  ## caller's pod is in the target function's namespace, is an internal Fission
+  ## component (a pod in the install namespace), or is in allowedNamespaces
+  ## below. Closes the cross-namespace invocation gap left when internalAuth is
+  ## disabled: NetworkPolicy/HMAC gate WHO reaches router-internal, not WHICH
+  ## namespace they can target. See docs/features/internal-invocation-isolation.md.
+  ## This fork defaults it ON (upstream has no equivalent) — lambforge.com runs
+  ## Fission as a shared control plane for mutually-untrusting tenant projects
+  ## (typically alongside tenancy.mode=dynamic).
+  ##
+  enforceSameNamespaceInvocation: true
+  ## allowedNamespaces lists extra namespaces whose pods may invoke
+  ## /fission-function/<ns>/<name> on the internal listener regardless of the
+  ## target namespace. Useful for cross-namespace monitoring or webhook callers
+  ## (e.g. a Prometheus stack deployed in "monitoring"). The router passes this
+  ## list as the ROUTER_ALLOWED_NAMESPACES env var (comma-separated).
+  ##
+  allowedNamespaces: []
   ## strategy is the Deployment rollout strategy for the router (ignored when
   ## deployAsDaemonSet is true). Leave unset for the Kubernetes default. The
   ## router is stateless, so a surge strategy gives zero-downtime rollouts:

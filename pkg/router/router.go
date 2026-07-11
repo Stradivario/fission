@@ -431,6 +431,31 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	// it builds inherits it; the escape hatch restores the legacy plain-text body.
 	triggers.structuredErrors = cfg.structuredErrors
 	triggers.accessLog = cfg.accessLog
+
+	// Opt-in same-namespace guard on the internal listener: when enabled, a caller
+	// may invoke a function only from its own namespace, or as an internal Fission
+	// component (a pod in the router's install namespace). Needs a cluster-wide
+	// pod-ip cache to attribute caller IPs to namespaces.
+	if enforce, _ := strconv.ParseBool(os.Getenv(EnforceSameNamespaceInvocationEnv)); enforce {
+		installNS := routerInstallNamespace()
+		if installNS == "" {
+			return fmt.Errorf("%s is enabled but the router's own namespace could not be determined; set POD_NAMESPACE via the downward API", EnforceSameNamespaceInvocationEnv)
+		}
+		ipCache, err := newPodIPCache(ctx, kubeClient, logger.WithName("same_namespace_guard"))
+		if err != nil {
+			return fmt.Errorf("error starting pod-ip cache for same-namespace guard: %w", err)
+		}
+		allowedNSRaw := os.Getenv(AllowedNamespacesEnv)
+		triggers.callerNSGuard = &sameNamespaceGuard{
+			lookup:            ipCache,
+			installNamespace:  installNS,
+			allowedNamespaces: parseAllowedNamespaces(allowedNSRaw),
+			logger:            logger.WithName("same_namespace_guard"),
+		}
+		logger.Info("router internal listener: same-namespace invocation guard enabled",
+			"install_namespace", installNS, "allowed_namespaces", allowedNSRaw)
+	}
+
 	// Incremental route updates (RFC-0013) are the only production path:
 	// per-event route-table diffs + handler indirection; muxes rebuild only on
 	// shape changes.
