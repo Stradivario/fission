@@ -104,7 +104,26 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 		needToUpdate = true
 	}
 
-	if input.IsSet(flagkey.PkgEnvironment) {
+	if input.IsSet(flagkey.PkgEnvironment) && envName != pkg.Spec.Environment.Name {
+		// `--env` is set unconditionally by every `fission function update`
+		// call (see cmd/function/update.go), whether or not the environment
+		// is actually changing — that command has its own guard for this
+		// exact case ("if the new env specified is the same as the old one,
+		// no need to update package"), but that guard only affects its own
+		// local Function.Spec assignment; it passes the raw, unmodified
+		// input straight into this function, which re-reads the same --env
+		// flag independently and — before this check — only tested whether
+		// the flag was *provided*, not whether the value differed from the
+		// package's current one. That meant EVERY `function update` call
+		// force-rebuilt the referenced package (needToRebuild=true) even
+		// when reusing an already-built package unchanged, which — because
+		// the rebuild's completion re-triggers the Function's own
+		// packageRef.resourceVersion correction in buildermgr's
+		// package_reconciler.go — produced a second, real rollout on every
+		// single function update. Comparing against the current value here
+		// (mirroring cmd/function/update.go's own pattern) closes that gap
+		// at its actual source instead of leaving every caller to work
+		// around it.
 		pkg.Spec.Environment.Name = envName
 		needToRebuild = true
 		needToUpdate = true
