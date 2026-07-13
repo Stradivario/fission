@@ -24,6 +24,17 @@ const (
 	// DefaultBuilderPoolSize is the default ceiling on the number of builder
 	// pods provisioned per environment for concurrent builds.
 	DefaultBuilderPoolSize int32 = 1
+
+	// MinBuilderIdleTimeout is the smallest positive idle-timeout honoured for
+	// a builder deployment; a configured value below this (but non-zero) is
+	// clamped up to it. 0 still means "never scale to zero" and is left
+	// alone. A builder that scales to zero and back on a timescale shorter
+	// than it takes a freshly-created pod's IP to become reliably routable
+	// spends most of its life mid-churn instead of warm: this is what made
+	// the 2026-07 incident's 20s idleTimeout turn nearly every build into a
+	// race between buildermgr's fetch and a brand-new, not-yet-routable pod
+	// IP (worse across nodes/regions), rather than a rare occasional one.
+	MinBuilderIdleTimeout int64 = 60
 )
 
 // builderPoolSize returns the MAXIMUM number of builder pods allowed for an
@@ -39,12 +50,17 @@ func builderPoolSize(env *fv1.Environment) int32 {
 
 // builderIdleTimeout returns the idle-timeout (seconds) for an environment
 // (spec.builder.idleTimeout), defaulting to DefaultBuilderIdleTimeout when unset.
-// A value of 0 is honoured and means "never scale to zero".
+// A value of 0 is honoured and means "never scale to zero"; a positive value
+// below MinBuilderIdleTimeout is clamped up to it (see its doc comment).
 func builderIdleTimeout(env *fv1.Environment) int64 {
-	if env.Spec.Builder.IdleTimeout != nil {
-		return *env.Spec.Builder.IdleTimeout
+	if env.Spec.Builder.IdleTimeout == nil {
+		return DefaultBuilderIdleTimeout
 	}
-	return DefaultBuilderIdleTimeout
+	t := *env.Spec.Builder.IdleTimeout
+	if t > 0 && t < MinBuilderIdleTimeout {
+		return MinBuilderIdleTimeout
+	}
+	return t
 }
 
 // buildKey identifies an in-flight package build within an environment.
@@ -130,6 +146,12 @@ func (m *BuilderPoolManager) getOrCreate(env *fv1.Environment, builderNS string)
 	st.idleTimeout = builderIdleTimeout(env)
 	st.poolSize = builderPoolSize(env)
 	st.mu.Unlock()
+
+	if raw := env.Spec.Builder.IdleTimeout; raw != nil && *raw > 0 && *raw < MinBuilderIdleTimeout {
+		m.logger.Info("configured builder idleTimeout is below the safety floor, clamping",
+			"environment", env.Name, "namespace", env.Namespace,
+			"configured_seconds", *raw, "floor_seconds", MinBuilderIdleTimeout)
+	}
 	return st
 }
 
