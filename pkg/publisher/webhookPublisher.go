@@ -220,8 +220,19 @@ func (p *WebhookPublisher) makeHTTPRequest(r *publishRequest) {
 				msg = "request returned bad request status code"
 				return
 			} else {
-				msg = "request returned failure status code"
-				return
+				// A 5xx is the target's own transient failure -- e.g. a
+				// newdeploy pod the router picked before it finished
+				// specializing, or a brief overload -- rather than a
+				// permanent condition like a 4xx. Retry it the same way
+				// as the 404/transport-failure paths instead of dropping
+				// the event on the first hiccup: previously a single 500
+				// silently discarded a build/deploy notification with no
+				// retry at all, so a downstream consumer (e.g. a webhook
+				// handler that creates a Function/Route once a build
+				// succeeds) never learned the event happened.
+				msg = "request returned server error, will retry"
+				msgType = "retry"
+				// fall through to retry scheduling below
 			}
 		}
 	}
