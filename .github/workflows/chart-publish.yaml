@@ -3,7 +3,7 @@ name: Release Charts
 on:
   push:
     branches:
-      - develop
+      - release/custom-v3.0
     paths:
       - 'charts/**'
   workflow_dispatch:

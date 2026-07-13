@@ -120,6 +120,40 @@ func TestWebhookPublisherRetriesNotFound(t *testing.T) {
 		"retried 404s that eventually succeed must not produce error-level logs")
 }
 
+// TestWebhookPublisherRetriesServerErrors verifies that a 5xx from the
+// target (e.g. a newdeploy pod the router picked before it finished
+// specializing, returning a transient 500) is retried instead of being
+// dropped on the first attempt — previously a single 500 gave up
+// immediately with no retry at all, silently discarding the event.
+func TestWebhookPublisherRetriesServerErrors(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		hits++
+		if hits < 3 {
+			http.Error(w, "not specialized yet", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sink := &countingSink{}
+	p := MakeWebhookPublisher(logr.New(sink), srv.URL)
+	p.Publish(t.Context(), "", map[string]string{}, http.MethodPost, "test-fn")
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits >= 3
+	}, 15*time.Second, 100*time.Millisecond, "publisher should retry past transient 5xx responses")
+
+	require.Zero(t, sink.errorCount(),
+		"retried 5xx responses that eventually succeed must not produce error-level logs")
+}
+
 // TestWebhookPublisherDoesNotRetryOtherClientErrors verifies that a 4xx
 // other than 404 stays terminal (no retry), matching the pre-existing
 // behaviour for bad-request responses.

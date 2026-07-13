@@ -818,6 +818,11 @@ storagesvc:
     enabled: true
     ## Run prune routine at interval (in minutes)
     interval: 60
+    ## Safety cap: refuse to delete more than this many archives in a single
+    ## sweep (a sweep that wants to delete far more than this is a signal
+    ## the reference list is wrong, not that this many archives are
+    ## genuinely orphaned at once — see pkg/storagesvc/archivePruner.go).
+    maxOrphansPerCycle: 20
 
   ## maxArchiveSizeMib caps the size (in MiB) of a single package archive
   ## uploaded to /v1/archive. With internalAuth enabled, the HMAC verifier

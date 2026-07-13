@@ -461,7 +461,11 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		if err != nil {
 			pruneInterval = defaultPruneInterval
 		}
-		pruner, err := MakeArchivePruner(logger, clientGen, storageClient, time.Duration(pruneInterval))
+		maxOrphansPerCycle, err := strconv.Atoi(os.Getenv("PRUNE_MAX_ORPHANS_PER_CYCLE"))
+		if err != nil {
+			maxOrphansPerCycle = defaultMaxOrphansPerCycle
+		}
+		pruner, err := MakeArchivePruner(logger, clientGen, storageClient, time.Duration(pruneInterval), maxOrphansPerCycle)
 		if err != nil {
 			return fmt.Errorf("error creating archivePruner: %w", err)
 		}
