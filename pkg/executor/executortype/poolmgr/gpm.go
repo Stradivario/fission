@@ -39,6 +39,7 @@ import (
 	"github.com/fission/fission/pkg/cache"
 	"github.com/fission/fission/pkg/crd"
 	ferror "github.com/fission/fission/pkg/error"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/executor/executortype"
 	"github.com/fission/fission/pkg/executor/fscache"
 	"github.com/fission/fission/pkg/executor/metrics"
@@ -133,6 +134,9 @@ type (
 		// successful-or-in-flight ensure. Entries are dropped on function
 		// delete and on ensure failure (so the next request retries).
 		fnSvcEnsured sync.Map
+
+		deployEventHook *eventhook.Dispatcher
+		deployPending   *deployPendingSet
 	}
 	request struct {
 		requestType
@@ -202,6 +206,8 @@ func MakeGenericPoolManager(ctx context.Context,
 		podReadyTimeout:            podReadyTimeoutFromEnv(gpmLogger),
 		maxPendingSpecializations:  maxPendingSpecializationsFromEnv(gpmLogger),
 		functionServicesEnabled:    functionServicesEnabled() && !enableIstio,
+		deployEventHook:            eventhook.NewFunctionDeployDispatcher(logger),
+		deployPending:              newDeployPendingSet(),
 	}
 
 	gpm.logger.V(1).Info("inside MakeGenericPoolManager")
@@ -764,7 +770,7 @@ func (gpm *GenericPoolManager) handleGetPool(req *request) {
 		pool = MakeGenericPool(gpm.logger, gpm.fissionClient, gpm.kubernetesClient,
 			gpm.metricsClient, req.env, ns, gpm.fsCache,
 			gpm.fetcherConfig, gpm.instanceID, gpm.enableIstio, gpm.podSpecPatch, gpm.crClient, req.oci,
-			gpm.podReadyTimeout)
+			gpm.podReadyTimeout, gpm.deployEventHook, gpm.deployPending)
 		err = pool.setup(req.ctx)
 		if err != nil {
 			req.responseChannel <- &response{error: err}

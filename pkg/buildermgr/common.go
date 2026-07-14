@@ -56,10 +56,16 @@ func builderSigningNamespace(pod *apiv1.Pod, builderNs string) (string, bool) {
 // signNamespace selects version-aware signing for the builder pod's sidecars:
 // non-empty means sign with that namespace's per-namespace keys (the pod holds
 // only those), empty means the master-derived keys. The package reconciler
-// computes it from the ready builder pod's key-scheme annotation
+// computes it from the claimed builder pod's key-scheme annotation
 // (builderSigningNamespace).
+// builderPodIP, when non-empty, pins the fetch + build + upload to one specific
+// builder pod (by IP) instead of the round-robining builder Service DNS. This is
+// required for correctness once the builder runs more than one replica: the
+// source archive is fetched onto a pod's local volume, so the build must run on
+// that same pod. An empty builderPodIP falls back to the Service DNS name,
+// preserving the single-replica behaviour.
 func buildPackage(ctx context.Context, logger logr.Logger, fissionClient versioned.Interface, envBuilderNamespace string,
-	signNamespace string, storageSvcUrl string, registryCfg *packageRegistryConfig, pkg *fv1.Package) (uploadResp *fetcher.ArchiveUploadResponse, buildLogs string, err error) {
+	builderPodIP string, signNamespace string, storageSvcUrl string, registryCfg *packageRegistryConfig, pkg *fv1.Package) (uploadResp *fetcher.ArchiveUploadResponse, buildLogs string, err error) {
 
 	// Defence in depth against cross-namespace Environment references; the
 	// admission webhook is the user-visible reject, this guard catches
@@ -78,15 +84,20 @@ func buildPackage(ctx context.Context, logger logr.Logger, fissionClient version
 		return nil, e, ferror.MakeError(http.StatusInternalServerError, e)
 	}
 
-	svcName := fmt.Sprintf("%s-%s.%s", env.Name, env.ResourceVersion, envBuilderNamespace)
+	// Route to a specific builder pod by IP when one was claimed (concurrent
+	// pool), else to the builder Service DNS name (single replica).
+	builderHost := fmt.Sprintf("%s-%s.%s", env.Name, env.ResourceVersion, envBuilderNamespace)
+	if builderPodIP != "" {
+		builderHost = builderPodIP
+	}
 	srcPkgFilename := fmt.Sprintf("%s-%s", pkg.Name, strings.ToLower(uniuri.NewLen(6)))
 	// HMACSecretFromEnv returns nil when internalAuth is disabled; the
 	// fetcher / builder clients pass-through unsigned in that case,
 	// which matches the corresponding verifier's empty-secret short-
 	// circuit on the server side.
 	masterSecret := storagesvcClient.HMACSecretFromEnv()
-	fetcherURL := fmt.Sprintf("http://%s:%d", svcName, svcinfo.PortFetcher)
-	builderURL := fmt.Sprintf("http://%s:%d", svcName, svcinfo.PortBuilder)
+	fetcherURL := fmt.Sprintf("http://%s:%d", builderHost, svcinfo.PortFetcher)
+	builderURL := fmt.Sprintf("http://%s:%d", builderHost, svcinfo.PortBuilder)
 	var fetcherC fetcherClient.ClientInterface
 	var builderC builderClient.ClientInterface
 	if signNamespace != "" {

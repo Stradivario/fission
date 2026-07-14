@@ -68,7 +68,10 @@ type HTTPTriggerSet struct {
 	structuredErrors           bool
 	accessLog                  bool
 	useEncodedPath             bool
-	syncDebouncer              func(func())
+	// callerNSGuard, when non-nil, enforces same-namespace invocation on the
+	// internal listener (ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION). nil = disabled.
+	callerNSGuard *sameNamespaceGuard
+	syncDebouncer func(func())
 	// ready flips true after the first successful mux build; routerReadinessHandler
 	// gates /readyz on it so a starting/rolling pod stays out of the
 	// Service endpoints until its mux is populated.

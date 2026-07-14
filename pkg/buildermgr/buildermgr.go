@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -47,6 +48,11 @@ const (
 	// + upload, so this replaces the old unbounded per-package build goroutines.
 	// Overridable via BUILDERMGR_PACKAGE_CONCURRENCY.
 	defaultPackageBuildConcurrency = 5
+
+	// defaultBuilderIdleReaperIntervalSeconds is how often the idle reaper sweeps
+	// for builders to scale to zero. Overridable via BUILDER_IDLE_REAPER_INTERVAL
+	// (falling back to OBJECT_REAPER_INTERVAL).
+	defaultBuilderIdleReaperIntervalSeconds = 10
 )
 
 // Start runs the builder manager under a controller-runtime Manager. The
@@ -119,7 +125,12 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		return fmt.Errorf("unable to set up builder manager: %w", err)
 	}
 
-	envReconciler := makeEnvironmentReconciler(bmLogger, mgr.GetClient(), kubernetesClient, fConfig, podSpecPatch)
+	// poolMgr is the shared, in-memory builder pool state used by both
+	// reconcilers and the idle reaper: in-flight builds (demand), claimed builder
+	// pod IPs, and per-environment idle timing.
+	poolMgr := newBuilderPoolManager(bmLogger)
+
+	envReconciler := makeEnvironmentReconciler(bmLogger, mgr.GetClient(), kubernetesClient, fConfig, podSpecPatch, poolMgr)
 	if err := controller.RegisterTenantScoped(mgr, &fv1.Environment{}, envReconciler, "buildermgr-environment"); err != nil {
 		return fmt.Errorf("unable to register environment reconciler: %w", err)
 	}
@@ -135,10 +146,17 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 			"pushSecret", registryCfg.pushSecret != "",
 			"pullSecret", registryCfg.pullSecret != "")
 	}
-	pkgReconciler := makePackageReconciler(bmLogger, mgr.GetClient(), fissionClient, kubernetesClient, storageSvcUrl, registryCfg)
+	pkgReconciler := makePackageReconciler(bmLogger, mgr.GetClient(), fissionClient, kubernetesClient, storageSvcUrl, registryCfg, poolMgr)
 	if err := controller.RegisterTenantScopedWithPredicates(mgr, &fv1.Package{}, pkgReconciler, "buildermgr-package",
 		packageBuildConcurrency(), buildTriggerPredicate()); err != nil {
 		return fmt.Errorf("unable to register package reconciler: %w", err)
+	}
+
+	// The idle reaper is the scale-DOWN half of the builder pool (scale-UP is
+	// demand-driven in the package reconciler). It runs on the leader only.
+	reaper := newIdleBuilderReaper(bmLogger, poolMgr, k8sDeploymentScaler(kubernetesClient, bmLogger), builderIdleReaperInterval())
+	if err := mgr.Add(reaper); err != nil {
+		return fmt.Errorf("unable to add idle builder reaper: %w", err)
 	}
 
 	// Cross-process propagation: under dynamic tenancy keep buildermgr's resolver
@@ -173,6 +191,18 @@ func packageBuildConcurrency() int {
 		return v
 	}
 	return defaultPackageBuildConcurrency
+}
+
+// builderIdleReaperInterval resolves the idle reaper's sweep interval from
+// BUILDER_IDLE_REAPER_INTERVAL, then OBJECT_REAPER_INTERVAL, falling back to
+// defaultBuilderIdleReaperIntervalSeconds for an unset/invalid/non-positive value.
+func builderIdleReaperInterval() time.Duration {
+	for _, key := range []string{"BUILDER_IDLE_REAPER_INTERVAL", "OBJECT_REAPER_INTERVAL"} {
+		if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+	}
+	return time.Duration(defaultBuilderIdleReaperIntervalSeconds) * time.Second
 }
 
 // readinessRunnable backs /readyz: it reports ready once this replica is the

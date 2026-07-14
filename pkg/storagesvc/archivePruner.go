@@ -20,27 +20,44 @@ import (
 )
 
 type ArchivePruner struct {
-	logger        logr.Logger
-	crdClient     versioned.Interface
-	archiveChan   chan string
-	storageClient *StorageClient
-	pruneInterval time.Duration
+	logger             logr.Logger
+	crdClient          versioned.Interface
+	archiveChan        chan string
+	storageClient      *StorageClient
+	pruneInterval      time.Duration
+	maxOrphansPerCycle int
 }
 
 const defaultPruneInterval int = 60 // in minutes
 
-func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterface, storageClient *StorageClient, pruneInterval time.Duration) (*ArchivePruner, error) {
+// defaultMaxOrphansPerCycle bounds how many archives a single sweep may
+// delete. A healthy steady state prunes a handful of genuinely abandoned
+// archives per cycle (leftovers from `fission package delete` or similar); a
+// sweep that wants to delete far more than that is a much stronger signal
+// that the "still referenced" list itself is wrong (an incomplete namespace
+// list, a resolver returning too few tenants, a listing that raced a bulk
+// update, ...) than that this many archives are truly orphaned at once. See
+// the 2026-07 incident where a bad reference list caused ~90 live archives
+// across multiple tenant namespaces to be deleted in one sweep.
+const defaultMaxOrphansPerCycle int = 20
+
+func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterface, storageClient *StorageClient, pruneInterval time.Duration, maxOrphansPerCycle int) (*ArchivePruner, error) {
 	fissionClient, err := clientGen.GetFissionClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get fission client: %w", err)
 	}
 
+	if maxOrphansPerCycle <= 0 {
+		maxOrphansPerCycle = defaultMaxOrphansPerCycle
+	}
+
 	return &ArchivePruner{
-		logger:        logger.WithName("archive_pruner"),
-		crdClient:     fissionClient,
-		archiveChan:   make(chan string),
-		storageClient: storageClient,
-		pruneInterval: pruneInterval,
+		logger:             logger.WithName("archive_pruner"),
+		crdClient:          fissionClient,
+		archiveChan:        make(chan string),
+		storageClient:      storageClient,
+		pruneInterval:      pruneInterval,
+		maxOrphansPerCycle: maxOrphansPerCycle,
 	}, nil
 }
 
@@ -76,38 +93,51 @@ func (pruner *ArchivePruner) insertArchive(archiveID string) {
 func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	pruner.logger.V(1).Info("getting orphan archives")
 	archivesRefByPkgs := make([]string, 0)
-	var archiveID string
+
+	// incomplete tracks whether we failed to enumerate every package's
+	// referenced archives this cycle (a namespace List() failed, or a
+	// package's URL didn't parse). A single bad namespace/package must not
+	// blind us to every OTHER namespace/package's references, so we log and
+	// keep scanning rather than aborting immediately — but we must also never
+	// let an incomplete reference list feed the deletion phase below, since
+	// that would make every archive we simply failed to see look orphaned.
+	incomplete := false
 
 	// get all pkgs from kubernetes
 	for _, namespace := range utils.DefaultNSResolver().FissionResourceNamespaces() {
 		pkgList, err := pruner.crdClient.CoreV1().Packages(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			pruner.logger.Error(err, "error getting package list from kubernetes")
-			return
+			pruner.logger.Error(err, "error getting package list from kubernetes; skipping this namespace for this cycle", "namespace", namespace)
+			incomplete = true
+			continue
 		}
 
 		// extract archives referenced by these pkgs
 		for _, pkg := range pkgList.Items {
 			if pkg.Spec.Deployment.URL != "" {
-				archiveID, err = getQueryParamValue(pkg.Spec.Deployment.URL, "id")
+				archiveID, err := getQueryParamValue(pkg.Spec.Deployment.URL, "id")
 				if err != nil {
-					pruner.logger.Error(err, "error extracting value of archiveID from deployment url", "url", pkg.Spec.Deployment.URL)
-					return
+					pruner.logger.Error(err, "error extracting value of archiveID from deployment url",
+						"package", pkg.Name, "namespace", pkg.Namespace, "url", pkg.Spec.Deployment.URL)
+					incomplete = true
+					continue
 				}
 				archivesRefByPkgs = append(archivesRefByPkgs, archiveID)
 			}
 			if pkg.Spec.Source.URL != "" {
-				archiveID, err = getQueryParamValue(pkg.Spec.Source.URL, "id")
+				archiveID, err := getQueryParamValue(pkg.Spec.Source.URL, "id")
 				if err != nil {
-					pruner.logger.Error(err, "error extracting value of archiveID from source url", "url", pkg.Spec.Source.URL)
-					return
+					pruner.logger.Error(err, "error extracting value of archiveID from source url",
+						"package", pkg.Name, "namespace", pkg.Namespace, "url", pkg.Spec.Source.URL)
+					incomplete = true
+					continue
 				}
 				archivesRefByPkgs = append(archivesRefByPkgs, archiveID)
 			}
 		}
 	}
 
-	pruner.logger.V(1).Info("archives referenced by packagese", "archives", archivesRefByPkgs)
+	pruner.logger.V(1).Info("archives referenced by packages", "count", len(archivesRefByPkgs))
 
 	// get all archives on storage
 	// out of them, there may be some just created but not referenced by packages yet.
@@ -117,15 +147,34 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 		pruner.logger.Error(err, "error getting items from storage")
 		return
 	}
-	pruner.logger.V(1).Info("archives in storage", "archives", archivesInStorage)
+	pruner.logger.V(1).Info("archives in storage", "count", len(archivesInStorage))
+
+	if incomplete {
+		pruner.logger.Error(nil, "skipping this prune cycle: failed to enumerate every package's referenced archives, refusing to guess which storage archives are orphaned")
+		return
+	}
 
 	// difference of the two lists gives us the list of orphan archives. This is just a brute force approach.
 	// need to do something more optimal at scale.
 	orphanedArchives := getDifferenceOfLists(archivesInStorage, archivesRefByPkgs)
-	pruner.logger.V(1).Info("orphan archives", "archives", orphanedArchives)
+	pruner.logger.Info("computed orphan archives for this cycle",
+		"orphan_count", len(orphanedArchives), "referenced_count", len(archivesRefByPkgs), "storage_count", len(archivesInStorage))
+
+	// Safety valve: refuse a sweep that wants to delete an implausibly large
+	// number of archives at once instead of silently carrying it out. See
+	// defaultMaxOrphansPerCycle for why — this is the guardrail that would
+	// have contained the 2026-07 incident regardless of what exactly made
+	// the reference list wrong that cycle. A genuinely large legitimate
+	// backlog can be cleared by raising PRUNE_MAX_ORPHANS_PER_CYCLE once the
+	// operator has confirmed the orphan list is correct.
+	if len(orphanedArchives) > pruner.maxOrphansPerCycle {
+		pruner.logger.Error(nil, "refusing to prune: orphan count exceeds the per-cycle safety cap; this usually means the reference list is wrong, not that this many archives are truly abandoned",
+			"orphan_count", len(orphanedArchives), "cap", pruner.maxOrphansPerCycle)
+		return
+	}
 
 	// send each orphan archive away for deletion
-	for _, archiveID = range orphanedArchives {
+	for _, archiveID := range orphanedArchives {
 		pruner.insertArchive(archiveID)
 	}
 }

@@ -14,22 +14,22 @@ routerServiceType: LoadBalancer
 ## repository represents base repository for images used in the chart.
 ## Keep it empty for using existing local image
 ##
-repository: ghcr.io
+repository: ghcr.io/stradivario
 
 ## image represents the base image fission-bundle used by multiple Fission components.
 ## We alter arguments to the image to run a particular component.
 ##
-image: fission/fission-bundle
+image: fission-bundle
 
 ## imageTag represents the tag of the base image fission-bundle used by multiple Fission components.
 ## It is also used by the chart to identify version of the few more images apart from fission-bundle.
 ## Keep it empty for using latest tag.
 ##
-imageTag: v1.27.0
+imageTag: v1.24.1-watch-all-namespaces
 
 ## pullPolicy represents the pull policy to use for images in the chart.
 ##
-pullPolicy: IfNotPresent
+pullPolicy: Always
 
 ## imagepullsecrets
 imagePullSecrets: []
@@ -178,11 +178,11 @@ fetcher:
   ## repository represents the repository of the fetcher component.
   ##
   ## By default, it is empty, which means global repository will be used.
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## image represents the image of the fetcher component.
-  image: fission/fetcher
+  image: fetcher
   ## imageTag represents the tag of the image of the fetcher component.
-  imageTag: v1.27.0
+  imageTag: v1.24.1-watch-all-namespaces
   ## allowInsecureRegistries is a comma-separated list of registry hosts
   ## (host[:port]) permitted to serve OCI package images over plain HTTP.
   ## Default empty: registries must serve TLS (localhost and private RFC-1918
@@ -365,6 +365,25 @@ router:
   ## port 80). Mirrored by pkg/svcinfo.PortRouter.
   port: 8888
   internalPort: 8889
+  ## enforceSameNamespaceInvocation (opt-in) rejects (403) a
+  ## /fission-function/<ns>/<name> request on the internal listener unless the
+  ## caller's pod is in the target function's namespace, is an internal Fission
+  ## component (a pod in the install namespace), or is in allowedNamespaces
+  ## below. Closes the cross-namespace invocation gap left when internalAuth is
+  ## disabled: NetworkPolicy/HMAC gate WHO reaches router-internal, not WHICH
+  ## namespace they can target. See docs/features/internal-invocation-isolation.md.
+  ## This fork defaults it ON (upstream has no equivalent) — lambforge.com runs
+  ## Fission as a shared control plane for mutually-untrusting tenant projects
+  ## (typically alongside tenancy.mode=dynamic).
+  ##
+  enforceSameNamespaceInvocation: true
+  ## allowedNamespaces lists extra namespaces whose pods may invoke
+  ## /fission-function/<ns>/<name> on the internal listener regardless of the
+  ## target namespace. Useful for cross-namespace monitoring or webhook callers
+  ## (e.g. a Prometheus stack deployed in "monitoring"). The router passes this
+  ## list as the ROUTER_ALLOWED_NAMESPACES env var (comma-separated).
+  ##
+  allowedNamespaces: []
   ## strategy is the Deployment rollout strategy for the router (ignored when
   ## deployAsDaemonSet is true). Leave unset for the Kubernetes default. The
   ## router is stateless, so a surge strategy gives zero-downtime rollouts:
@@ -733,7 +752,17 @@ tenancy:
   ##           single-tenant/trusted clusters.
   ## dynamic and cluster set FISSION_TENANCY_MODE on the data-plane components and
   ## render the tenant controller; static renders neither.
-  mode: static
+  ##
+  ## This fork defaults to "dynamic": lambforge.com runs Fission as a shared,
+  ## multi-tenant control plane where tenant namespaces must NOT be able to read
+  ## each other's Secrets/ConfigMaps, which is exactly the posture "dynamic"
+  ## provides (and "cluster" explicitly does not — see its warning above). This
+  ## replaces the fork's old custom watch-all-namespaces mechanism; unlike that
+  ## mechanism, onboarding is explicit (fission.io/enabled=true label or
+  ## `fission tenant enable <ns>`), not automatic for every namespace in the
+  ## cluster. See docs/features/watch-all-namespaces.md for the migration note
+  ## (existing tenant namespaces need a one-time backfill before cutover).
+  mode: dynamic
 
 ## The tenant controller is the multi-namespace tenancy lifecycle controller
 ## (docs/multiple-namespace). It is rendered automatically when tenancy.mode is
@@ -789,6 +818,11 @@ storagesvc:
     enabled: true
     ## Run prune routine at interval (in minutes)
     interval: 60
+    ## Safety cap: refuse to delete more than this many archives in a single
+    ## sweep (a sweep that wants to delete far more than this is a signal
+    ## the reference list is wrong, not that this many archives are
+    ## genuinely orphaned at once — see pkg/storagesvc/archivePruner.go).
+    maxOrphansPerCycle: 20
 
   ## maxArchiveSizeMib caps the size (in MiB) of a single package archive
   ## uploaded to /v1/archive. With internalAuth enabled, the HMAC verifier
@@ -1020,17 +1054,17 @@ preUpgradeChecks:
   ## Repository for pre-install/pre-upgrade checks image
   ## By default it uses the global repository
   ##
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## pre-install/pre-upgrade checks live in this image
   ##
-  image: fission/pre-upgrade-checks
+  image: pre-upgrade-checks
   ## pre-install/pre-upgrade checks image version
   ##
-  imageTag: v1.27.0
+  imageTag: v1.24.1-watch-all-namespaces
 
 ## Fission post-install/post-upgrade reporting live in this image
 ##
-postInstallReportImage: fission/reporter
+postInstallReportImage: reporter
 
 ## If there are any pod specialization errors when a function is triggered, the error
 ## summary is returned as part of http response if this is set to true.
@@ -1336,8 +1370,63 @@ networkPolicy:
 ##
 ## Disabled here means the cluster falls back to NetworkPolicy + namespace
 ## isolation only, matching pre-1.(N+1) behaviour.
+##
+## This fork defaults this OFF (upstream defaults it on): the unsigned KEDA
+## HTTP connector images and the GraphQL federation gateway this fork's
+## deployments rely on do not sign their calls to router-internal, and would
+## 401 if HMAC verification were enforced. See docs/features/internal-auth.md.
+## Note this also means tenancy.mode=dynamic's per-namespace derived-key
+## provisioning is a no-op (pkg/tenant/provision_auth.go: EnsureNamespaceAuthSecret
+## short-circuits when the master secret is empty) — dynamic mode's RBAC/cache
+## isolation (Tier A/B split, no cluster-wide Secrets/ConfigMaps read) still
+## fully applies regardless; only the additional per-namespace-HMAC-key layer
+## is inactive until internalAuth is opted back on (which requires the KEDA
+## connectors + federation gateway to sign, same prerequisite as before).
 internalAuth:
-  enabled: true
+  enabled: false
   # secret: "" — auto-generated on first install; preserved on upgrade.
   # oldSecret: "" — set during rotation; accepted by the verifier alongside `secret`.
+
+## eventHooks pushes package-build and function-deploy lifecycle events to a
+## designated target, so consumers stop polling `fission package info` /
+## `kubectl rollout status` to find out when a build finished or a new pod
+## actually specialized. See docs/features/build-deploy-webhooks.md.
+##
+## Two independent targets, one per event family — leave either unset to
+## disable just that family. For each, set EITHER (namespace + function [+
+## subpath]) — the recommended mode: the event is delivered by invoking that
+## Fission function through the router's internal listener, the same
+## mechanism timer/mqtrigger/kubewatcher already use — OR `url`, an escape
+## hatch for a non-Fission / out-of-cluster receiver. Setting both on the same
+## family is invalid; namespace/function wins if both happen to be set.
+##
+## `subpath` matters when the target function is a full app with its own
+## router rather than a single-purpose function: the router only strips
+## `/fission-function/<ns>/<fn>` and forwards the rest, so subpath is what
+## lets the event land on a specific route (e.g. graphql-server-lambdas
+## registers POST /webhooks/fission-events for exactly this — see
+## src/app/webhooks/fission-events.plugin.ts there). Empty means the
+## function's root path.
+##
+## Delivery reuses the existing internal webhook publisher: async, retried
+## with backoff, and automatically HMAC-signed whenever internalAuth.enabled
+## is true (same FISSION_INTERNAL_AUTH_SECRET already used for every other
+## internal call to the router) — there is no separate auth toggle here.
+##
+## Disabled by default: zero behavior change, and on the update path
+## (function.deploy.* only) enabling it makes the executor wait for the new
+## pod to actually become available before returning, closing a race that
+## does not matter unless something is listening (see newdeploymgr.go).
+eventHooks:
+  enabled: false
+  packageBuild:
+    namespace: ""
+    function: ""
+    subpath: ""
+    url: ""
+  functionDeploy:
+    namespace: ""
+    function: ""
+    subpath: ""
+    url: ""
 

@@ -124,7 +124,18 @@ func MakeClient(logger logr.Logger, executorURL string, masterSecret []byte) Cli
 	}
 	// Retry is the outermost transport so the signer re-signs each attempt with
 	// a fresh timestamp (replaces hashicorp/go-retryablehttp).
-	rt = httpretry.New(rt, httpretry.DefaultOptions())
+	//
+	// NoRetryOn429: the executor returns 429 for deliberate back-pressure (the
+	// per-function concurrency limit and the per-environment pod cap /
+	// spec.maxpoolsize). Retrying just delays the inevitable for ~15s and,
+	// worse, the default policy then surfaces a generic "giving up after N
+	// attempts" error that erases the 429, so the router would default its
+	// response to 500 instead of the 429 it explicitly fast-fails on (see
+	// functionHandler's RoundTrip). Skipping the retry lets the 429 propagate
+	// to the caller immediately.
+	retryOpts := httpretry.DefaultOptions()
+	retryOpts.NoRetryOn429 = true
+	rt = httpretry.New(rt, retryOpts)
 	hc := &http.Client{Transport: rt}
 	c := &client{
 		logger:      logger.WithName("executor_client"),

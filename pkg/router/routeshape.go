@@ -231,7 +231,15 @@ func (ts *HTTPTriggerSet) buildInternalFunctionHandler(fn *fv1.Function, fnTimeo
 		policyByUID: precomputePolicies(map[string]*fv1.Function{fn.Name: fn},
 			fnTimeoutMap, streamIdleDefault),
 	}
-	return http.HandlerFunc(fh.handler)
+	var handler http.Handler = http.HandlerFunc(fh.handler)
+	// Same-namespace guard (opt-in): a caller may invoke this function only from
+	// its own namespace (fn.Namespace) or as an internal Fission component.
+	// Wrapping here (the single builder shared by the one-shot, incremental-apply,
+	// and resync callers) covers all three without duplication.
+	if ts.callerNSGuard != nil {
+		handler = ts.callerNSGuard.wrap(handler, fn.Namespace)
+	}
+	return handler
 }
 
 // newListenerMuxes creates the public + internal mux skeletons: encoded-path

@@ -4,6 +4,7 @@ on:
     tags:
       - v1.**
       - v2.**
+      - v3.**
 
 env:
   KIND_VERSION: v0.32.0
@@ -172,6 +173,13 @@ jobs:
 
   image-provenance-verification-with-cosign:
     name: Verify Image Provenance
+    # Disabled on this fork: --certificate-identity-regexp below is pinned to
+    # github.com/fission/fission's OIDC identity and can never match this
+    # fork's own attestations (github.com/Stradivario/fission) -- it would
+    # always fail red regardless of whether the release itself is fine.
+    # Kept (not deleted) so re-pointing the regexp at Stradivario/fission is a
+    # small, obvious follow-up if this is ever wanted back.
+    if: false
     needs: [create-draft-release, image-sbom-provenance-ghcr]
     strategy:
       matrix:
