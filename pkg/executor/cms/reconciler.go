@@ -23,6 +23,7 @@ import (
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/executor/executortype"
+	"github.com/fission/fission/pkg/executor/tenantwatch"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
 	"github.com/fission/fission/pkg/utils"
 )
@@ -95,7 +96,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 // Manager. They watch through the Manager's (namespace-scoped) cache and, like
 // the rest of the executor's mutating controllers, run on the elected leader
 // only. Under dynamic tenancy that cache is fixed at startup, so the reconcilers
-// are fed by a tenantWatcher instead (see registerTenantScoped).
+// are fed by a tenantwatch.Watcher instead (see registerTenantScoped).
 func RegisterReconcilers(mgr ctrl.Manager, logger logr.Logger, fissionClient versioned.Interface,
 	types map[fv1.ExecutorType]executortype.ExecutorType) error {
 	if utils.DynamicNamespacesEnabled() {
@@ -122,8 +123,8 @@ func RegisterReconcilers(mgr ctrl.Manager, logger logr.Logger, fissionClient ver
 	return nil
 }
 
-// registerTenantScoped is RegisterReconcilers for dynamic tenancy: a tenantWatcher
-// runs per-tenant metadata-only Secret/ConfigMap informers that follow the live
+// registerTenantScoped is RegisterReconcilers for dynamic tenancy: a tenantwatch
+// Watcher runs per-tenant metadata-only Secret/ConfigMap informers that follow the live
 // tenant set, and feeds ResourceVersion changes to the same reconcilers through
 // channel sources. The reconcilers read through the API reader (one GET per
 // change) because the Manager cache cannot see runtime-onboarded namespaces.
@@ -133,7 +134,9 @@ func registerTenantScoped(mgr ctrl.Manager, logger logr.Logger, fissionClient ve
 	if err != nil {
 		return fmt.Errorf("error creating metadata client: %w", err)
 	}
-	w := newTenantWatcher(logger, metaClient, mgr.GetClient(), mgr.GetCache())
+	secrets := tenantwatch.MetadataSource(metaClient, apiv1.SchemeGroupVersion.WithResource("secrets"))
+	configMaps := tenantwatch.MetadataSource(metaClient, apiv1.SchemeGroupVersion.WithResource("configmaps"))
+	w := tenantwatch.New(logger.WithName("secret_configmap_tenant_watch"), mgr.GetClient(), mgr.GetCache(), secrets, configMaps)
 	if err := mgr.Add(w); err != nil {
 		return fmt.Errorf("error adding tenant secret/configmap watcher: %w", err)
 	}
@@ -146,7 +149,7 @@ func registerTenantScoped(mgr ctrl.Manager, logger logr.Logger, fissionClient ve
 	}
 	if err := builder.ControllerManagedBy(mgr).
 		Named("executor-configmap").
-		WatchesRawSource(source.Channel(w.cmEvents, &handler.EnqueueRequestForObject{})).
+		WatchesRawSource(source.Channel(configMaps.Events, &handler.EnqueueRequestForObject{})).
 		Complete(cmReconciler); err != nil {
 		return fmt.Errorf("error registering configmap reconciler: %w", err)
 	}
@@ -158,7 +161,7 @@ func registerTenantScoped(mgr ctrl.Manager, logger logr.Logger, fissionClient ve
 	}
 	if err := builder.ControllerManagedBy(mgr).
 		Named("executor-secret").
-		WatchesRawSource(source.Channel(w.secretEvents, &handler.EnqueueRequestForObject{})).
+		WatchesRawSource(source.Channel(secrets.Events, &handler.EnqueueRequestForObject{})).
 		Complete(secretReconciler); err != nil {
 		return fmt.Errorf("error registering secret reconciler: %w", err)
 	}
