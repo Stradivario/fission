@@ -236,6 +236,16 @@ func IsURL(str string) bool {
 	return strings.HasPrefix(str, "http://") || strings.HasPrefix(str, "https://")
 }
 
+// HTTPStatusError is the non-2xx response of a download. Its message is the
+// bare status line, as before; StatusCode lets callers tell a permanent 4xx
+// from a retryable 5xx.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPStatusError) Error() string { return e.Status }
+
 func isHttp2xxSuccessful(status int) bool {
 	return status >= 200 && status < 300
 }
@@ -262,7 +272,7 @@ func DownloadUrl(ctx context.Context, httpClient *http.Client, targetURL string,
 	defer resp.Body.Close()
 
 	if !isHttp2xxSuccessful(resp.StatusCode) {
-		return errors.New(resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	w, err := os.OpenFile(localPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -312,7 +322,7 @@ func DownloadUrlToRoot(ctx context.Context, httpClient *http.Client, targetURL s
 	defer resp.Body.Close()
 
 	if !isHttp2xxSuccessful(resp.StatusCode) {
-		return errors.New(resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	w, err := RootOpenFile(base, localPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)

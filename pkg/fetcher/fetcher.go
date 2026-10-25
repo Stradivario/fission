@@ -392,7 +392,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 		// fetch the file and save it to the tmp path. FETCH_URL targets
 		// are user-supplied — pick the unsigned client unless the URL
 		// happens to point at our own storagesvc.
-		err := utils.DownloadUrlToRoot(ctx, fetcher.httpClientForURL(req.URL), req.URL, fetcher.sharedVolumePath, tmpPath)
+		err := fetcher.downloadToRoot(ctx, logger, fetcher.httpClientForURL(req.URL), req.URL, tmpPath)
 		if err != nil {
 			e := "failed to download url from fetch request"
 			logger.Error(err, e, "url", req.URL)
@@ -454,7 +454,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 				logger.Error(err, e, "url", archive.URL)
 				return code, fmt.Errorf("%s %s: %w", e, archive.URL, err)
 			}
-			err = utils.DownloadUrlToRoot(ctx, client, archive.URL, fetcher.sharedVolumePath, tmpPath)
+			err = fetcher.downloadToRoot(ctx, logger, client, archive.URL, tmpPath)
 			if err != nil {
 				e := "failed to download url from archive"
 				logger.Error(err, e, "url", req.URL)
@@ -945,6 +945,20 @@ func (fetcher *Fetcher) SpecializePod(ctx context.Context, fetchReq FunctionFetc
 		}
 		return statusCode, fmt.Errorf("error specializing function pod: %w", err)
 	}
+}
+
+// downloadToRoot downloads targetURL to tmpPath under the shared volume with
+// client, retrying transient failures (archiveDownloadRetrySchedule). Callers
+// pick the client: httpClientForURL (signed only for storagesvc) or, for a
+// SecretRef archive, clientForArchive's credentialed one.
+func (fetcher *Fetcher) downloadToRoot(ctx context.Context, logger logr.Logger, client *http.Client, targetURL, tmpPath string) error {
+	return downloadWithRetry(ctx, archiveDownloadRetrySchedule,
+		func(attempt int, err error) {
+			logger.Info("transient error downloading archive, retrying", "url", targetURL, "attempt", attempt, "error", err.Error())
+		},
+		func() error {
+			return utils.DownloadUrlToRoot(ctx, client, targetURL, fetcher.sharedVolumePath, tmpPath)
+		})
 }
 
 // WsStartHandler is used to generate websocket events in Kubernetes
