@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
@@ -126,7 +127,7 @@ func executorCacheOptions() crcache.Options {
 		// memory, the one read the design forbids. Override the per-type namespaces
 		// to the env-seeded set, leaving the cluster-wide default to the Tier-A CRDs
 		// only. The executor's Secret/ConfigMap change reconcilers do not use this
-		// cache in dynamic mode: cms.tenantWatcher runs per-tenant metadata-only
+		// cache in dynamic mode: tenantwatch.Watcher runs per-tenant metadata-only
 		// watches that follow the live tenant set instead.
 		byObject[&corev1.Secret{}] = crcache.ByObject{Namespaces: nsConfig}
 		byObject[&corev1.ConfigMap{}] = crcache.ByObject{Namespaces: nsConfig}
@@ -170,6 +171,9 @@ type executorControllers struct {
 	executorTypes  map[fv1.ExecutorType]executortype.ExecutorType
 	waitForSync    func(ctx context.Context) bool
 	adoptResources bool
+	// syncTenants loads the live tenant set into the resolver (dynamic/cluster
+	// tenancy only; nil otherwise). See syncTenantsBeforeAdopt.
+	syncTenants func(ctx context.Context) error
 }
 
 func (c *executorControllers) NeedLeaderElection() bool { return true }
@@ -191,7 +195,9 @@ func (c *executorControllers) Start(ctx context.Context) error {
 	idleReaper := idle.NewReaper(c.logger, strategies...)
 	gm.Go(func() error { idleReaper.Start(ctx); return nil })
 
-	runAdoptCleanup(ctx, c.executorTypes, c.adoptResources)
+	if syncTenantsBeforeAdopt(ctx, c.logger, c.syncTenants, adoptCleanupMaxWait, time.Second) {
+		runAdoptCleanup(ctx, c.executorTypes, c.adoptResources)
+	}
 
 	c.api.isLeader.Store(true)
 	go c.markSyncedWhenCachesWarm(ctx)
@@ -235,6 +241,31 @@ func (a *executorAPIServer) Start(ctx context.Context) error {
 // CleanupOldExecutorObjects runs after AdoptExistingResources within each
 // goroutine regardless, so it never reaps objects adopt hasn't re-stamped.
 const adoptCleanupMaxWait = 30 * time.Second
+
+// syncTenantsBeforeAdopt loads the tenant set into the resolver before the
+// adopt + cleanup pass, retrying until it succeeds or timeout passes. Adopt and
+// the stale-instanceID reaper each snapshot the resolver's namespaces; at startup
+// the resolver-sync controller fills the tenant set concurrently, so adopt saw
+// only the env seed while the reaper, moments later, saw the tenants and deleted
+// every Deployment adopt had not re-stamped (every function's Deployment in
+// every tenant namespace, on each executor restart). It returns false when the
+// set could not be loaded: the pass is then skipped — leaving orphans is safe,
+// reaping against a partial tenant set is not.
+func syncTenantsBeforeAdopt(ctx context.Context, logger logr.Logger, sync func(context.Context) error, timeout, interval time.Duration) bool {
+	if sync == nil {
+		return true
+	}
+	var lastErr error
+	err := wait.PollUntilContextTimeout(ctx, interval, timeout, true, func(ctx context.Context) (bool, error) {
+		lastErr = sync(ctx)
+		return lastErr == nil, nil
+	})
+	if err != nil {
+		logger.Error(lastErr, "could not load the tenant set; skipping adopt and orphan cleanup of existing executor objects")
+		return false
+	}
+	return true
+}
 
 // runAdoptCleanup adopts pre-existing resources (optional) and cleans up stale
 // executor objects. Runs on the leader.
@@ -498,6 +529,11 @@ func StartExecutor(ctx context.Context, clientGen crd.ClientGeneratorInterface, 
 		executorTypes:  executorTypes,
 		waitForSync:    waitForSync,
 		adoptResources: adoptExistingResources,
+	}
+	if utils.CrdWatchClusterWide() {
+		controllers.syncTenants = func(ctx context.Context) error {
+			return tenant.SyncResolverFromTenants(ctx, crMgr.GetAPIReader(), utils.DefaultNSResolver())
+		}
 	}
 	if err := crMgr.Add(controllers); err != nil {
 		return fmt.Errorf("unable to add executor controllers: %w", err)

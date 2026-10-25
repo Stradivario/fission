@@ -47,7 +47,7 @@ const (
 // (utils.GetNamespaces) keeps the static FISSION_RESOURCE_NAMESPACES entries as a
 // base, so dynamic onboarding is additive and removing a FissionTenant never
 // drops an env-configured namespace.
-func SyncResolverFromTenants(ctx context.Context, c client.Client, resolver *utils.NamespaceResolver) error {
+func SyncResolverFromTenants(ctx context.Context, c client.Reader, resolver *utils.NamespaceResolver) error {
 	list := &fv1.FissionTenantList{}
 	if err := c.List(ctx, list); err != nil {
 		return err

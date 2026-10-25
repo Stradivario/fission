@@ -10,3 +10,4 @@ Custom features and fixes for this Fission fork (`ghcr.io/stradivario` builds), 
 | [build-deploy-webhooks](build-deploy-webhooks.md) | Active — re-ported onto `release/custom-v3.0` |
 | [builder-env-annotation-reconcile](builder-env-annotation-reconcile.md) | Active — buildermgr reconciles annotation- and label-only Environment changes (builder objects are named after resourceVersion); not in a published image yet |
 | [tenant-secret-configmap-watch](tenant-secret-configmap-watch.md) | Active — dynamic tenancy: Secret/ConfigMap changes in runtime-onboarded namespaces recycle function pods again; also fixes newdeploy resource overrides mutating the cached Environment; not in a published image yet |
+| [adopt-tenant-sync](adopt-tenant-sync.md) | Active — executor restarts no longer delete tenant function Deployments / leak specialized pods (adopt waited on a partial tenant set); not in a published image yet |
