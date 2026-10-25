@@ -123,8 +123,9 @@ func executorCacheOptions() crcache.Options {
 		// Secret cache would mirror every Secret in the cluster into the executor's
 		// memory, the one read the design forbids. Override the per-type namespaces
 		// to the env-seeded set, leaving the cluster-wide default to the Tier-A CRDs
-		// only. (Operators needing Tier-B reads in arbitrary runtime-onboarded
-		// namespaces use cluster mode, which goes cluster-wide above.)
+		// only. The executor's Secret/ConfigMap change reconcilers do not use this
+		// cache in dynamic mode: cms.tenantWatcher runs per-tenant metadata-only
+		// watches that follow the live tenant set instead.
 		byObject[&corev1.Secret{}] = crcache.ByObject{Namespaces: nsConfig}
 		byObject[&corev1.ConfigMap{}] = crcache.ByObject{Namespaces: nsConfig}
 		// ReplicaSets (poolmgr's specialized-pod cleanup watch) are not label-bounded
