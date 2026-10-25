@@ -6,6 +6,7 @@ package buildermgr
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -217,10 +219,47 @@ func (r *EnvironmentReconciler) ensureBuilder(ctx context.Context, env *fv1.Envi
 			return fmt.Errorf("error creating builder deployment for environment %s in namespace %s: %w", env.Name, ns, err)
 		}
 	case 1:
-		// already present
+		if err := r.syncBuilderNodeSelector(ctx, &deployList[0]); err != nil {
+			return fmt.Errorf("error updating builder deployment node selector for environment %s in namespace %s: %w", env.Name, ns, err)
+		}
 	default:
 		return fmt.Errorf("found more than one builder deployment for environment %s in namespace %s", env.Name, ns)
 	}
+	return nil
+}
+
+// syncBuilderNodeSelector adds the builder pod spec patch's nodeSelector keys
+// that an existing builder Deployment lacks. Builders are named after the
+// Environment's resourceVersion and otherwise never updated, so without this a
+// newly enabled patch (e.g. kubernetes.io/arch: amd64) would only reach the
+// builders created after each Environment's next change. Keys the builder
+// already sets are left alone, as in createBuilderDeployment's merge, where the
+// Environment's own builder podspec wins.
+func (r *EnvironmentReconciler) syncBuilderNodeSelector(ctx context.Context, deployment *appsv1.Deployment) error {
+	if r.podSpecPatch == nil {
+		return nil
+	}
+	missing := map[string]string{}
+	for k, v := range r.podSpecPatch.NodeSelector {
+		if _, ok := deployment.Spec.Template.Spec.NodeSelector[k]; !ok {
+			missing[k] = v
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	patch, err := json.Marshal(map[string]any{
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{"nodeSelector": missing}}},
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := r.kubernetesClient.AppsV1().Deployments(deployment.Namespace).Patch(ctx, deployment.Name,
+		k8stypes.StrategicMergePatchType, patch, metav1.PatchOptions{}); err != nil {
+		return err
+	}
+	r.logger.Info("added pod spec patch node selector to builder deployment", "deployment", deployment.Name,
+		"namespace", deployment.Namespace, "nodeSelector", missing)
 	return nil
 }
 
