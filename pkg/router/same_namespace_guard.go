@@ -42,8 +42,8 @@ type callerNamespaceLookup interface {
 	lookup(ip string) (namespace string, found bool)
 }
 
-// defaultUnresolvedRetries/defaultUnresolvedRetryInterval bound how long wrap
-// retries an unresolved caller before failing closed. This absorbs a real,
+// defaultUnresolvedRetrySchedule bounds how long wrap retries an unresolved
+// caller before failing closed. This absorbs a real,
 // 100%-reproducible race (confirmed live: a curl fired the instant a pod's
 // container starts, 4ms round trip, always 403s on the first attempt) between
 // a brand-new pod's first outbound request and its own status.podIP becoming
@@ -56,10 +56,17 @@ type callerNamespaceLookup interface {
 // which — if the caller treats it as fatal — can cascade into a pod
 // restart-and-repeat loop, since the replacement pod hits exactly the same
 // race with its own new IP.
-const (
-	defaultUnresolvedRetries       = 5
-	defaultUnresolvedRetryInterval = 50 * time.Millisecond
-)
+//
+// The default is a backoff, ~3s in total: the guard can only see a pod's IP once
+// the kubelet has reported the pod's status, which on a node that just joined
+// the cluster lags the container start by far more than the previous fixed
+// 5x50ms. Production, 2026-10-25: federation gateway pods starting on a fresh
+// node had every startup subgraph call rejected as unresolved. Only a caller
+// that is still unresolved pays the wait, and only in its first seconds.
+var defaultUnresolvedRetrySchedule = []time.Duration{
+	50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond,
+	400 * time.Millisecond, 750 * time.Millisecond, 1500 * time.Millisecond,
+}
 
 // sameNamespaceGuard enforces same-namespace (or internal-component) invocation
 // on the internal listener. It is applied per function handler so the target
@@ -82,16 +89,23 @@ func (g *sameNamespaceGuard) resolveCallerNamespace(callerIP string) (string, bo
 	if ns, found := g.lookup.lookup(callerIP); found {
 		return ns, true
 	}
-	retries := g.unresolvedRetries
-	if retries == 0 {
-		retries = defaultUnresolvedRetries
+	schedule := defaultUnresolvedRetrySchedule
+	if g.unresolvedRetries > 0 || g.unresolvedRetryInterval > 0 {
+		// Test override: a fixed number of fixed-interval retries.
+		retries, interval := g.unresolvedRetries, g.unresolvedRetryInterval
+		if retries == 0 {
+			retries = len(defaultUnresolvedRetrySchedule)
+		}
+		if interval == 0 {
+			interval = defaultUnresolvedRetrySchedule[0]
+		}
+		schedule = make([]time.Duration, retries)
+		for i := range schedule {
+			schedule[i] = interval
+		}
 	}
-	interval := g.unresolvedRetryInterval
-	if interval == 0 {
-		interval = defaultUnresolvedRetryInterval
-	}
-	for i := 0; i < retries; i++ {
-		time.Sleep(interval)
+	for _, d := range schedule {
+		time.Sleep(d)
 		if ns, found := g.lookup.lookup(callerIP); found {
 			return ns, true
 		}

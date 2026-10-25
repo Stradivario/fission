@@ -30,9 +30,12 @@ When enabled, the internal listener rejects (`403`) any
 The same guard also covers the RFC-0025 `:<alias>` internal routes (scoped to
 the alias's function namespace), so an alias is no way around it.
 
-A caller is resolved by its pod IP (retried for ~250ms). A pod that invokes
-another function in its very first moments, before the router has seen its IP,
-can still get `403 caller namespace unresolved`.
+A caller is resolved by its pod IP: the router's pod informer cache, then a
+direct API lookup, retried with backoff for ~3s (50ms → 1.5s). A brand-new pod's
+IP is only visible once the kubelet reports its status; on a node that just
+joined that lagged well past the original 250ms window, and production
+federation gateway pods had every startup subgraph call rejected (2026-10-25).
+A caller still unresolved after ~3s gets `403 caller namespace unresolved`.
 
 This fits the common patterns exactly: a GraphQL federation gateway invoking its
 own-namespace subgraphs passes; a KEDA connector (deployed in the function's

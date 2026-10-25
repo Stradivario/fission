@@ -21,7 +21,7 @@ import (
 
 // testUnresolvedRetries/testUnresolvedRetryInterval keep the unresolved-caller
 // test cases fast and deterministic instead of eating the real ~250ms default
-// retry budget (defaultUnresolvedRetries * defaultUnresolvedRetryInterval).
+// retry budget (defaultUnresolvedRetrySchedule).
 const (
 	testUnresolvedRetries       = 1
 	testUnresolvedRetryInterval = time.Millisecond
@@ -257,4 +257,40 @@ func TestPodIPCacheAPIFallback(t *testing.T) {
 
 	_, ok = c.lookup("10.9.9.9")
 	assert.False(t, ok, "an IP with no pod stays unresolved")
+}
+
+// delayedLookup resolves its IP only once `after` has elapsed: a pod whose IP
+// the kubelet has not reported yet, as on a node that just joined.
+type delayedLookup struct {
+	start time.Time
+	after time.Duration
+	ns    string
+}
+
+func (d delayedLookup) lookup(string) (string, bool) {
+	if time.Since(d.start) < d.after {
+		return "", false
+	}
+	return d.ns, true
+}
+
+// With the default schedule a caller that becomes resolvable 600ms in (the old
+// fixed 5x50ms window gave up at 250ms) is let through instead of 403ed.
+func TestResolveCallerNamespaceDefaultScheduleCoversSlowPodIP(t *testing.T) {
+	t.Parallel()
+	g := &sameNamespaceGuard{
+		lookup:           delayedLookup{start: time.Now(), after: 600 * time.Millisecond, ns: "tenant-a"},
+		installNamespace: "fission",
+		logger:           loggerfactory.GetLogger(),
+	}
+	ns, found := g.resolveCallerNamespace("10.0.0.42")
+	assert.True(t, found, "a pod IP that appears within the default budget must resolve")
+	assert.Equal(t, "tenant-a", ns)
+
+	var total time.Duration
+	for _, d := range defaultUnresolvedRetrySchedule {
+		total += d
+	}
+	assert.GreaterOrEqual(t, total, 2*time.Second, "budget must cover a fresh node's status lag")
+	assert.LessOrEqual(t, total, 5*time.Second, "a truly unknown caller must still fail closed quickly")
 }
