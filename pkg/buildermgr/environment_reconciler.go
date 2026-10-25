@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/executor/util"
@@ -51,6 +52,24 @@ var (
 	deletePropagation = metav1.DeletePropagationBackground
 	delOpt            = metav1.DeleteOptions{PropagationPolicy: &deletePropagation}
 )
+
+// environmentPredicate admits spec changes (generation) AND annotation- or
+// label-only changes. The builder objects are named "<env.Name>-<env.ResourceVersion>",
+// and an annotation patch (e.g. Lambforge's `fission.io/force-update` when a
+// suspended project is resumed) bumps ResourceVersion without bumping
+// generation: with GenerationChangedPredicate alone this reconciler never
+// created the builder for the new ResourceVersion, while the package
+// reconciler waited for exactly that name - builds stayed "pending"
+// ("builder deployment not created yet, will retry") until buildermgr
+// restarted. Status-only writes are still dropped.
+func environmentPredicate() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.AnnotationChangedPredicate{},
+		// a label-only edit bumps ResourceVersion the same way
+		predicate.LabelChangedPredicate{},
+	)
+}
 
 // EnvironmentReconciler keeps a per-Environment builder Service + Deployment in
 // sync with the Environment CR. It replaces the informer-driven

@@ -8,3 +8,4 @@ Custom features and fixes for this Fission fork (`ghcr.io/stradivario` builds), 
 | [internal-invocation-isolation](internal-invocation-isolation.md) | Active — re-ported onto `release/custom-v3.0`'s router (RFC-0002/0013 rewrite); kept alongside upstream's tenancy work, which does not cover this threat model |
 | [internal-auth](internal-auth.md) | Active — `internalAuth.enabled` defaults off (upstream defaults on) |
 | [build-deploy-webhooks](build-deploy-webhooks.md) | Active — re-ported onto `release/custom-v3.0` |
+| [builder-env-annotation-reconcile](builder-env-annotation-reconcile.md) | Active — buildermgr reconciles annotation- and label-only Environment changes (builder objects are named after resourceVersion); not in a published image yet |
