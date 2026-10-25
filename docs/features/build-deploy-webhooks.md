@@ -241,6 +241,17 @@ is set — is `WebhookPublisher`'s existing, already-in-production behavior.
 retry count, or signing path to configure or keep in sync with the rest of the
 fork's internal-publisher machinery.
 
+`Send` hands the publisher `context.WithoutCancel(ctx)`: delivery happens after
+the caller (a reconcile, or the router's cold-start request on the executor) has
+returned and cancelled its context. Passing the caller's context directly lost
+those deliveries as `final retry failed, giving up … context canceled` — 30 of
+113 production deploy events on 2026-10-25 (fixed 2026-10-25).
+
+Known limits of the shared publisher (not changed): it delivers serially with a
+60-minute per-attempt timeout and 10 retries behind a 32-slot queue, so a target
+that accepts connections but hangs stalls delivery, and once the queue is full
+`Send` blocks the reconciler that called it.
+
 On auth specifically: signing follows whatever `internalAuth.enabled` already is
 on the cluster — **not** a new mandate specific to this feature. If it's on,
 every `eventHooks` dispatch is signed for free, same as every other internal

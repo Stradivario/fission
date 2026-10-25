@@ -5,6 +5,7 @@
 package eventhook
 
 import (
+	"context"
 	"testing"
 
 	"github.com/fission/fission/pkg/utils/loggerfactory"
@@ -82,4 +83,36 @@ func TestConfiguredDispatcherIsEnabled(t *testing.T) {
 		Function:             "some-lambda",
 		DeploymentGeneration: "3",
 	})
+}
+
+type ctxKey struct{}
+
+// recordingPublisher captures the context Send hands the publisher.
+type recordingPublisher struct{ ctx context.Context }
+
+func (r *recordingPublisher) Publish(ctx context.Context, _ string, _ map[string]string, _, _ string) {
+	r.ctx = ctx
+}
+
+// The publisher delivers asynchronously, after the caller (a reconcile or the
+// router's cold-start request) has returned and cancelled its context. Send must
+// hand it a context that survives that cancellation but keeps the caller's
+// values; production lost a quarter of deploy events to "context canceled".
+func TestSendDetachesDeliveryFromCallerCancellation(t *testing.T) {
+	rec := &recordingPublisher{}
+	d := &Dispatcher{logger: loggerfactory.GetLogger(), target: target{namespace: "platform", function: "events"}, publisher: rec}
+
+	caller, cancel := context.WithCancel(context.WithValue(t.Context(), ctxKey{}, "trace"))
+	d.Send(caller, Event{Event: EventFunctionDeployReady, Namespace: "p", Function: "f"})
+	cancel()
+
+	if rec.ctx == nil {
+		t.Fatal("Send did not publish")
+	}
+	if err := rec.ctx.Err(); err != nil {
+		t.Fatalf("delivery context was cancelled with the caller: %v", err)
+	}
+	if got := rec.ctx.Value(ctxKey{}); got != "trace" {
+		t.Fatalf("delivery context lost the caller's values: %v", got)
+	}
 }

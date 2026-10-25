@@ -199,5 +199,9 @@ func (d *Dispatcher) Send(ctx context.Context, ev Event) {
 		"Content-Type":    "application/json",
 		"X-Fission-Event": ev.Event,
 	}
-	d.publisher.Publish(ctx, string(body), headers, http.MethodPost, requestTarget)
+	// The publisher delivers asynchronously (queued, retried), long after the
+	// caller's reconcile or request has returned and cancelled its context.
+	// Detach from that cancellation — keeping its values (trace IDs) — or the
+	// delivery dies with "context canceled" and the event is lost.
+	d.publisher.Publish(context.WithoutCancel(ctx), string(body), headers, http.MethodPost, requestTarget)
 }
