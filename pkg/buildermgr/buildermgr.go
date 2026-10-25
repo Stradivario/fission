@@ -131,7 +131,8 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	poolMgr := newBuilderPoolManager(bmLogger)
 
 	envReconciler := makeEnvironmentReconciler(bmLogger, mgr.GetClient(), kubernetesClient, fConfig, podSpecPatch, poolMgr)
-	if err := controller.RegisterTenantScoped(mgr, &fv1.Environment{}, envReconciler, "buildermgr-environment"); err != nil {
+	if err := controller.RegisterTenantScopedWithPredicates(mgr, &fv1.Environment{}, envReconciler, "buildermgr-environment",
+		0, environmentPredicate()); err != nil {
 		return fmt.Errorf("unable to register environment reconciler: %w", err)
 	}
 
