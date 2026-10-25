@@ -13,3 +13,4 @@ Custom features and fixes for this Fission fork (`ghcr.io/stradivario` builds), 
 | [adopt-tenant-sync](adopt-tenant-sync.md) | Active — executor restarts no longer delete tenant function Deployments / leak specialized pods (adopt waited on a partial tenant set); not in a published image yet |
 | [fetcher-download-retry](fetcher-download-retry.md) | Active — fetcher retries package archive downloads on network errors / 5xx (fresh-node DNS); not in a published image yet |
 | [pod-spec-patch-existing-objects](pod-spec-patch-existing-objects.md) | Active — runtime/builder pod spec patch (e.g. amd64 pin) reaches existing newdeploy functions and builders; not in a published image yet |
+| [newdeploy-function-versions](newdeploy-function-versions.md) | Active — RFC-0025 versions/aliases also work for newdeploy and container functions (cache re-key on in-place update; per-version Deployment); not in a published image yet |
