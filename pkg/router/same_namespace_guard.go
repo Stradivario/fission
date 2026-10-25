@@ -107,6 +107,15 @@ func (g *sameNamespaceGuard) resolveCallerNamespace(callerIP string) (string, bo
 func (g *sameNamespaceGuard) wrap(inner http.Handler, targetNamespace string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callerIP := clientIP(r.RemoteAddr)
+		// A loopback peer is a connection made inside the router pod's own
+		// network namespace: in practice a port-forward to the router (the
+		// fission CLI's `fn test` path), which already required
+		// pods/portforward in the release namespace. It has no pod IP to
+		// resolve; treat it like an internal Fission component.
+		if ip := net.ParseIP(callerIP); ip != nil && ip.IsLoopback() {
+			inner.ServeHTTP(w, r)
+			return
+		}
 		callerNS, found := g.resolveCallerNamespace(callerIP)
 		if !found {
 			g.logger.Info("rejecting internal invocation: caller namespace unresolved",

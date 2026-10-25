@@ -21,7 +21,18 @@ When enabled, the internal listener rejects (`403`) any
   invoke functions across namespaces, or
 - the caller's namespace is listed in `router.allowedNamespaces` (e.g.
   `"monitoring"`), which lets cross-namespace infrastructure like Prometheus
-  invoke private functions in any namespace.
+  invoke private functions in any namespace, or
+- the caller is **loopback** (`127.0.0.1` / `::1`): a connection made inside the
+  router pod, in practice a port-forward to it — the path the fission CLI's
+  `fn test` takes (it already needs `pods/portforward` in the release
+  namespace). Without this `fission fn test` always got `403`.
+
+The same guard also covers the RFC-0025 `:<alias>` internal routes (scoped to
+the alias's function namespace), so an alias is no way around it.
+
+A caller is resolved by its pod IP (retried for ~250ms). A pod that invokes
+another function in its very first moments, before the router has seen its IP,
+can still get `403 caller namespace unresolved`.
 
 This fits the common patterns exactly: a GraphQL federation gateway invoking its
 own-namespace subgraphs passes; a KEDA connector (deployed in the function's

@@ -55,6 +55,8 @@ func TestSameNamespaceGuard(t *testing.T) {
 		{"allowed namespace not in list still forbidden", "10.0.0.5:5000", mapLookup{"10.0.0.5": "monitoring"}, "tenant-b", []string{"logging"}, http.StatusForbidden, false},
 		{"allowed namespace + same namespace still allowed", "10.0.0.6:5000", mapLookup{"10.0.0.6": "tenant-a"}, "tenant-a", []string{"monitoring"}, http.StatusOK, true},
 		{"install namespace takes precedence over allowed list", "10.0.0.7:5000", mapLookup{"10.0.0.7": installNS}, "tenant-c", []string{"other"}, http.StatusOK, true},
+		{"loopback (port-forward, fission fn test) treated as internal", "127.0.0.1:5000", mapLookup{}, "tenant-a", nil, http.StatusOK, true},
+		{"IPv6 loopback treated as internal", "[::1]:5000", mapLookup{}, "tenant-a", nil, http.StatusOK, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
