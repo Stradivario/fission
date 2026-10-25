@@ -272,6 +272,10 @@ func (r *EnvironmentReconciler) reconcileBuilderDeployment(ctx context.Context, 
 	// name/namespace/RV as the live object's, so it cannot legitimately differ
 	// — keep the live value rather than betting the update on that staying true.
 	updated.Spec.Selector = live.Spec.Selector
+	// Keep the live replica count: this fork's builder pool scales builders
+	// to zero when idle and back up on demand (idleBuilderReaper / package
+	// reconciler), and a drift roll must not undo that.
+	updated.Spec.Replicas = live.Spec.Replicas
 	if updated.Annotations == nil {
 		updated.Annotations = map[string]string{}
 	}

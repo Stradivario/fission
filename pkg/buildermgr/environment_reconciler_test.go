@@ -587,3 +587,35 @@ func TestBuilderSpecHashGolden(t *testing.T) {
 		})
 	}
 }
+
+// A builder the pool scaled to zero that then drifts — here a newly enabled
+// builder pod spec patch nodeSelector (the kubernetes.io/arch pin) — must be
+// rolled onto the selector without being scaled back up: the fork's builder
+// pool owns the replica count (idleBuilderReaper / package reconciler).
+func TestEnvironmentReconcileDriftRollKeepsPoolReplicas(t *testing.T) {
+	env := newTestBuilderEnv()
+	env.ResourceVersion = "7"
+	r := newTestEnvironmentReconciler(t, nil, env)
+	ns := r.nsResolver.GetBuilderNS(env.Namespace)
+	_, err := r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	name := env.Name + "-7"
+	created, err := r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	idle := created.DeepCopy()
+	idle.Spec.Replicas = new(int32(0))
+	_, err = r.kubernetesClient.AppsV1().Deployments(ns).Update(t.Context(), idle, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	r.podSpecPatch = &apiv1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/arch": "amd64"}}
+	_, err = r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	got, err := r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"kubernetes.io/arch": "amd64"}, got.Spec.Template.Spec.NodeSelector,
+		"the drift roll must carry the patch's nodeSelector")
+	require.NotNil(t, got.Spec.Replicas)
+	assert.Equal(t, int32(0), *got.Spec.Replicas, "the roll must not scale an idle pooled builder back up")
+}

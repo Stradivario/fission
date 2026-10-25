@@ -25,6 +25,22 @@ import (
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
+// adoptDeployment copies onto an orphan Deployment left by a previous executor
+// the fields the current executor owns. Scheduling is included so a changed
+// runtime pod spec patch (e.g. a kubernetes.io/arch nodeSelector) reaches
+// existing functions on the next executor start, not only new ones.
+func adoptDeployment(existing, desired *appsv1.Deployment) {
+	existing.Annotations = desired.Annotations
+	existing.Labels = desired.Labels
+	existing.OwnerReferences = desired.OwnerReferences
+	existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
+	existing.Spec.Template.Spec.ServiceAccountName = desired.Spec.Template.Spec.ServiceAccountName
+	existing.Spec.Template.Spec.TerminationGracePeriodSeconds = desired.Spec.Template.Spec.TerminationGracePeriodSeconds
+	existing.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+	existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
+	existing.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
+}
+
 func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment,
 	deployName string, deployLabels map[string]string, deployAnnotations map[string]string, deployNamespace string) (*appsv1.Deployment, error) {
 
@@ -47,12 +63,7 @@ func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Func
 	if err == nil {
 		// Try to adopt orphan deployment created by the old executor.
 		if existingDepl.Annotations[fv1.EXECUTOR_INSTANCEID_LABEL] != deploy.instanceID {
-			existingDepl.Annotations = deployment.Annotations
-			existingDepl.Labels = deployment.Labels
-			existingDepl.OwnerReferences = deployment.OwnerReferences
-			existingDepl.Spec.Template.Spec.Containers = deployment.Spec.Template.Spec.Containers
-			existingDepl.Spec.Template.Spec.ServiceAccountName = deployment.Spec.Template.Spec.ServiceAccountName
-			existingDepl.Spec.Template.Spec.TerminationGracePeriodSeconds = deployment.Spec.Template.Spec.TerminationGracePeriodSeconds
+			adoptDeployment(existingDepl, deployment)
 
 			// Update with the latest deployment spec. Kubernetes will trigger
 			// rolling update if spec is different from the one in the cluster.
