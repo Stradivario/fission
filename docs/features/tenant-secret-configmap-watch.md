@@ -18,8 +18,8 @@ which gives the executor a cluster-wide Secret read and cache.
 
 ## The fix
 
-`pkg/executor/cms/tenantwatch.go`: under dynamic tenancy a leader-only
-`tenantWatcher` runnable runs one **metadata-only** Secret and ConfigMap
+`pkg/executor/tenantwatch` (wired in `pkg/executor/cms/reconciler.go`): under
+dynamic tenancy a leader-only `tenantwatch.Watcher` runnable runs one **metadata-only** Secret and ConfigMap
 informer per live tenant namespace (resolver set + builder/function/default,
 unioned with the FissionTenants it lists itself). It re-syncs on every
 FissionTenant event and every 5 minutes, starting watches on onboarding and
@@ -45,7 +45,7 @@ leaked into the next function's Deployment. It now deep-copies; container's
 ## How to test
 
 ```bash
-go test -race ./pkg/executor/cms/ -run 'TestTenantWatcher|TestSecretReconciler|TestConfigMapReconciler'
+go test -race ./pkg/executor/tenantwatch/ ./pkg/executor/cms/
 go test -race ./pkg/executor/executortype/newdeploy/ -run TestGetResourcesDoesNotMutateEnvironment
 ```
 
@@ -56,8 +56,8 @@ env changes).
 
 ## How to debug
 
-Executor logs `started secret/configmap watch {"namespace": ...}` for every
-watched namespace at startup and on onboarding, and `stopped ...` on
+Executor logs `started tenant watch {"namespace": ...}` (logger `secret_configmap_tenant_watch`) for every
+watched namespace at startup and on onboarding, and `stopped tenant watch` on
 offboarding. A tenant missing from those lines → check its FissionTenant
 exists; `forbidden` reflector errors for a namespace → the tenant's
 `fission-executor-workload` RoleBinding is missing. Workaround on an image

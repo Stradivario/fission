@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-package cms
+package tenantwatch
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -21,6 +22,11 @@ import (
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	fscheme "github.com/fission/fission/pkg/generated/clientset/versioned/scheme"
+)
+
+var (
+	secretGVR    = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+	configMapGVR = schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}
 )
 
 func metaObj(kind, ns, name, rv string) *metav1.PartialObjectMetadata {
@@ -72,7 +78,7 @@ func waitWatching(t *testing.T, c *metafake.FakeMetadataClient, gvr schema.Group
 	deadline := time.Now().Add(5 * time.Second)
 	for i := 0; time.Now().Before(deadline); i++ {
 		o := obj.DeepCopy()
-		o.ResourceVersion = obj.ResourceVersion + "-warm" + string(rune('a'+i%26))
+		o.ResourceVersion = fmt.Sprintf("%s-warm%d", obj.ResourceVersion, i)
 		update(t, c, gvr, o)
 		select {
 		case <-ch:
@@ -83,56 +89,58 @@ func waitWatching(t *testing.T, c *metafake.FakeMetadataClient, gvr schema.Group
 	t.Fatalf("watch on %s/%s never became live", obj.Namespace, obj.Name)
 }
 
-func TestTenantWatcherFollowsTenantSet(t *testing.T) {
+func TestWatcherFollowsTenantSet(t *testing.T) {
 	sec := metaObj("Secret", "tenant-a", "environment", "1")
 	cm := metaObj("ConfigMap", "tenant-a", "settings", "1")
 	other := metaObj("Secret", "not-a-tenant", "environment", "1")
 	c := newMetaClient(t, sec, cm, other)
-	w := newTenantWatcher(logr.Discard(), c, nil, nil)
+	secrets := MetadataSource(c, secretGVR)
+	configMaps := MetadataSource(c, configMapGVR)
+	w := New(logr.Discard(), nil, nil, secrets, configMaps)
 	ctx := t.Context()
 
-	w.sync(ctx, map[string]string{"tenant-a": "tenant-a"})
-	assert.Equal(t, []string{"tenant-a"}, w.watchedNamespaces())
-	waitWatching(t, c, secretGVR, sec, w.secretEvents)
-	waitWatching(t, c, configMapGVR, cm, w.cmEvents)
+	w.Sync(ctx, map[string]string{"tenant-a": "tenant-a"})
+	assert.Equal(t, []string{"tenant-a"}, w.Watched())
+	waitWatching(t, c, secretGVR, sec, secrets.Events)
+	waitWatching(t, c, configMapGVR, cm, configMaps.Events)
 
 	t.Run("secret content change in a tenant is delivered", func(t *testing.T) {
 		update(t, c, secretGVR, metaObj("Secret", "tenant-a", "environment", "10"))
-		expectEvent(t, w.secretEvents, "tenant-a", "environment")
+		expectEvent(t, secrets.Events, "tenant-a", "environment")
 	})
 
 	t.Run("configmap content change in a tenant is delivered", func(t *testing.T) {
 		update(t, c, configMapGVR, metaObj("ConfigMap", "tenant-a", "settings", "10"))
-		expectEvent(t, w.cmEvents, "tenant-a", "settings")
+		expectEvent(t, configMaps.Events, "tenant-a", "settings")
 	})
 
 	t.Run("same resourceVersion is dropped", func(t *testing.T) {
 		update(t, c, secretGVR, metaObj("Secret", "tenant-a", "environment", "10"))
-		expectNoEvent(t, w.secretEvents)
+		expectNoEvent(t, secrets.Events)
 	})
 
 	t.Run("non-tenant namespace is not watched", func(t *testing.T) {
 		update(t, c, secretGVR, metaObj("Secret", "not-a-tenant", "environment", "2"))
-		expectNoEvent(t, w.secretEvents)
+		expectNoEvent(t, secrets.Events)
 	})
 
 	t.Run("offboarded tenant stops delivering", func(t *testing.T) {
-		w.sync(ctx, map[string]string{})
-		assert.Empty(t, w.watchedNamespaces())
+		w.Sync(ctx, map[string]string{})
+		assert.Empty(t, w.Watched())
 		update(t, c, secretGVR, metaObj("Secret", "tenant-a", "environment", "11"))
-		expectNoEvent(t, w.secretEvents)
+		expectNoEvent(t, secrets.Events)
 	})
 
 	t.Run("re-onboarded tenant delivers again", func(t *testing.T) {
-		w.sync(ctx, map[string]string{"tenant-a": "tenant-a"})
-		waitWatching(t, c, secretGVR, metaObj("Secret", "tenant-a", "environment", "12"), w.secretEvents)
+		w.Sync(ctx, map[string]string{"tenant-a": "tenant-a"})
+		waitWatching(t, c, secretGVR, metaObj("Secret", "tenant-a", "environment", "12"), secrets.Events)
 	})
 
-	w.sync(ctx, nil)
-	assert.Empty(t, w.watchedNamespaces())
+	w.Sync(ctx, nil)
+	assert.Empty(t, w.Watched())
 }
 
-func TestTenantWatcherDesiredNamespaces(t *testing.T) {
+func TestWatcherDesiredNamespaces(t *testing.T) {
 	s := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(s))
 	require.NoError(t, fscheme.AddToScheme(s))
@@ -143,9 +151,9 @@ func TestTenantWatcherDesiredNamespaces(t *testing.T) {
 		},
 		&fv1.FissionTenant{ObjectMeta: metav1.ObjectMeta{Name: "empty"}},
 	).Build()
-	w := newTenantWatcher(logr.Discard(), nil, reader, nil)
+	w := New(logr.Discard(), reader, nil)
 
-	desired, err := w.desiredNamespaces(t.Context())
+	desired, err := w.DesiredNamespaces(t.Context())
 	require.NoError(t, err)
 	assert.Contains(t, desired, "team-a", "a FissionTenant is watched even before resolver-sync catches up")
 	assert.NotContains(t, desired, "", "a tenant without a namespace is skipped")
