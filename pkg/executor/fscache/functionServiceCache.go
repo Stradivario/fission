@@ -360,6 +360,38 @@ func (fsc *FunctionServiceCache) _touchByAddress(address string) error {
 // through the index (GetLiveByFunctionUID/ListByFunctionUID/ListOld) — a
 // bare-UID delete destroyed the survivors' only index entry, so e.g. a
 // still-live minScale-0 Deployment was never idle-reaped again.
+// Rekey moves fsvc's entry to the (UID, Generation) of fn: for executors whose
+// live objects are updated in place (newdeploy, container) the entry describes
+// the new spec once the update has landed. Left under the old Generation, it
+// would also answer an RFC-0025 versioned projection pinning that Generation —
+// serving the live (updated) code for an alias/version route, and preventing
+// the projection's own -v<seq> objects from ever being created.
+func (fsc *FunctionServiceCache) Rekey(fsvc *FuncSvc, fn *metav1.ObjectMeta) error {
+	if crd.CacheKeyUGFromMeta(fsvc.Function) == crd.CacheKeyUGFromMeta(fn) {
+		return nil
+	}
+	fsc.DeleteEntry(fsvc)
+	moved := *fsvc
+	moved.Function = fn.DeepCopy()
+	_, err := fsc.Add(moved)
+	return err
+}
+
+// GetByFunctionVersion is GetByFunction for executors whose live objects are
+// updated in place (newdeploy, container): an entry only answers a lookup for
+// the same RFC-0025 version — the live function ("") or one published
+// FunctionVersion — even when (UID, Generation) match.
+func (fsc *FunctionServiceCache) GetByFunctionVersion(m *metav1.ObjectMeta) (*FuncSvc, error) {
+	fsvc, err := fsc.GetByFunction(m)
+	if err != nil {
+		return nil, err
+	}
+	if fsvc.Function.Labels[fv1.FUNCTION_VERSION] != m.Labels[fv1.FUNCTION_VERSION] {
+		return nil, ferror.MakeError(ferror.ErrorNotFound, "cached function service belongs to a different function version")
+	}
+	return fsvc, nil
+}
+
 func (fsc *FunctionServiceCache) DeleteEntry(fsvc *FuncSvc) {
 	fsc.byFunction.Delete(crd.CacheKeyUGFromMeta(fsvc.Function))
 	fsc.byAddress.Delete(fsvc.Address)

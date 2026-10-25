@@ -161,7 +161,9 @@ func (caaf *Container) GetFuncSvc(ctx context.Context, fn *fv1.Function) (*fscac
 // container (IsValid only checks the backing objects exist).
 func (caaf *Container) GetFuncSvcFromCache(ctx context.Context, fn *fv1.Function) (*fscache.FuncSvc, error) {
 	otelUtils.SpanTrackEvent(ctx, "GetFuncSvcFromCache", otelUtils.GetAttributesForFunction(fn)...)
-	return caaf.fsCache.GetByFunction(&fn.ObjectMeta)
+	// Version-matched: the live Deployment is updated in place, so the live
+	// entry must never answer a versioned projection (nor the reverse).
+	return caaf.fsCache.GetByFunctionVersion(&fn.ObjectMeta)
 }
 
 // DeleteFuncSvcFromCache deletes a function service from cache.
@@ -682,6 +684,11 @@ func (caaf *Container) updateFuncDeployment(ctx context.Context, fn *fv1.Functio
 	if err != nil {
 		caaf.updateStatus(fn, err, "failed to update deployment while updating function")
 		return err
+	}
+	// The live Deployment now runs fn's new spec: move its cache entry to the
+	// new Generation (see newdeploy's updateFuncDeployment).
+	if rerr := caaf.fsCache.Rekey(fsvc, &fn.ObjectMeta); rerr != nil {
+		caaf.logger.Error(rerr, "failed to re-key the function's cache entry after update", "function", fn.Name)
 	}
 
 	return nil

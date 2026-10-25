@@ -176,7 +176,9 @@ func (deploy *NewDeploy) GetFuncSvc(ctx context.Context, fn *fv1.Function) (*fsc
 // code (IsValid only checks the backing objects exist).
 func (deploy *NewDeploy) GetFuncSvcFromCache(ctx context.Context, fn *fv1.Function) (*fscache.FuncSvc, error) {
 	otelUtils.SpanTrackEvent(ctx, "GetFuncSvcFromCache")
-	return deploy.fsCache.GetByFunction(&fn.ObjectMeta)
+	// Version-matched: the live Deployment is updated in place, so the live
+	// entry must never answer a versioned projection (nor the reverse).
+	return deploy.fsCache.GetByFunctionVersion(&fn.ObjectMeta)
 }
 
 // DeleteFuncSvcFromCache deletes a function service from cache.
@@ -903,6 +905,12 @@ func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Funct
 	if err != nil {
 		deploy.updateStatus(fn, err, "failed to update deployment while updating function")
 		return err
+	}
+	// The live Deployment now runs fn's new spec: move its cache entry to the
+	// new Generation, or a FunctionVersion pinning the old Generation would be
+	// served by this (updated) Deployment instead of its own -v<seq> objects.
+	if rerr := deploy.fsCache.Rekey(fsvc, &fn.ObjectMeta); rerr != nil {
+		deploy.logger.Error(rerr, "failed to re-key the function's cache entry after update", "function", fn.Name)
 	}
 
 	// Unlike fnCreate (which always waits for the Deployment to become
