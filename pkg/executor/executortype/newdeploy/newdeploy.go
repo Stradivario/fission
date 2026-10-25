@@ -370,7 +370,9 @@ func (deploy *NewDeploy) mainContainerName(env *fv1.Environment) (string, error)
 // getResources overrides only the resources which are overridden at function level otherwise
 // default to resources specified at environment level
 func (deploy *NewDeploy) getResources(env *fv1.Environment, fn *fv1.Function) apiv1.ResourceRequirements {
-	resources := env.Spec.Resources
+	// deep copy: env is the shared cached Environment; writing the function's
+	// overrides into its maps raced other functions and leaked between them
+	resources := *env.Spec.Resources.DeepCopy()
 	if resources.Requests == nil {
 		resources.Requests = make(map[apiv1.ResourceName]resource.Quantity)
 	}
