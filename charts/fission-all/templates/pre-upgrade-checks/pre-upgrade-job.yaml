@@ -20,7 +20,7 @@ install that comes up dead, from two values that each look reasonable alone.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ template "fullname" . }}-{{ .Chart.Version }}-{{ randNumeric 3 }}
+  name: {{ printf "%s-%s" (include "fullname" .) .Chart.Version | trunc 59 | trimSuffix "-" }}-{{ randNumeric 3 }}
   labels:
     # The "release" convention makes it easy to tie a release to all of the
     # Kubernetes resources that were created as part of that release.
