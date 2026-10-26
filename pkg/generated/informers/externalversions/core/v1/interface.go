@@ -20,6 +20,10 @@ type Interface interface {
 	FissionTenants() FissionTenantInformer
 	// Functions returns a FunctionInformer.
 	Functions() FunctionInformer
+	// FunctionAliases returns a FunctionAliasInformer.
+	FunctionAliases() FunctionAliasInformer
+	// FunctionVersions returns a FunctionVersionInformer.
+	FunctionVersions() FunctionVersionInformer
 	// HTTPTriggers returns a HTTPTriggerInformer.
 	HTTPTriggers() HTTPTriggerInformer
 	// KubernetesWatchTriggers returns a KubernetesWatchTriggerInformer.
@@ -30,6 +34,10 @@ type Interface interface {
 	Packages() PackageInformer
 	// TimeTriggers returns a TimeTriggerInformer.
 	TimeTriggers() TimeTriggerInformer
+	// Workflows returns a WorkflowInformer.
+	Workflows() WorkflowInformer
+	// WorkflowRuns returns a WorkflowRunInformer.
+	WorkflowRuns() WorkflowRunInformer
 }
 
 type version struct {
@@ -63,6 +71,16 @@ func (v *version) Functions() FunctionInformer {
 	return &functionInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
+// FunctionAliases returns a FunctionAliasInformer.
+func (v *version) FunctionAliases() FunctionAliasInformer {
+	return &functionAliasInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// FunctionVersions returns a FunctionVersionInformer.
+func (v *version) FunctionVersions() FunctionVersionInformer {
+	return &functionVersionInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
 // HTTPTriggers returns a HTTPTriggerInformer.
 func (v *version) HTTPTriggers() HTTPTriggerInformer {
 	return &hTTPTriggerInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
@@ -86,4 +104,14 @@ func (v *version) Packages() PackageInformer {
 // TimeTriggers returns a TimeTriggerInformer.
 func (v *version) TimeTriggers() TimeTriggerInformer {
 	return &timeTriggerInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// Workflows returns a WorkflowInformer.
+func (v *version) Workflows() WorkflowInformer {
+	return &workflowInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// WorkflowRuns returns a WorkflowRunInformer.
+func (v *version) WorkflowRuns() WorkflowRunInformer {
+	return &workflowRunInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

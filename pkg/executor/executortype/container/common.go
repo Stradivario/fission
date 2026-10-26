@@ -17,7 +17,7 @@ import (
 
 // getResources gets the resources(CPU, memory) set for the function
 func (cn *Container) getResources(fn *fv1.Function) apiv1.ResourceRequirements {
-	resources := fn.Spec.Resources
+	resources := *fn.Spec.Resources.DeepCopy() // fn is a cached object; never write into its maps
 	if resources.Requests == nil {
 		resources.Requests = make(map[apiv1.ResourceName]resource.Quantity)
 	}

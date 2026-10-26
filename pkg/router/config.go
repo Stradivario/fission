@@ -13,6 +13,7 @@ import (
 	"github.com/go-logr/logr"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/router/streaming"
 )
 
 // endpointSliceCacheMode selects how the router uses its EndpointSlice-fed
@@ -71,6 +72,15 @@ type routerConfig struct {
 	// DISPLAY_ACCESS_LOG flag (chart: router.displayAccessLog, default false);
 	// off adds no per-request log volume.
 	accessLog bool
+
+	// RFC-0024 async invocation. All lenient/optional: the chart sets these only
+	// when asyncInvocation.enabled, so an unset value must never abort startup.
+	// asyncInvocationEnabled gates the enqueue branch and the dispatcher;
+	// statestoreDriver/DSN open the statestore queue (driver "client" → the
+	// embedded statestore service).
+	asyncInvocationEnabled bool
+	statestoreDriver       string
+	statestoreDSN          string
 }
 
 // loadRouterConfig parses the router's environment configuration. Behavior is
@@ -120,15 +130,11 @@ func loadRouterConfig(logger logr.Logger) (routerConfig, error) {
 	// DefaultStreamIdleSeconds.
 	cfg.streamIdleDefault = time.Duration(fv1.DefaultStreamIdleSeconds) * time.Second
 	if v := os.Getenv("ROUTER_STREAM_IDLE_TIMEOUT"); v != "" {
-		d, perr := time.ParseDuration(v)
+		// Validation shared with the MCP server (streaming.ParseIdleTimeout)
+		// so the same env var can never validate differently per consumer.
+		d, perr := streaming.ParseIdleTimeout("ROUTER_STREAM_IDLE_TIMEOUT", v)
 		if perr != nil {
-			return cfg, fmt.Errorf("failed to parse stream idle timeout value('%s') from 'ROUTER_STREAM_IDLE_TIMEOUT': %w", v, perr)
-		}
-		// A non-positive idle window would silently disable the streaming idle
-		// watchdog (streams with no max-duration ceiling could then hang forever).
-		// Reject it at startup rather than failing open.
-		if d <= 0 {
-			return cfg, fmt.Errorf("'ROUTER_STREAM_IDLE_TIMEOUT' must be a positive duration, got %q", v)
+			return cfg, perr
 		}
 		cfg.streamIdleDefault = d
 	}
@@ -227,6 +233,20 @@ func loadRouterConfig(logger logr.Logger) (routerConfig, error) {
 			cfg.accessLog = access
 		}
 	}
+
+	// RFC-0024 async invocation. Optional and lenient: an unset/blank env means
+	// disabled and must never abort startup (the chart sets these only when the
+	// feature is on). An unparsable ASYNC_INVOCATION_ENABLED logs and stays off.
+	if raw := os.Getenv("ASYNC_INVOCATION_ENABLED"); raw != "" {
+		enabled, perr := strconv.ParseBool(raw)
+		if perr != nil {
+			logger.Error(perr, "failed to parse 'ASYNC_INVOCATION_ENABLED' - async invocation stays disabled", "value", raw)
+		} else {
+			cfg.asyncInvocationEnabled = enabled
+		}
+	}
+	cfg.statestoreDriver = os.Getenv("STATESTORE_DRIVER")
+	cfg.statestoreDSN = os.Getenv("STATESTORE_DSN")
 
 	switch mode := endpointSliceCacheMode(os.Getenv("ROUTER_ENDPOINTSLICE_CACHE_MODE")); mode {
 	case "", endpointSliceCacheOff:

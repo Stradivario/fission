@@ -11,6 +11,7 @@ cmd/reporter/reporter
 test/logs/
 test/e2e/cli/fission-dump/
 test/integration/logs/
+test/integration/suites/*/test/
 
 # Pycharm IDE
 .idea
@@ -50,6 +51,34 @@ output.sarif
 *.sarif
 /fission-bundle
 
+# Stray binaries from `go build ./cmd/<name>` with no -o: Go writes the binary
+# into the working directory, which is the repo root. Each is ~90MB.
+/preupgradechecks
+/fetcher
+/builder
+/reporter
+
 # Stray archive-download artifacts from e2e CLI test runs (UUID-named files
 # written to the test's working directory by `fission archive download`).
 test/e2e/cli/????????-????-????-????-????????????
+# Added by code-review-graph
+.code-review-graph/
+notes
+# Anchored to the repo root. Unanchored, this pattern matched EVERY directory
+# named "examples" at any depth, which silently swallowed committed example
+# trees — RFC-0029's examples/gitops/ and docs/examples/ among them.
+/examples
+.nvim.json
+.github/code-review-graph.instruction.md
+.claude/skills
+.claude/settings.json
+.mcp.json
+.envrc
+common.log
+kind-132.yaml
+
+# Maven build output from the JVM testdata trees. `ZipTestDataTree` ships the
+# whole source tree to the builder, which runs mvn itself — a locally-built
+# target/ is both redundant and easy to commit by accident.
+test/integration/testdata/**/target/
+dist-local

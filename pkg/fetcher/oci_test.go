@@ -28,7 +28,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
@@ -85,7 +84,7 @@ func newOCITestFetcher(t *testing.T) *Fetcher {
 
 func ociPackage(image, digest string) *fv1.Package {
 	return &fv1.Package{
-		ObjectMeta: metav1.ObjectMeta{Name: "oci-pkg", Namespace: "fn-ns"},
+		Name: "oci-pkg", Namespace: "fn-ns",
 		Spec: fv1.PackageSpec{
 			Deployment: fv1.Archive{
 				Type: fv1.ArchiveTypeOCI,
@@ -94,6 +93,17 @@ func ociPackage(image, digest string) *fv1.Package {
 		},
 		Status: fv1.PackageStatus{BuildStatus: fv1.BuildStatusNone},
 	}
+}
+
+// TestKeychainServiceAccount pins the RFC-0031 identity fix: the keychain
+// resolves the pod's ACTUAL SA (downward API), falling back to the static
+// fetcher SA only for pods created before POD_SERVICE_ACCOUNT existed.
+func TestKeychainServiceAccount(t *testing.T) {
+	t.Parallel()
+	f := newOCITestFetcher(t)
+	assert.Equal(t, fv1.FissionFetcherSA, f.keychainServiceAccount(), "empty pod SA falls back (upgrade skew)")
+	f.podServiceAccount = "fission-builder"
+	assert.Equal(t, "fission-builder", f.keychainServiceAccount(), "builder pods must resolve the builder SA")
 }
 
 func TestFetchOCIDeployment(t *testing.T) {

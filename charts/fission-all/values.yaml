@@ -11,25 +11,36 @@ serviceType: ClusterIP
 ##
 routerServiceType: LoadBalancer
 
+## clusterDomain is the cluster's DNS suffix, used to build ABSOLUTE
+## (trailing-dot) in-cluster Service names on the request hot paths — the
+## router's executor URL and the executor/buildermgr-built function and
+## builder service addresses. Absolute names skip the pod resolv.conf
+## search-path walk (ndots:5), cutting per-resolution DNS queries ~4x;
+## the short forms' extra queries are what drop under parallel load
+## ("lookup <svc>.<ns>: i/o timeout" cascades). Change only if your
+## cluster uses a non-default DNS domain.
+##
+clusterDomain: cluster.local
+
 ## repository represents base repository for images used in the chart.
 ## Keep it empty for using existing local image
 ##
-repository: ghcr.io
+repository: ghcr.io/stradivario
 
 ## image represents the base image fission-bundle used by multiple Fission components.
 ## We alter arguments to the image to run a particular component.
 ##
-image: fission/fission-bundle
+image: fission-bundle
 
 ## imageTag represents the tag of the base image fission-bundle used by multiple Fission components.
 ## It is also used by the chart to identify version of the few more images apart from fission-bundle.
 ## Keep it empty for using latest tag.
 ##
-imageTag: v1.27.0
+imageTag: v1.26.0-watch-all-namespaces
 
 ## pullPolicy represents the pull policy to use for images in the chart.
 ##
-pullPolicy: IfNotPresent
+pullPolicy: Always
 
 ## imagepullsecrets
 imagePullSecrets: []
@@ -178,11 +189,11 @@ fetcher:
   ## repository represents the repository of the fetcher component.
   ##
   ## By default, it is empty, which means global repository will be used.
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## image represents the image of the fetcher component.
-  image: fission/fetcher
+  image: fetcher
   ## imageTag represents the tag of the image of the fetcher component.
-  imageTag: v1.27.0
+  imageTag: v1.26.0-watch-all-namespaces
   ## allowInsecureRegistries is a comma-separated list of registry hosts
   ## (host[:port]) permitted to serve OCI package images over plain HTTP.
   ## Default empty: registries must serve TLS (localhost and private RFC-1918
@@ -221,16 +232,41 @@ executor:
   ##
   leaderElection:
     enabled: false
-  ## strategy is the Deployment rollout strategy for the executor. Leave unset
-  ## for the Kubernetes default. With leaderElection enabled, a surge strategy
-  ## keeps a standby warm across upgrades, e.g.:
-  ##   strategy:
-  ##     type: RollingUpdate
-  ##     rollingUpdate:
-  ##       maxSurge: 1
-  ##       maxUnavailable: 0
+  ## strategy is the Deployment rollout strategy for the executor.
   ##
-  strategy: {}
+  ## maxSurge 0 / maxUnavailable 1 makes every roll OVERLAP-FREE: the old pod
+  ## terminates before its replacement is created, at any replica count. That
+  ## matters because the executor is a single-writer control plane keyed on
+  ## its instance ID: under the k8s default (which surges at replicas=1) two
+  ## executors with DIFFERENT instance IDs run concurrently during every
+  ## roll, with no leader election to arbitrate — the outgoing one keeps
+  ## re-stamping objects with its own ID while the incoming one's
+  ## adopt+cleanup pass runs, so the incoming reaper deletes the very objects
+  ## adoption exists to keep.
+  ##
+  ## Expressed WITHIN RollingUpdate rather than as `type: Recreate`
+  ## deliberately, and not only for equivalence at replicas=1: a live
+  ## Deployment whose strategy was ever defaulted carries a rollingUpdate
+  ## block, and the API forbids that block alongside type Recreate — so a
+  ## helm upgrade flipping the type fails validation against every existing
+  ## install ("spec.strategy.rollingUpdate: Forbidden"). Mutating two fields
+  ## inside the type the object already has upgrades cleanly.
+  ##
+  ## The cost is a bounded executor-down window per roll (≲60s). Warm traffic
+  ## keeps serving throughout — neither poolmgr nor newdeploy needs a live
+  ## executor; only cold starts wait for the new one.
+  ##
+  ## This default also composes with HA (replicas > 1 + leaderElection):
+  ## pods roll one at a time and a dying leader releases its lease to a
+  ## standby. Never set maxUnavailable: 0 with leaderElection — /readyz
+  ## answers 503 on non-leaders, so a surged pod can never become Ready
+  ## while the old one holds the lease, and the rollout deadlocks.
+  ##
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   ## terminationGracePeriodSeconds gives in-flight work time to drain on
   ## shutdown. Leave unset for the Kubernetes default (30s). Keep it at or
   ## above GRACEFUL_SHUTDOWN_TIMEOUT.
@@ -254,9 +290,19 @@ executor:
   ## terminationMessagePolicy is the policy for the executor termination message.
   ##
   terminationMessagePolicy: ""
-  ## adoptExistingResources decides whether to adopt existing resources when executor restarts or Fission is redeployed.
+  ## adoptExistingResources decides whether to adopt existing resources when
+  ## the executor restarts or Fission is upgraded.
   ##
-  adoptExistingResources: false
+  ## Enabled by default: on restart the executor re-stamps the previous
+  ## instance's objects (specialized warm pods, function Deployments and
+  ## Services — same UID, in place) instead of deleting and recreating them.
+  ## This is half of what lets warm pods survive a `helm upgrade`; the other
+  ## half is the pool-roll discriminator keyed on the environment generation.
+  ## With adoption off, the startup cleanup deletes every pod whose
+  ## executorInstanceId annotation belongs to the previous instance — which
+  ## is exactly the specialized pods, and only them.
+  ##
+  adoptExistingResources: true
   ## Mount OCI packages directly into function pods (needs Kubernetes 1.33+;
   ## older clusters automatically fall back to downloading the package).
   ## Gives noticeably faster cold starts. Set false to always download.
@@ -287,6 +333,27 @@ executor:
   ## nodes, and size it generously.
   ##
   specializationConcurrency: 0
+  ## provisionedConcurrency configures the RFC-0026 provisioned-concurrency
+  ## warmer in the poolmgr executor. When enabled, the executor runs a
+  ## periodic loop that keeps N warm specialized pods for each Function that
+  ## sets spec.provisionedConcurrency.target (CLI: --provisioned-concurrency).
+  ## Off by default in PR 1; opt-in per cluster. poolmgr-only.
+  ##
+  provisionedConcurrency:
+    enabled: false
+    ## maxPerFunction is the namespace-wide cap on
+    ## spec.provisionedConcurrency.target (defense-in-depth on top of the
+    ## webhook/CEL bound). Default 20.
+    maxPerFunction: 20
+    ## maxInflightPerFunction bounds concurrent eager specializations per
+    ## function so a warm-up burst cannot saturate the shared
+    ## EXECUTOR_SPECIALIZATION_CONCURRENCY and starve on-demand cold starts
+    ## for other functions (RFC-0026 invariant P5). Default 4.
+    maxInflightPerFunction: 4
+    ## reconcileInterval is how often the warmer scans opted-in functions
+    ## and reconciles their warm-pod count toward the effective target.
+    ## Default 30s.
+    reconcileInterval: "30s"
   ## maxPendingSpecializations bounds specializations IN FLIGHT per function on
   ## the router's ensureCapacity path (EXECUTOR_MAX_PENDING_SPECIALIZATIONS_PER_FUNCTION).
   ## Unlike the function Concurrency cap (a total-pods budget, default 500), this
@@ -365,6 +432,25 @@ router:
   ## port 80). Mirrored by pkg/svcinfo.PortRouter.
   port: 8888
   internalPort: 8889
+  ## enforceSameNamespaceInvocation (opt-in) rejects (403) a
+  ## /fission-function/<ns>/<name> request on the internal listener unless the
+  ## caller's pod is in the target function's namespace, is an internal Fission
+  ## component (a pod in the install namespace), or is in allowedNamespaces
+  ## below. Closes the cross-namespace invocation gap left when internalAuth is
+  ## disabled: NetworkPolicy/HMAC gate WHO reaches router-internal, not WHICH
+  ## namespace they can target. See docs/features/internal-invocation-isolation.md.
+  ## This fork defaults it ON (upstream has no equivalent) — lambforge.com runs
+  ## Fission as a shared control plane for mutually-untrusting tenant projects
+  ## (typically alongside tenancy.mode=dynamic).
+  ##
+  enforceSameNamespaceInvocation: true
+  ## allowedNamespaces lists extra namespaces whose pods may invoke
+  ## /fission-function/<ns>/<name> on the internal listener regardless of the
+  ## target namespace. Useful for cross-namespace monitoring or webhook callers
+  ## (e.g. a Prometheus stack deployed in "monitoring"). The router passes this
+  ## list as the ROUTER_ALLOWED_NAMESPACES env var (comma-separated).
+  ##
+  allowedNamespaces: []
   ## strategy is the Deployment rollout strategy for the router (ignored when
   ## deployAsDaemonSet is true). Leave unset for the Kubernetes default. The
   ## router is stateless, so a surge strategy gives zero-downtime rollouts:
@@ -374,17 +460,58 @@ router:
   ##       maxSurge: 1
   ##       maxUnavailable: 0
   ##
-  strategy: {}
+  ## Surge-then-drain by default: a new pod becomes Ready (which gates on the
+  ## mux build and the endpoint index) before an old one is taken down, so a
+  ## rollout never dips below the current replica count. Explicit rather than
+  ## relying on the Kubernetes 25% defaults, which allow maxUnavailable > 0
+  ## once the router is scaled past 3 replicas — exactly when a dip hurts most.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   ## terminationGracePeriodSeconds gives in-flight requests time to drain on
-  ## shutdown. Leave unset for the Kubernetes default (30s). Keep it at or
-  ## above GRACEFUL_SHUTDOWN_TIMEOUT.
+  ## shutdown. Keep it at or above gracefulShutdownTimeout.
   ##
-  terminationGracePeriodSeconds: null
-  ## podDisruptionBudget (opt-in) protects router availability during voluntary
-  ## disruptions. Only meaningful with replicas > 1 (not a DaemonSet).
+  ## 90s rather than the Kubernetes default of 30, sized above
+  ## gracefulShutdownTimeout below, which is in turn sized above the default
+  ## 60s function timeout: a drain shorter than the longest in-flight request
+  ## turns every rollout into truncated responses for the slowest requests.
+  ##
+  terminationGracePeriodSeconds: 90
+  ## gracefulShutdownTimeout bounds how long the router keeps serving in-flight
+  ## requests after SIGTERM before force-closing them (GRACEFUL_SHUTDOWN_TIMEOUT).
+  ## Raising terminationGracePeriodSeconds alone does nothing: the code caps the
+  ## drain at 30s unless this is set, so the extra grace would be spent idle
+  ## while a 60s invocation is cut off at 30.
+  ##
+  ## Keep terminationGracePeriodSeconds > gracefulShutdownTimeout > the longest
+  ## expected function timeout.
+  ##
+  gracefulShutdownTimeout: 75s
+  ## preStopSleep delays the drain so the pod's removal from the Service
+  ## EndpointSlice propagates to every kube-proxy BEFORE the listener closes.
+  ## Without it a terminating router still receives connections it can no
+  ## longer accept, which surfaces as connection-refused — a platform-attributed
+  ## failure with no response and no attribution header (RFC-0028 §1). Set to
+  ## 0 to disable.
+  ##
+  preStopSleep: 5
+  ## podDisruptionBudget protects router availability during voluntary
+  ## disruptions (node drains, cluster upgrades).
+  ##
+  ## Enabled by default, but the template renders it only when the router can
+  ## actually satisfy it: replicas >= 2, OR an autoscaler is enabled. A
+  ## minAvailable: 1 PDB on a genuinely single-replica Deployment blocks node
+  ## drains forever — so setting replicas: 1 silently and correctly drops the
+  ## PDB rather than deadlocking the cluster. An HPA/KEDA-scaled router keeps
+  ## replicas: 1 in its spec while running more, so an autoscaler counts as
+  ## evidence too — but only when its OWN floor (minReplicas) is >= 2, since
+  ## an autoscaler idling at minReplicas: 1 is still a single-replica
+  ## Deployment and would deadlock exactly the same way.
   ##
   podDisruptionBudget:
-    enabled: false
+    enabled: true
     minAvailable: 1
     # maxUnavailable:
   ## autoscaling (opt-in) deploys a HorizontalPodAutoscaler for the router. The
@@ -396,6 +523,23 @@ router:
     minReplicas: 1
     maxReplicas: 3
     targetCPUUtilizationPercentage: 80
+  ## keda (opt-in) scales the router on the RFC-0024 async-invocation backlog via a
+  ## KEDA ScaledObject using the postgresql scaler on the statestore queue depth.
+  ## Requires KEDA installed, asyncInvocation.enabled, and statestore.mode=external
+  ## (the postgresql scaler cannot reach an embedded SQLite store). It is mutually
+  ## exclusive with router.autoscaling (KEDA manages its own HPA on the router).
+  ## The Prometheus-scaler variant (mode-agnostic, needs an external Prometheus +
+  ## the router ServiceMonitor) is a documented follow-up.
+  ##
+  keda:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    ## Desired visible async backlog per router replica; replicas scale toward
+    ## ceil(backlog / targetBacklogPerReplica).
+    targetBacklogPerReplica: 50
+    pollingInterval: 15
+    cooldownPeriod: 120
   ## router priorityClassName
   ## Ref. https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/
   ## Recommended to use system-cluster-critical for router pods.
@@ -412,7 +556,13 @@ router:
   deployAsDaemonSet: false
   ## replicas decides how many router pods to deploy. Only used when deployAsDaemonSet is false.
   ##
-  replicas: 1
+  ## Two by default (RFC-0028): the router is the data plane, and a single
+  ## replica means every rollout, node drain or eviction is a traffic outage.
+  ## Small-footprint installs (kind, single-node) can set 1 and get exactly the
+  ## previous behaviour, including no PodDisruptionBudget — the PDB renders
+  ## only when it is safe (see podDisruptionBudget below).
+  ##
+  replicas: 2
   ## svcAddressMaxRetries is the max times for router to retry with a specific function service address
   ##
   svcAddressMaxRetries: 5
@@ -472,7 +622,7 @@ router:
     ## However, the drawback is it takes longer to switch to newly created function pods
     ## if using newdeploy as executor type for function. If you want to preserve the
     ## performance while keeping the short switching time to new function, you can create
-    ## an environment with short grace period by setting flag "--graceperiod" (default 360s),
+    ## an environment with short grace period by setting flag "--graceperiod" (default 90s),
     ## so that kubernetes will be able to reap old function pod quickly.
     ##
     ## For details, see https://github.com/fission/fission/issues/723
@@ -585,6 +735,40 @@ buildermgr:
 ## It contains validation and mutation for functions, triggers, environments, Kubernetes event watches, etc.
 ##
 webhook:
+  ## replicas decides how many webhook pods to deploy.
+  ##
+  ## The webhook is fail-closed (failurePolicy: Fail on every configuration),
+  ## so while it has zero Ready endpoints EVERY Fission CR write errors. Two
+  ## replicas by default (RFC-0028) so a rollout or an eviction is not a
+  ## write outage.
+  ##
+  ## NOTE: replicas alone does not make upgrades seamless on the default cert
+  ## path — the serving cert is still minted per render, so the caBundle can
+  ## race the still-serving old cert. cert-manager (webhook.certManager.enabled)
+  ## is the supported path for that; see RFC-0028 §2.
+  ##
+  replicas: 2
+
+  ## podDisruptionBudget protects webhook availability during voluntary
+  ## disruptions. Same render guard as the router's: it is emitted only when
+  ## replicas >= 2, because a minAvailable: 1 budget on a single-replica
+  ## Deployment blocks node drains forever.
+  ##
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+    # maxUnavailable:
+
+  ## strategy is the Deployment rollout strategy for the webhook. Surge-first,
+  ## so a new pod is Ready before an old one goes away — with a fail-closed
+  ## webhook, a gap is a cluster-wide CR-write outage.
+  ##
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
   ## Pod resources as:
   ##  resources:
   ##    limits:
@@ -706,6 +890,94 @@ mcp:
     runAsUser: 10001
     runAsGroup: 10001
 
+## Statestore — the durable-state substrate (RFC-0021) consumed by workflows
+## (RFC-0022), stateful functions (RFC-0023), and async invocation (RFC-0024).
+##
+## Fission never deploys a database product. In "external" mode the chart only
+## wires a user-managed Postgres DSN into a Secret; in "embedded" mode it runs a
+## single-replica, PVC-backed SQLite store (Fission's own binary) for local/small
+## deployments — explicitly single-writer and NOT HA.
+## functionState (RFC-0023) deploys statesvc, the function-facing keyed-state
+## API: functions opted in via FunctionSpec.state get a scoped keyspace over
+## the statestore, with per-function tokens injected at specialization time.
+## Requires statestore.enabled (render-validated).
+##
+functionState:
+  enabled: false
+  ## Port statesvc listens on (ClusterIP Service of the same port).
+  ##
+  port: 8893
+  ## replicas to deploy. statesvc is stateless (every replica indexes Function
+  ## StateConfigs itself, no leader election); the keyspace-purge finalizer is
+  ## idempotent, so replicas > 1 is safe for availability.
+  ##
+  replicas: 1
+  ## Pod resources.
+  ##
+  resources: {}
+
+statestore:
+  ## Off by default. A statestore-dependent feature that is enabled without this
+  ## fails the chart render.
+  enabled: false
+  ## "external" | "embedded" — required when enabled.
+  mode: ""
+  ## Capability API port (mirrors pkg/svcinfo.PortStatestore).
+  port: 8891
+  external:
+    ## Externally deployed Postgres DSN (recommended for production). Stored into
+    ## a Secret named statestore-postgres (key: dsn).
+    dsn: ""
+    ## Or reference a pre-created Secret instead of dsn.
+    existingSecret: ""
+  embedded:
+    ## PVC size for the embedded SQLite file.
+    storageSize: 1Gi
+    ## StorageClass for the PVC ("" uses the cluster default).
+    storageClassName: ""
+    resources: {}
+    securityContext:
+      enabled: true
+      runAsNonRoot: true
+      fsGroup: 10001
+      runAsUser: 10001
+      runAsGroup: 10001
+
+## RFC-0024 asynchronous invocation (X-Fission-Invoke-Mode: async): the router
+## durably enqueues the request and a per-replica dispatcher delivers it
+## at-least-once with retries and a dead-letter queue. Requires statestore.enabled
+## (the render gate in statestore/validate.yaml enforces it). Off by default.
+asyncInvocation:
+  enabled: false
+
+## RFC-0022 durable workflows: the Workflow/WorkflowRun engine head. Executes
+## declarative state machines over existing functions with durable,
+## resumable runs (statestore EventLog per run). Requires statestore.enabled
+## (the render gate in statestore/validate.yaml enforces it). Off by default.
+workflows:
+  enabled: false
+  ## Single replica in v1: correctness never depends on it (CAS-append is
+  ## the arbiter); one replica avoids wasted duplicate invocations.
+  replicas: 1
+  port: 8892
+  resources: {}
+  securityContext:
+    enabled: false
+
+## RFC-0027 statestore-backed eventing: the built-in MessageQueue provider
+## (messageQueueType: statestore) — topics on the statestore EventLog, consumed
+## by the mqtrigger-statestore head with zero external brokers. Effective only
+## when statestore.enabled (the deployment gates on both); enabled by default so
+## a statestore-enabled install gets the full eventing loop out of the box.
+eventing:
+  enabled: true
+  ## replicas > 1 REQUIRES leaderElection.enabled: true — without election every
+  ## replica is a live consumer of every trigger (permanent duplicate delivery
+  ## and cursor churn, not HA).
+  replicas: 1
+  leaderElection:
+    enabled: false
+
 ## Multi-namespace tenancy (docs/multiple-namespace).
 ##
 tenancy:
@@ -733,7 +1005,17 @@ tenancy:
   ##           single-tenant/trusted clusters.
   ## dynamic and cluster set FISSION_TENANCY_MODE on the data-plane components and
   ## render the tenant controller; static renders neither.
-  mode: static
+  ##
+  ## This fork defaults to "dynamic": lambforge.com runs Fission as a shared,
+  ## multi-tenant control plane where tenant namespaces must NOT be able to read
+  ## each other's Secrets/ConfigMaps, which is exactly the posture "dynamic"
+  ## provides (and "cluster" explicitly does not — see its warning above). This
+  ## replaces the fork's old custom watch-all-namespaces mechanism; unlike that
+  ## mechanism, onboarding is explicit (fission.io/enabled=true label or
+  ## `fission tenant enable <ns>`), not automatic for every namespace in the
+  ## cluster. See docs/features/watch-all-namespaces.md for the migration note
+  ## (existing tenant namespaces need a one-time backfill before cutover).
+  mode: dynamic
 
 ## The tenant controller is the multi-namespace tenancy lifecycle controller
 ## (docs/multiple-namespace). It is rendered automatically when tenancy.mode is
@@ -789,6 +1071,11 @@ storagesvc:
     enabled: true
     ## Run prune routine at interval (in minutes)
     interval: 60
+    ## Safety cap: refuse to delete more than this many archives in a single
+    ## sweep (a sweep that wants to delete far more than this is a signal
+    ## the reference list is wrong, not that this many archives are
+    ## genuinely orphaned at once — see pkg/storagesvc/archivePruner.go).
+    maxOrphansPerCycle: 20
 
   ## maxArchiveSizeMib caps the size (in MiB) of a single package archive
   ## uploaded to /v1/archive. With internalAuth enabled, the HMAC verifier
@@ -1020,17 +1307,17 @@ preUpgradeChecks:
   ## Repository for pre-install/pre-upgrade checks image
   ## By default it uses the global repository
   ##
-  repository: ""
+  repository: "ghcr.io/stradivario"
   ## pre-install/pre-upgrade checks live in this image
   ##
-  image: fission/pre-upgrade-checks
+  image: pre-upgrade-checks
   ## pre-install/pre-upgrade checks image version
   ##
-  imageTag: v1.27.0
+  imageTag: v1.26.0-watch-all-namespaces
 
 ## Fission post-install/post-upgrade reporting live in this image
 ##
-postInstallReportImage: fission/reporter
+postInstallReportImage: reporter
 
 ## If there are any pod specialization errors when a function is triggered, the error
 ## summary is returned as part of http response if this is set to true.
@@ -1083,6 +1370,33 @@ canaryDeployment:
     runAsUser: 10001
     runAsGroup: 10001
 
+## crds controls how Fission's CustomResourceDefinitions are delivered
+## (RFC-0029). Single-writer by design: exactly one mechanism ever writes the
+## CRD objects.
+##
+crds:
+  ## mode selects the delivery mechanism:
+  ##   hook (default) - the pre-install/pre-upgrade checks Job server-side-applies
+  ##                    the CRD bundle embedded in its image, before the release
+  ##                    manifests roll. Makes `helm install` one-shot on a fresh
+  ##                    cluster and keeps CRDs upgraded with the chart. Requires
+  ##                    preUpgradeChecks.enabled and grants that hook's
+  ##                    ServiceAccount CRD write, fenced by name for update/patch
+  ##                    and by a ValidatingAdmissionPolicy for create.
+  ##   none           - bring your own (kubectl create -k crds/v1 / make create-crds);
+  ##                    the hook only checks that the CRDs are present. Use this if
+  ##                    your organization will not grant CRD write to a chart.
+  ##
+  mode: hook
+  ## forceConflicts adopts CRDs applied by the documented kubectl flow, whose
+  ## managedFields are owned by kubectl-create: without it the first
+  ## server-side apply conflicts on exactly the fields a schema-changing
+  ## upgrade must change. Set false to make such a conflict fail the upgrade
+  ## instead — which preserves hand-edits to a Fission CRD (added printer
+  ## columns, relaxed validation) at the cost of stopping until reconciled.
+  ##
+  forceConflicts: true
+
 ## Enable authentication for fission function invocation via Fission router
 ##
 authentication:
@@ -1104,6 +1418,14 @@ authentication:
   ## signing the JWT token
   ##
   jwtSigningKey:
+  ## existingSecret names a pre-created Secret in the release namespace
+  ## carrying the keys username, password and jwtSigningKey. When set, the
+  ## chart does not generate the "router" Secret and the router and MCP
+  ## deployments read from the named Secret instead. Recommended for GitOps
+  ## renderers (e.g. Argo CD), which run `helm template` where the chart's
+  ## lookup-based preservation of generated values cannot work.
+  ##
+  existingSecret:
   ## jwtExpiryTime is the JWT expiry time
   ## in seconds
   ## default '120'
@@ -1113,6 +1435,81 @@ authentication:
   ## default 'fission'
   ##
   jwtIssuer: fission
+
+
+## nameFormat selects how generated resource names are built (RFC-0029 §2).
+##
+##   standard (default) — release-qualified names with room to stay distinct.
+##   legacy             — the pre-1.(N+1) names, kept as an escape hatch if you
+##                        need an upgrade to change nothing at all.
+##
+## standard keeps 43 characters, leaving room for the suffixes the chart
+## appends inside the 63-char Job-name limit. The legacy form truncated to 24,
+## so any two release names sharing a 24-character prefix collided and the
+## second install silently reused the first's object names.
+##
+## The flip is low-impact because `fullname` has exactly four consumers and all
+## are hook Jobs — no Deployment, Service, Secret or RBAC name derives from it.
+## Two already carry a random suffix, and the analytics Jobs delete themselves
+## on success. A hook Job that FAILED and was never cleaned up will linger under
+## its old name; it is inert, but delete it by hand if you see one.
+##
+nameFormat: standard
+
+## Annotations and labels to stamp onto the ServiceAccounts this chart creates.
+##
+## The motivating case is cloud workload identity — EKS IRSA, GKE Workload
+## Identity, Azure Workload Identity — where a component assumes a cloud role by
+## carrying an annotation on its ServiceAccount. storagesvc talking to S3 with an
+## IAM role instead of a static access key is the common one.
+##
+## `annotations` and `labels` at this level apply to EVERY account; a key under a
+## component name applies to that account alone and overrides the chart-wide
+## value key by key. Components are keyed by ACCOUNT, not by deployment: two of
+## them (fetcher, builder) live in the function and builder namespaces rather
+## than the release namespace, and neither has a component block elsewhere in
+## this file.
+##
+## A role ARN is scoped to one component's permissions, so it belongs under that
+## component, never at the chart-wide level:
+##
+##   serviceAccounts:
+##     labels:
+##       my-org/owner: platform-team
+##     storagesvc:
+##       annotations:
+##         eks.amazonaws.com/role-arn: arn:aws:iam::012345678901:role/fission-storagesvc
+##     kafka:
+##       annotations:
+##         eks.amazonaws.com/role-arn: arn:aws:iam::012345678901:role/fission-kafka
+##
+serviceAccounts:
+  ## Applied to every Fission ServiceAccount.
+  annotations: {}
+  labels: {}
+
+  ## Per-account overrides. Every account this chart can create is listed, so
+  ## the set is discoverable without reading the templates; an account only
+  ## renders when its component is enabled.
+  builder: {}
+  buildermgr: {}
+  canaryconfig: {}
+  executor: {}
+  fetcher: {}
+  kafka: {}
+  kubewatcher: {}
+  mcp: {}
+  mqtKeda: {}
+  preupgrade: {}
+  router: {}
+  statestore: {}
+  statestoreMqt: {}
+  statesvc: {}
+  storagesvc: {}
+  tenantController: {}
+  timer: {}
+  webhook: {}
+  workflow: {}
 
 ## OpenTelemetry is a set of tools for collecting, analyzing, and visualizing
 ## distributed tracing data across function calls.
@@ -1317,9 +1714,93 @@ grafana:
 ## that don't already restrict pod-to-pod traffic.
 ##
 ## Requires a NetworkPolicy-aware CNI (Calico, Cilium, Weave, etc.).
-## Egress rules are intentionally not added in this round.
+## Egress rules are intentionally not added here — see the separate
+## `environmentNetworkPolicy` knob below for environment-pod egress.
 networkPolicy:
   enabled: false
+
+
+## environmentNetworkPolicy: egress isolation for environment/function pods.
+## When enabled, the chart renders one Egress-only NetworkPolicy per function
+## namespace, each selecting every pod in that namespace that carries the
+## `environmentName` label — poolmgr generic and specialized pods, and
+## newdeploy pods (see pkg/apis/core/v1/const.go ENVIRONMENT_NAME and
+## pkg/executor/executortype/{poolmgr/gp_pod.go, newdeploy/newdeploymgr.go}).
+## Container-executortype pods don't carry this label and are unaffected by
+## this knob.
+##
+## Namespace coverage: functionNamespace (or defaultNamespace when unset)
+## plus every additionalFissionNamespaces entry — the STATIC-tenancy
+## function-namespace set, mirrored from pkg/utils
+## NamespaceResolver.FunctionNamespaces. Under tenancy.mode: dynamic or
+## cluster, namespaces the tenant controller onboards at runtime are NOT in
+## that list and so are unknown at chart render time — this knob does not
+## enforce egress isolation for function pods in those namespaces. There is
+## no chart-level fix for that gap; a dynamic/cluster-tenancy install needs
+## an out-of-band mechanism (e.g. a controller that stamps the same policy
+## into each onboarded namespace) to get equivalent coverage.
+##
+## Default posture mirrors the kubernetes-sigs/agent-sandbox managed
+## NetworkPolicy default: allow general
+## internet egress, deny RFC1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16),
+## RFC6598/CGNAT (100.64.0.0/10) and link-local (169.254.0.0/16 — which also
+## covers the 169.254.169.254 cloud metadata endpoint) destinations.
+##
+## CGNAT (100.64.0.0/10): included in the deny-list alongside RFC1918
+## because EKS clusters running VPC CNI custom networking use this range for
+## pod and/or Service CIDRs — without it, the deny-in-cluster posture
+## silently fails to cover in-cluster traffic on those clusters (identical
+## failure mode to the RFC1918 case below, just for a range the classic
+## "private ranges" mental model omits).
+##
+## Independent of the ingress-only `networkPolicy` knob above — enable
+## either or both. Requires a NetworkPolicy-aware CNI (Calico, Cilium,
+## Weave, etc.).
+##
+## Pod-level egress only. Per-function egress policy (finer than per-pod) is
+## out of scope here — it is CNI-specific (e.g. Cilium identity-based
+## policy) and not something a portable Helm chart can author.
+##
+## IPv4-only allow rule: the default posture's "allow general internet
+## egress" rule is `ipBlock: 0.0.0.0/0` only — there is no `::/0` rule. On a
+## dual-stack cluster this is still fail-closed (no accidental IPv6 egress
+## opens up) but it means IPv6 destinations are unreachable even where an
+## IPv4 destination would be allowed. Add an `::/0` ipBlock (with your
+## cluster's IPv6 pod/Service CIDRs excepted) via extraEgress if your
+## environment pods need outbound IPv6.
+##
+## NodeLocal DNSCache: the well-known NodeLocal DNSCache listener address
+## (169.254.20.10) falls inside the 169.254.0.0/16 link-local deny range,
+## so on a cluster running it, allowClusterDNS=true's kube-system/kube-dns
+## rule does not cover it — DNS resolution breaks even with the DNS knob on.
+## Add an extraEgress ipBlock allow for 169.254.20.10/32 port 53 (UDP+TCP)
+## if your cluster uses NodeLocal DNSCache.
+##
+## THE RFC1918/CGNAT DENY-LIST BLOCKS IN-CLUSTER CONTROL-PLANE TRAFFIC TOO —
+## pod and Service CIDRs are themselves RFC1918 ranges in most clusters (or
+## 100.64.0.0/10 CGNAT on an EKS cluster running VPC custom networking). If
+## your environment pods also need any of the following, allow-list the
+## destination via extraEgress before enabling this knob:
+##   - fetcher sidecar -> storagesvc (port 8000): package fetch at
+##     specialization time; without it, cold starts fail for every
+##     packaged (non-image-volume) function.
+##   - function pod -> statesvc (functionState.enabled): keyed state
+##     reads/writes.
+## router -> function pod (port 8888) and executor -> fetcher (port 8000)
+## are unaffected: this policy governs EGRESS from environment pods, not
+## ingress to them.
+environmentNetworkPolicy:
+  enabled: false
+  ## Allow egress to cluster DNS (kube-system/kube-dns, port 53 TCP+UDP).
+  ## Needed to resolve hostname-based egress destinations. Set false for a
+  ## stricter numeric-IP-only posture (mirrors the "DNS blocked" half of
+  ## Agent Sandbox's default posture).
+  allowClusterDNS: true
+  ## Extra raw NetworkPolicy egress rule entries (networking.k8s.io/v1
+  ## NetworkPolicyEgressRule shape), appended verbatim after the default
+  ## deny-list rule — e.g. to allow-list a specific in-cluster or RFC1918
+  ## destination the deny rule above would otherwise block.
+  extraEgress: []
 
 
 ## InternalAuth: HMAC-SHA256 application-layer authentication for the
@@ -1336,8 +1817,130 @@ networkPolicy:
 ##
 ## Disabled here means the cluster falls back to NetworkPolicy + namespace
 ## isolation only, matching pre-1.(N+1) behaviour.
+##
+## This fork defaults this OFF (upstream defaults it on): the unsigned KEDA
+## HTTP connector images and the GraphQL federation gateway this fork's
+## deployments rely on do not sign their calls to router-internal, and would
+## 401 if HMAC verification were enforced. See docs/features/internal-auth.md.
+## Note this also means tenancy.mode=dynamic's per-namespace derived-key
+## provisioning is a no-op (pkg/tenant/provision_auth.go: EnsureNamespaceAuthSecret
+## short-circuits when the master secret is empty) — dynamic mode's RBAC/cache
+## isolation (Tier A/B split, no cluster-wide Secrets/ConfigMaps read) still
+## fully applies regardless; only the additional per-namespace-HMAC-key layer
+## is inactive until internalAuth is opted back on (which requires the KEDA
+## connectors + federation gateway to sign, same prerequisite as before).
+## NOTE ON SECRET RETENTION: the chart-generated Secrets below —
+## `fission-internal-auth`, `router` (when authentication is enabled), and
+## `fission-webhook-certs` (when cert-manager is not managing it) — are
+## annotated `helm.sh/resource-policy: keep` by the pre-upgrade hook, so they
+## are NOT removed by `helm uninstall`. That is deliberate: it is what lets
+## their generation move out of the templating layer without an upgrade pruning
+## the live value and wedging the control plane.
+##
+## Two consequences worth knowing:
+##   * After `helm uninstall`, live key material remains — and NOT only in the
+##     release namespace. Under static tenancy `fission-internal-auth` is
+##     replicated into `defaultNamespace` and every entry of
+##     `additionalFissionNamespaces` (kubelet cannot resolve a cross-namespace
+##     secretKeyRef), and those copies are annotated for retention too. Deleting
+##     it in the release namespace alone leaves usable key material behind.
+##     When decommissioning, remove it from every namespace it was replicated
+##     into:
+##       kubectl delete secret router fission-webhook-certs -n <release-ns>
+##       for ns in <release-ns> <defaultNamespace> <additionalFissionNamespaces...>; do
+##         kubectl delete secret fission-internal-auth -n "$ns" --ignore-not-found
+##       done
+##   * `helm uninstall && helm install` no longer rotates this material — the
+##     reinstall finds the surviving Secrets and reuses them. To rotate after a
+##     suspected compromise, delete the Secrets explicitly (above) or set the
+##     value inputs to new material.
+##
 internalAuth:
-  enabled: true
+  enabled: false
   # secret: "" — auto-generated on first install; preserved on upgrade.
   # oldSecret: "" — set during rotation; accepted by the verifier alongside `secret`.
+  ## autoGenerate moves master generation OUT of the chart template and into
+  ## the pre-install/pre-upgrade hook, which creates it only if absent.
+  ##
+  ## Why: the template preserves a generated value across upgrades with
+  ## `lookup`, and `lookup` returns EMPTY under `helm template`. A GitOps
+  ## renderer therefore re-mints the master on every sync, breaking every pod
+  ## signed with the previous one. An in-cluster create-if-absent survives any
+  ## renderer. Prefer existingSecret if you would rather own the value.
+  ##
+  ## Default false, so existing installs are untouched.
+  ##
+  ## The hook writes the master into the same namespaces the template would
+  ## have: under static tenancy the release namespace plus defaultNamespace
+  ## plus each additionalFissionNamespaces; under dynamic/cluster tenancy the
+  ## release namespace ONLY, since tenant namespaces get controller-owned
+  ## derived keys and the master must never land there.
+  ##
+  autoGenerate: false
+  ## existingSecret names a Secret you create yourself, holding key `secret`
+  ## (and optionally `oldSecret`). When set the chart renders NO master Secret
+  ## and every component reads yours instead.
+  ##
+  ## Recommended for GitOps renderers (Argo CD, Flux). Those run `helm
+  ## template`, where the chart's `lookup`-based preservation of a generated
+  ## value cannot work — so a generated master would be re-minted on every
+  ## sync, breaking every pod signed with the previous one.
+  ##
+  ## YOU MUST CREATE IT IN EVERY NAMESPACE FISSION RUNS PODS IN — the release
+  ## namespace plus defaultNamespace plus each additionalFissionNamespaces.
+  ## kubelet cannot resolve a cross-namespace secretKeyRef, so a single copy in
+  ## the release namespace leaves builder and function pods without the key:
+  ## the mount is optional, so those pods START and then 401 on every archive
+  ## fetch and builder upload. (Under dynamic/cluster tenancy only the release
+  ## namespace is needed; tenant namespaces get controller-owned derived keys.)
+  ##
+  ## Switching an existing install to this is safe: the pre-upgrade retention
+  ## hook stamps helm.sh/resource-policy=keep on the chart-generated Secret
+  ## before Helm computes its deletion set, so the value it stops rendering is
+  ## not pruned.
+  ##
+  existingSecret: ""
+
+## eventHooks pushes package-build and function-deploy lifecycle events to a
+## designated target, so consumers stop polling `fission package info` /
+## `kubectl rollout status` to find out when a build finished or a new pod
+## actually specialized. See docs/features/build-deploy-webhooks.md.
+##
+## Two independent targets, one per event family — leave either unset to
+## disable just that family. For each, set EITHER (namespace + function [+
+## subpath]) — the recommended mode: the event is delivered by invoking that
+## Fission function through the router's internal listener, the same
+## mechanism timer/mqtrigger/kubewatcher already use — OR `url`, an escape
+## hatch for a non-Fission / out-of-cluster receiver. Setting both on the same
+## family is invalid; namespace/function wins if both happen to be set.
+##
+## `subpath` matters when the target function is a full app with its own
+## router rather than a single-purpose function: the router only strips
+## `/fission-function/<ns>/<fn>` and forwards the rest, so subpath is what
+## lets the event land on a specific route (e.g. graphql-server-lambdas
+## registers POST /webhooks/fission-events for exactly this — see
+## src/app/webhooks/fission-events.plugin.ts there). Empty means the
+## function's root path.
+##
+## Delivery reuses the existing internal webhook publisher: async, retried
+## with backoff, and automatically HMAC-signed whenever internalAuth.enabled
+## is true (same FISSION_INTERNAL_AUTH_SECRET already used for every other
+## internal call to the router) — there is no separate auth toggle here.
+##
+## Disabled by default: zero behavior change, and on the update path
+## (function.deploy.* only) enabling it makes the executor wait for the new
+## pod to actually become available before returning, closing a race that
+## does not matter unless something is listening (see newdeploymgr.go).
+eventHooks:
+  enabled: false
+  packageBuild:
+    namespace: ""
+    function: ""
+    subpath: ""
+    url: ""
+  functionDeploy:
+    namespace: ""
+    function: ""
+    subpath: ""
+    url: ""
 

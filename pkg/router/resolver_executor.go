@@ -24,12 +24,16 @@ import (
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
-// executorResolver is the executor-RPC AddressResolver — today's address
-// source, retained as the cold-start path, the strict-mode path, and the
-// universal fallback. Poolmgr lookups always RPC the executor (its PoolCache
-// does per-request concurrency-aware dispatch); newdeploy/container lookups
-// hit the router-side address cache first, coalescing misses through the
-// throttler.
+// executorResolver is the executor-RPC AddressResolver, retained as the
+// cold-start path, the strict-mode path, and the universal fallback. With the
+// EndpointSlice data plane on (the default; RFC-0002), warm poolmgr traffic is
+// admitted from the router's slice-fed endpoint index and never reaches this
+// resolver — poolmgr lookups RPC the executor only on cold start, on
+// saturation (ensureCapacity), and for strict-concurrency/OnceOnly functions
+// (the executor's PoolCache does per-request concurrency-aware dispatch
+// there). With the gate off (legacy mode) every poolmgr lookup takes this RPC.
+// newdeploy/container lookups hit the router-side address cache first,
+// coalescing misses through the throttler.
 type executorResolver struct {
 	logger logr.Logger
 	fmap   *functionServiceMap
@@ -47,8 +51,10 @@ type svcEntryRecord struct {
 }
 
 // Resolve implements AddressResolver with the historical getServiceEntry
-// semantics.
-func (r *executorResolver) Resolve(ctx context.Context, fn *fv1.Function) (ResolvedEntry, error) {
+// semantics. The sticky key is ignored: the executor-RPC data plane has no
+// endpoint choice to make (documented — legacy mode does not support
+// stickiness).
+func (r *executorResolver) Resolve(ctx context.Context, fn *fv1.Function, _ string) (ResolvedEntry, error) {
 	if fn.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType == fv1.ExecutorTypePoolmgr {
 		svcURL, err := r.fromExecutor(ctx, fn)
 		return ResolvedEntry{SvcURL: svcURL}, err
@@ -61,38 +67,11 @@ func (r *executorResolver) Resolve(ctx context.Context, fn *fv1.Function) (Resol
 		return ResolvedEntry{}, err
 	}
 
-	fnMeta := &fn.ObjectMeta
-	recordObj, err := r.throttler.RunOnce(
-		crd.CacheKeyURFromMeta(fnMeta).String(),
-		func(firstToTheLock bool) (any, error) {
-			if !firstToTheLock {
-				svcURL, err := r.fromCache(fn)
-				if err != nil {
-					return nil, err
-				}
-				return svcEntryRecord{svcURL: svcURL, cacheHit: true}, err
-			}
-			svcURL, err = r.fromExecutor(ctx, fn)
-			if err != nil {
-				return nil, err
-			}
-			r.fmap.assign(&fn.ObjectMeta, svcURL)
-			return svcEntryRecord{
-				svcURL:   svcURL,
-				cacheHit: false,
-			}, nil
-		},
-	)
-
-	if recordObj == nil {
-		return ResolvedEntry{}, fmt.Errorf("empty service entry: %w", err)
+	record, err := r.coalescedResolve(ctx, fn)
+	if err != nil {
+		return ResolvedEntry{}, fmt.Errorf("resolving service entry: %w", err)
 	}
-
-	record, ok := recordObj.(svcEntryRecord)
-	if !ok {
-		return ResolvedEntry{}, fmt.Errorf("unexpected type of recordObj %T: %w", recordObj, err)
-	}
-	return ResolvedEntry{SvcURL: record.svcURL, FromCache: record.cacheHit}, err
+	return ResolvedEntry{SvcURL: record.svcURL, FromCache: record.cacheHit}, nil
 }
 
 // Invalidate removes the function's service url entry from the cache.
@@ -131,7 +110,21 @@ func (r *executorResolver) fromCache(fn *fv1.Function) (serviceUrl *url.URL, err
 // executor specialize — fromExecutor AND the fallback resolver's
 // ensureCapacity — must use the current spec, or updated functions keep
 // getting pods specialized from the old package.
+//
+// A version-pinned projection is the one exception, returned AS-IS: when the
+// resolved fn carries the fv1.FUNCTION_VERSION label it is
+// versioning.VersionedFunction's projection of an immutable FunctionVersion
+// snapshot (Spec = snapshot, Generation = pinned), so the
+// re-read-for-freshness rationale above does not apply — live specs mutate,
+// version snapshots cannot, and the pin IS the freshness contract.
+// Substituting the live Function here would discard the pinned
+// Spec/Generation/version label and make the executor specialize the LIVE
+// spec for an alias/version-pinned route — RFC-0025's "silently executes the
+// wrong version's code" failure.
 func (r *executorResolver) currentFunction(ctx context.Context, fn *fv1.Function) *fv1.Function {
+	if fn.Labels[fv1.FUNCTION_VERSION] != "" {
+		return fn
+	}
 	if r.reader == nil {
 		return fn
 	}
@@ -151,32 +144,55 @@ func (r *executorResolver) currentFunction(ctx context.Context, fn *fv1.Function
 // Service DNS would dial into a backendless Service, but a thundering herd of
 // uncoalesced RPCs is the very thing the throttler exists to prevent.
 func (r *executorResolver) resolveUncached(ctx context.Context, fn *fv1.Function) (*url.URL, error) {
-	recordObj, err := r.throttler.RunOnce(
-		crd.CacheKeyURFromMeta(&fn.ObjectMeta).String(),
-		func(firstToTheLock bool) (any, error) {
+	record, err := r.coalescedResolve(ctx, fn)
+	if err != nil {
+		return nil, err
+	}
+	return record.svcURL, nil
+}
+
+// coalescedResolve asks the executor for fn's address behind the throttler:
+// the leader performs the RPC and populates the address cache, and followers
+// that arrive while it is in flight read the leader's result back out of the
+// cache instead of issuing their own RPC.
+//
+// Dedup key is UID+Generation, not ResourceVersion (see #3596):
+// ResourceVersion moves on status-only writes, and this component's
+// informer cache can lag another component's view, so an RV-keyed
+// throttler key could split one function's in-flight specialization
+// across concurrent callers observing different RVs of the same spec.
+//
+// Minor pre-existing gap (unrelated to the RV->Generation swap, noted
+// here for a future revisit): the key is derived from the resolved fn
+// snapshot passed in, but fromExecutor() re-reads the live Function via
+// currentFunction() before calling GetServiceForFunction. A spec update
+// landing between the two reads means the throttler key (old Generation)
+// and the object actually specialized (new Generation) can diverge for
+// that one race window; a follower joining on the old key would get an
+// entry keyed under a Generation that doesn't match what was specialized.
+// Pre-existing shape (predates this migration). Version-pinned projections
+// (fv1.FUNCTION_VERSION label) are exempt from this race: currentFunction
+// passes them through without a re-read, so the throttler key and the
+// specialized object always agree.
+func (r *executorResolver) coalescedResolve(ctx context.Context, fn *fv1.Function) (svcEntryRecord, error) {
+	return r.throttler.RunOnce(
+		crd.CacheKeyUGFromMeta(&fn.ObjectMeta).String(),
+		func(firstToTheLock bool) (svcEntryRecord, error) {
 			if !firstToTheLock {
 				svcURL, err := r.fromCache(fn)
 				if err != nil {
-					return nil, err
+					return svcEntryRecord{}, err
 				}
-				return svcEntryRecord{svcURL: svcURL, cacheHit: true}, err
+				return svcEntryRecord{svcURL: svcURL, cacheHit: true}, nil
 			}
 			svcURL, err := r.fromExecutor(ctx, fn)
 			if err != nil {
-				return nil, err
+				return svcEntryRecord{}, err
 			}
 			r.fmap.assign(&fn.ObjectMeta, svcURL)
 			return svcEntryRecord{svcURL: svcURL, cacheHit: false}, nil
 		},
 	)
-	if err != nil {
-		return nil, err
-	}
-	record, ok := recordObj.(svcEntryRecord)
-	if !ok {
-		return nil, fmt.Errorf("unexpected type of recordObj %T", recordObj)
-	}
-	return record.svcURL, nil
 }
 
 // fromExecutor asks the executor for the function's service address

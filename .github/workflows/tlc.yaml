@@ -1,0 +1,49 @@
+name: TLC model check
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/rfc/specs/**'
+      - 'pkg/statestore/**'
+      - 'pkg/workflow/**'
+      - 'hack/run-tlc.sh'
+      - '.github/workflows/tlc.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'docs/rfc/specs/**'
+      - 'pkg/statestore/**'
+      - 'pkg/workflow/**'
+      - 'hack/run-tlc.sh'
+      - '.github/workflows/tlc.yaml'
+
+permissions:
+  contents: read
+
+env:
+  TLA2TOOLS_VERSION: "1.7.4"
+
+jobs:
+  tlc:
+    runs-on: ubuntu-24.04
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-ci') }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Model-check the RFC protocol specs (queue + workflow fold)
+        run: ./hack/run-tlc.sh

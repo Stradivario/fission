@@ -8,6 +8,7 @@ package framework
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -79,6 +80,25 @@ type FunctionOptions struct {
 	// MinScale / MaxScale, when > 0, control newdeploy autoscaler bounds.
 	MinScale int
 	MaxScale int
+	// ProvisionedConcurrency, when > 0, passes `--provisioned-concurrency <n>`
+	// (RFC-0026: keep N poolmgr pods warm). Poolmgr-only; webhook rejects
+	// other executor types.
+	ProvisionedConcurrency int
+	// ProvisionedSchedules, when set, passes `--provisioned-schedule <schedule>`
+	// ProvisionedConcurrency must also be set.
+	// Multiple schedules can be specified as separate --provisioned-schedule flags.
+	ProvisionedSchedules []string
+	// IdleTimeout, when > 0, passes `--idletimeout <n>` (seconds before an
+	// idle poolmgr pod is reaped).
+	IdleTimeout int
+	// RetainPods, when > 0, passes `--retainpods <n>` (poolmgr warm-pod floor:
+	// PoolCache.ListAvailableValue only offers a generation's pods as idle-reap
+	// candidates once its live pod count exceeds this floor, so 0 — the CLI
+	// default — means the idle reaper is free to drain every pod once past
+	// IdleTimeout regardless of generation; RFC-0025 alias-retention extends the
+	// same floor to an alias-referenced non-latest generation instead of
+	// unconditionally zeroing it, so exercising that path needs RetainPods > 0).
+	RetainPods int
 	// TargetCPU is the CPU utilization (%) the autoscaler targets.
 	TargetCPU int
 	// MinCPU / MaxCPU are millicores (CLI: `--mincpu` / `--maxcpu`).
@@ -91,6 +111,35 @@ type FunctionOptions struct {
 	// function pods (CLI: `--configmap` / `--secret`, both repeatable).
 	ConfigMaps []string
 	Secrets    []string
+
+	// EnvVars are per-function environment variables as "KEY=VALUE"
+	// (CLI: `--env-var`, repeatable). RFC-0030.
+	EnvVars []string
+	// EnvFromSecrets / EnvFromConfigMaps project a same-namespace object into
+	// the function's environment: "name" for the whole object, "name/key" for
+	// one key, "name/key:ENV" to rename it (CLI: `--env-from-secret` /
+	// `--env-from-configmap`, both repeatable). RFC-0030.
+	EnvFromSecrets    []string
+	EnvFromConfigMaps []string
+	// State, when true, opts the function into the RFC-0023 keyed-state API
+	// (CLI: `--state`), with the optional knobs below.
+	State bool
+	// StateKeyspace passes `--state-keyspace` (default: the function name).
+	StateKeyspace string
+	// StateMaxKeys passes `--state-max-keys` when > 0.
+	StateMaxKeys int
+	// StateStickySource/StateStickyName pass `--state-sticky-source` /
+	// `--state-sticky-name` (sticky routing, RFC-0023 phase 3).
+	StateStickySource string
+	StateStickyName   string
+	// Versioning, when set ("auto"|"manual"|"off"), passes `--versioning
+	// <mode>` (RFC-0025 opt-in; pkg/fission-cli/cmd/function/create.go's
+	// getVersioningConfig, shared by create and update).
+	Versioning string
+	// RetainVersions, when > 0, passes `--retain-versions <n>` alongside
+	// Versioning (requires Versioning to be auto|manual). Named to disambiguate
+	// from RetainPods, which retains specialized pods rather than versions.
+	RetainVersions int
 }
 
 // CreateFunction creates a Function via the CLI from either Code or Src. The
@@ -154,6 +203,21 @@ func (ns *TestNamespace) CreateFunction(t *testing.T, ctx context.Context, opts 
 			args = append(args, "--streamingmaxduration", strconv.Itoa(opts.StreamingMaxDuration))
 		}
 	}
+	if opts.State {
+		args = append(args, "--state")
+		if opts.StateKeyspace != "" {
+			args = append(args, "--state-keyspace", opts.StateKeyspace)
+		}
+		if opts.StateMaxKeys > 0 {
+			args = append(args, "--state-max-keys", strconv.Itoa(opts.StateMaxKeys))
+		}
+		if opts.StateStickySource != "" {
+			args = append(args, "--state-sticky-source", opts.StateStickySource)
+		}
+		if opts.StateStickyName != "" {
+			args = append(args, "--state-sticky-name", opts.StateStickyName)
+		}
+	}
 	if opts.ExposeAsMCP {
 		args = append(args, "--expose-as-mcp")
 		if opts.ToolDescription != "" {
@@ -168,6 +232,18 @@ func (ns *TestNamespace) CreateFunction(t *testing.T, ctx context.Context, opts 
 	}
 	if opts.ExecutorType != "" {
 		args = append(args, "--executortype", opts.ExecutorType)
+	}
+	if opts.ProvisionedConcurrency > 0 {
+		args = append(args, "--provisioned-concurrency", strconv.Itoa(opts.ProvisionedConcurrency))
+	}
+	for _, schedule := range opts.ProvisionedSchedules {
+		args = append(args, "--provisioned-schedule", schedule)
+	}
+	if opts.IdleTimeout > 0 {
+		args = append(args, "--idletimeout", strconv.Itoa(opts.IdleTimeout))
+	}
+	if opts.RetainPods > 0 {
+		args = append(args, "--retainpods", strconv.Itoa(opts.RetainPods))
 	}
 	if opts.MinScale > 0 {
 		args = append(args, "--minscale", strconv.Itoa(opts.MinScale))
@@ -195,6 +271,21 @@ func (ns *TestNamespace) CreateFunction(t *testing.T, ctx context.Context, opts 
 	}
 	for _, s := range opts.Secrets {
 		args = append(args, "--secret", s)
+	}
+	for _, e := range opts.EnvVars {
+		args = append(args, "--env-var", e)
+	}
+	for _, e := range opts.EnvFromSecrets {
+		args = append(args, "--env-from-secret", e)
+	}
+	for _, e := range opts.EnvFromConfigMaps {
+		args = append(args, "--env-from-configmap", e)
+	}
+	if opts.Versioning != "" {
+		args = append(args, "--versioning", opts.Versioning)
+	}
+	if opts.RetainVersions > 0 {
+		args = append(args, "--retain-versions", strconv.Itoa(opts.RetainVersions))
 	}
 	ns.CLI(t, ctx, args...)
 
@@ -287,13 +378,28 @@ func (ns *TestNamespace) WaitForFunction(t *testing.T, ctx context.Context, name
 //   - builder pods (separate deployment): `envName=<env>` (legacy label).
 func (ns *TestNamespace) FunctionLogs(t *testing.T, ctx context.Context, fnName string) string {
 	t.Helper()
+	logs, err := ns.FunctionLogsE(t, ctx, fnName)
+	require.NoErrorf(t, err, "FunctionLogs: %s", fnName)
+	return logs
+}
+
+// FunctionLogsE is FunctionLogs without the fatal require: inside a polling
+// closure (require.Eventually and friends) a transient apiserver error must
+// surface as "retry", not fail the test from a goroutine the retry loop cannot
+// recover. Per-pod stream errors are still tolerated (churned pods).
+func (ns *TestNamespace) FunctionLogsE(t *testing.T, ctx context.Context, fnName string) (string, error) {
+	t.Helper()
 	pods, err := ns.f.kubeClient.CoreV1().Pods(ns.Name).List(ctx, metav1.ListOptions{
 		LabelSelector: "functionName=" + fnName,
 	})
-	require.NoErrorf(t, err, "FunctionLogs: list pods (functionName=%s)", fnName)
+	if err != nil {
+		return "", fmt.Errorf("list pods (functionName=%s): %w", fnName, err)
+	}
 
 	fn, err := ns.f.fissionClient.CoreV1().Functions(ns.Name).Get(ctx, fnName, metav1.GetOptions{})
-	require.NoErrorf(t, err, "FunctionLogs: get function %q", fnName)
+	if err != nil {
+		return "", fmt.Errorf("get function %q: %w", fnName, err)
+	}
 	envName := fn.Spec.Environment.Name
 
 	var combined strings.Builder
@@ -312,7 +418,7 @@ func (ns *TestNamespace) FunctionLogs(t *testing.T, ctx context.Context, fnName 
 		}
 		combined.Write(b)
 	}
-	return combined.String()
+	return combined.String(), nil
 }
 
 // GetFunction returns the live Function CR by name. Use it to assert on

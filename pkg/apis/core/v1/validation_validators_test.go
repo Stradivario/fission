@@ -10,7 +10,39 @@ import (
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/fission/fission/pkg/mqtrigger/validator"
 )
+
+// TestMessageQueueTriggerSpecValidateForAdmission: Topic, ResponseTopic AND
+// ErrorTopic are all validated for a classic-kind trigger — an invalid
+// ErrorTopic is the worst of the three to admit, since the consumer refuses to
+// advance past a poison event whose error-topic publish keeps failing (E5) and
+// the trigger wedges.
+func TestMessageQueueTriggerSpecValidateForAdmission(t *testing.T) {
+	t.Parallel()
+	validator.Register("test-classic-mq", func(topic string) bool { return !strings.Contains(topic, "/") })
+
+	base := func(mutate func(*MessageQueueTriggerSpec)) MessageQueueTriggerSpec {
+		spec := MessageQueueTriggerSpec{
+			FunctionReference: FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "fn"},
+			MessageQueueType:  "test-classic-mq",
+			MqtKind:           "fission",
+			Topic:             "orders",
+		}
+		if mutate != nil {
+			mutate(&spec)
+		}
+		return spec
+	}
+
+	require.NoError(t, base(nil).validateForAdmission())
+	require.NoError(t, base(func(s *MessageQueueTriggerSpec) { s.ResponseTopic, s.ErrorTopic = "replies", "errs" }).validateForAdmission())
+	require.Error(t, base(func(s *MessageQueueTriggerSpec) { s.Topic = "bad/topic" }).validateForAdmission())
+	require.Error(t, base(func(s *MessageQueueTriggerSpec) { s.ResponseTopic = "bad/topic" }).validateForAdmission())
+	require.Error(t, base(func(s *MessageQueueTriggerSpec) { s.ErrorTopic = "bad/topic" }).validateForAdmission())
+	require.Error(t, base(func(s *MessageQueueTriggerSpec) { s.MessageQueueType = "unregistered" }).validateForAdmission())
+}
 
 func TestValidateKubeName(t *testing.T) {
 	t.Parallel()
@@ -110,21 +142,29 @@ func TestOCIArchiveValidate(t *testing.T) {
 	require.Error(t, OCIArchive{Image: "ghcr.io/x/y:v1", SubPath: "a/../b"}.Validate(), "unclean sub-path")
 }
 
-func TestPackageSpecValidateRejectsOCISource(t *testing.T) {
+// TestPackageSpecValidateAllowsOCISource pins RFC-0031 phase 2: source
+// archives may be OCI — the builder pod's fetcher pulls them with the same
+// keychain as deployment archives. The one-content-source rule still holds.
+func TestPackageSpecValidateAllowsOCISource(t *testing.T) {
 	t.Parallel()
 	spec := PackageSpec{
 		Environment: EnvironmentReference{Name: "env", Namespace: "ns"},
 		Source:      Archive{Type: ArchiveTypeOCI, OCI: &OCIArchive{Image: "ghcr.io/x/y:v1"}},
 	}
-	err := spec.Validate()
-	require.Error(t, err, "oci on the source archive must be rejected")
-	require.Contains(t, err.Error(), "deployment archive only")
+	require.NoError(t, spec.Validate(), "oci on the source archive is allowed (RFC-0031 phase 2)")
 
 	spec = PackageSpec{
 		Environment: EnvironmentReference{Name: "env", Namespace: "ns"},
 		Deployment:  Archive{Type: ArchiveTypeOCI, OCI: &OCIArchive{Image: "ghcr.io/x/y:v1"}},
 	}
 	require.NoError(t, spec.Validate())
+
+	spec = PackageSpec{
+		Environment: EnvironmentReference{Name: "env", Namespace: "ns"},
+		Source: Archive{Type: ArchiveTypeOCI, OCI: &OCIArchive{Image: "ghcr.io/x/y:v1"},
+			URL: "http://example.com/src.zip"},
+	}
+	require.Error(t, spec.Validate(), "oci+url on one archive must still be rejected")
 }
 
 func TestArchiveIsEmptyOCI(t *testing.T) {
@@ -182,6 +222,25 @@ func TestFunctionReferenceValidate(t *testing.T) {
 	require.NoError(t, FunctionReference{Type: FunctionReferenceTypeFunctionWeights}.Validate())
 	require.Error(t, FunctionReference{Type: "bogus"}.Validate())
 	require.Error(t, FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "Bad_Name"}.Validate())
+
+	// RFC-0025: Alias/Version are format-only checks (kube-name), mutually
+	// exclusive, and valid only when Type is "name". No existence check —
+	// aliases are eventually consistent and existence-at-admission would
+	// break apply-before-publish ordering.
+	require.NoError(t, FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod"}.Validate(),
+		"alias alone is valid with type=name")
+	require.NoError(t, FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello", Version: "hello-v1"}.Validate(),
+		"version alone is valid with type=name")
+	require.Error(t, FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod", Version: "hello-v1"}.Validate(),
+		"alias and version together must be rejected (mutually exclusive)")
+	require.Error(t, FunctionReference{Type: FunctionReferenceTypeFunctionWeights, Alias: "prod"}.Validate(),
+		"alias with type=function-weights must be rejected")
+	require.Error(t, FunctionReference{Type: FunctionReferenceTypeFunctionWeights, Version: "hello-v1"}.Validate(),
+		"version with type=function-weights must be rejected")
+	require.Error(t, FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "Bad_Alias"}.Validate(),
+		"malformed alias must be rejected")
+	require.Error(t, FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello", Version: "Bad_Version"}.Validate(),
+		"malformed version must be rejected")
 }
 
 func TestFunctionSpecValidate(t *testing.T) {
@@ -208,6 +267,44 @@ func TestEnvironmentSpecValidate(t *testing.T) {
 	require.Error(t, EnvironmentSpec{Version: 2, AllowedFunctionsPerContainer: "many"}.Validate())
 }
 
+// TestEnvironmentSpecValidateRuntimeClassName pins the Go-side mirror of the
+// struct-level CEL rule on EnvironmentSpec.RuntimeClassName. It deliberately
+// does NOT reuse validation.IsDNS1123Label (max 63 chars): the CEL rule
+// allows up to 253, and a CLI-side check stricter than the apiserver's would
+// reject a value the API server would admit. The 100-char case below is the
+// one that would wrongly fail if a future edit swapped in IsDNS1123Label.
+func TestEnvironmentSpecValidateRuntimeClassName(t *testing.T) {
+	t.Parallel()
+
+	longButValid := strings.Repeat("a", 100)
+	overLimit := strings.Repeat("a", 254)
+
+	tests := []struct {
+		name    string
+		rcName  *string
+		wantErr bool
+	}{
+		{"nil is valid (unset)", nil, false},
+		{"short lowercase name is valid", new("gvisor"), false},
+		{"100-char lowercase name is valid (over IsDNS1123Label's 63-char cap, under the CEL's 253)", &longButValid, false},
+		{"254-char name is rejected (over the CEL's 253 length bound)", &overLimit, true},
+		{"invalid charset is rejected", new("Bad_Name!"), true},
+		{"empty string is rejected", new(""), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			spec := EnvironmentSpec{Version: 2, RuntimeClassName: tt.rcName}
+			err := spec.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestHTTPTriggerSpecValidate(t *testing.T) {
 	t.Parallel()
 	valid := HTTPTriggerSpec{
@@ -223,6 +320,18 @@ func TestHTTPTriggerSpecValidate(t *testing.T) {
 		FunctionReference: FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello"},
 	}
 	require.Error(t, bad.Validate())
+
+	// RFC-0025: HTTPTriggerSpec.Validate reaches FunctionReference.Validate
+	// via spec.FunctionReference.Validate(), so the alias/version XOR rule
+	// must surface here too.
+	badRef := HTTPTriggerSpec{
+		Methods:     []string{"GET"},
+		RelativeURL: "/api/hello",
+		FunctionReference: FunctionReference{
+			Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod", Version: "hello-v1",
+		},
+	}
+	require.Error(t, badRef.Validate(), "alias/version XOR must propagate through HTTPTriggerSpec.Validate")
 }
 
 // TestHTTPTriggerSpecValidate_Path covers the URL-path safety rules added for
@@ -371,18 +480,82 @@ func TestKubernetesWatchTriggerSpecValidate(t *testing.T) {
 		Namespace:         "default",
 		FunctionReference: FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello"},
 	}.Validate())
+	// RFC-0025: KubernetesWatchTriggerSpec.Validate reaches
+	// FunctionReference.Validate via spec.FunctionReference.Validate(), so the
+	// alias/version XOR rule must surface here too.
+	require.Error(t, KubernetesWatchTriggerSpec{
+		Type:      "POD",
+		Namespace: "default",
+		FunctionReference: FunctionReference{
+			Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod", Version: "hello-v1",
+		},
+	}.Validate(), "alias/version XOR must propagate through KubernetesWatchTriggerSpec.Validate")
 }
 
 func TestTimeTriggerSpecValidate(t *testing.T) {
 	t.Parallel()
 	require.NoError(t, TimeTriggerSpec{
-		Cron:              "0 * * * *",
-		FunctionReference: FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello"},
+		Cron: "0 * * * *",
+		Type: FunctionReferenceTypeFunctionName, Name: "hello",
 	}.Validate())
 	require.Error(t, TimeTriggerSpec{
-		Cron:              "every-other-tuesday",
-		FunctionReference: FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello"},
+		Cron: "every-other-tuesday",
+		Type: FunctionReferenceTypeFunctionName, Name: "hello",
 	}.Validate())
+
+	// RFC-0025: TimeTriggerSpec has no Alias field of its own — the embedded
+	// FunctionReference (promoted as spec.Alias in Go, spec.functionref.alias
+	// in JSON) is the single home for it, so there is exactly one path and no
+	// shadowing. Its alias/version XOR rule must propagate through
+	// TimeTriggerSpec.Validate via spec.FunctionReference.Validate().
+	require.NoError(t, TimeTriggerSpec{
+		Cron: "0 * * * *",
+		Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod",
+	}.Validate(), "valid alias on the embedded FunctionReference accepted")
+	require.Error(t, TimeTriggerSpec{
+		Cron: "0 * * * *",
+		Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod", Version: "hello-v1",
+	}.Validate(), "alias/version XOR must propagate through TimeTriggerSpec.Validate")
+}
+
+// A workflow target (functionref.type "workflow") is accepted by the
+// triggers that can start runs - HTTP and time - and nowhere else.
+func TestWorkflowTriggerTargetValidate(t *testing.T) {
+	t.Parallel()
+	wf := FunctionReference{Type: FunctionReferenceTypeWorkflow, Name: "order-flow"}
+	require.NoError(t, TimeTriggerSpec{Cron: "@hourly", FunctionReference: wf}.Validate())
+	require.NoError(t, HTTPTriggerSpec{RelativeURL: "/orders", Method: "POST", FunctionReference: wf}.Validate())
+	require.Error(t, TimeTriggerSpec{
+		Cron:              "@hourly",
+		FunctionReference: FunctionReference{Type: FunctionReferenceTypeWorkflow, Name: "Not_A_Name"},
+	}.Validate(), "the workflow name must be a kube name")
+	require.Error(t, TimeTriggerSpec{
+		Cron:              "@hourly",
+		FunctionReference: FunctionReference{Type: FunctionReferenceTypeWorkflow, Name: "order-flow", Alias: "prod"},
+	}.Validate(), "alias is meaningless for a workflow target")
+	require.Error(t, wf.Validate(), "plain FunctionReference.Validate (MQ, kubewatcher, destinations) refuses a workflow")
+}
+
+func TestMessageQueueTriggerSpecValidate(t *testing.T) {
+	t.Parallel()
+	validator.Register("test-classic-mq-fnref", func(topic string) bool { return !strings.Contains(topic, "/") })
+
+	require.NoError(t, MessageQueueTriggerSpec{
+		FunctionReference: FunctionReference{Type: FunctionReferenceTypeFunctionName, Name: "hello"},
+		MessageQueueType:  "test-classic-mq-fnref",
+		MqtKind:           "fission",
+		Topic:             "orders",
+	}.Validate())
+	// RFC-0025: MessageQueueTriggerSpec.Validate reaches
+	// FunctionReference.Validate via spec.FunctionReference.Validate().
+	require.Error(t, MessageQueueTriggerSpec{
+		FunctionReference: FunctionReference{
+			Type: FunctionReferenceTypeFunctionName, Name: "hello", Alias: "prod", Version: "hello-v1",
+		},
+		MessageQueueType: "test-classic-mq-fnref",
+		MqtKind:          "fission",
+		Topic:            "orders",
+	}.Validate(), "alias/version XOR must propagate through MessageQueueTriggerSpec.Validate")
 }
 
 func TestCRDValidate(t *testing.T) {
@@ -394,7 +567,7 @@ func TestCRDValidate(t *testing.T) {
 		f.Spec.InvokeStrategy = InvokeStrategy{StrategyType: StrategyTypeExecution, ExecutionStrategy: ExecutionStrategy{ExecutorType: ExecutorTypePoolmgr}}
 		require.NoError(t, f.Validate())
 
-		bad := &Function{ObjectMeta: metav1.ObjectMeta{Name: "Bad_Name"}}
+		bad := &Function{Name: "Bad_Name"}
 		require.Error(t, bad.Validate())
 	})
 

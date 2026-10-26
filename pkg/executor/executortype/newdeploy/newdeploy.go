@@ -25,6 +25,22 @@ import (
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
+// adoptDeployment copies onto an orphan Deployment left by a previous executor
+// the fields the current executor owns. Scheduling is included so a changed
+// runtime pod spec patch (e.g. a kubernetes.io/arch nodeSelector) reaches
+// existing functions on the next executor start, not only new ones.
+func adoptDeployment(existing, desired *appsv1.Deployment) {
+	existing.Annotations = desired.Annotations
+	existing.Labels = desired.Labels
+	existing.OwnerReferences = desired.OwnerReferences
+	existing.Spec.Template.Spec.Containers = desired.Spec.Template.Spec.Containers
+	existing.Spec.Template.Spec.ServiceAccountName = desired.Spec.Template.Spec.ServiceAccountName
+	existing.Spec.Template.Spec.TerminationGracePeriodSeconds = desired.Spec.Template.Spec.TerminationGracePeriodSeconds
+	existing.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
+	existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
+	existing.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
+}
+
 func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment,
 	deployName string, deployLabels map[string]string, deployAnnotations map[string]string, deployNamespace string) (*appsv1.Deployment, error) {
 
@@ -47,12 +63,7 @@ func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Func
 	if err == nil {
 		// Try to adopt orphan deployment created by the old executor.
 		if existingDepl.Annotations[fv1.EXECUTOR_INSTANCEID_LABEL] != deploy.instanceID {
-			existingDepl.Annotations = deployment.Annotations
-			existingDepl.Labels = deployment.Labels
-			existingDepl.OwnerReferences = deployment.OwnerReferences
-			existingDepl.Spec.Template.Spec.Containers = deployment.Spec.Template.Spec.Containers
-			existingDepl.Spec.Template.Spec.ServiceAccountName = deployment.Spec.Template.Spec.ServiceAccountName
-			existingDepl.Spec.Template.Spec.TerminationGracePeriodSeconds = deployment.Spec.Template.Spec.TerminationGracePeriodSeconds
+			adoptDeployment(existingDepl, deployment)
 
 			// Update with the latest deployment spec. Kubernetes will trigger
 			// rolling update if spec is different from the one in the cluster.
@@ -121,10 +132,11 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		replicas = *targetReplicas
 	}
 
-	gracePeriodSeconds := int64(6 * 60)
-	if env.Spec.TerminationGracePeriod >= 0 {
-		gracePeriodSeconds = env.Spec.TerminationGracePeriod
-	}
+	// Effective value: the apiserver fills an absent field with the CRD
+	// default (90); the helper mirrors that for objects that never crossed
+	// it. An explicit 0 — expressible from typed clients since the field
+	// became a pointer — means no drain window.
+	gracePeriodSeconds := env.Spec.EffectiveTerminationGracePeriod()
 
 	podAnnotations := env.Annotations
 	if podAnnotations == nil {
@@ -164,10 +176,24 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 	// rollback, set RevisionHistoryLimit to 0 to disable this feature.
 	revisionHistoryLimit := int32(0)
 
-	rvCount, err := util.ReferencedResourcesRVSum(ctx, deploy.kubernetesClient, fn.Namespace, fn.Spec.Secrets, fn.Spec.ConfigMaps)
+	rvCount, err := util.ReferencedResourcesRVSum(ctx, deploy.kubernetesClient, fn.Namespace, fn.Spec)
 	if err != nil {
 		return nil, err
 	}
+
+	// Platform-owned env for the user container. Kept as one slice because
+	// ApplyFunctionEnv re-appends it LAST when the function declares its own
+	// env — kubelet last-wins is what keeps these names authoritative
+	// (RFC-0030 §1); admission's reserved-name denylist is only fast feedback.
+	platformEnv := append([]apiv1.EnvVar{
+		{
+			Name:  fv1.ResourceVersionCount,
+			Value: fmt.Sprintf("%d", rvCount),
+		},
+		// RFC-0023 state API env (nil when functionState is off). The token
+		// itself arrives via the specialize-on-startup fetcher, which writes
+		// it to the shared mount (see fetcher.StateTokenFileName).
+	}, util.StateAPIEnvVars(deploy.fetcherConfig.SharedMountPath())...)
 
 	container, err := util.MergeContainer(&apiv1.Container{
 		Name:                   env.Name,
@@ -176,12 +202,7 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		TerminationMessagePath: "/dev/termination-log",
 		// Connection-draining preStop hook; see utils.DrainLifecycle.
 		Lifecycle: utils.DrainLifecycle(gracePeriodSeconds),
-		Env: []apiv1.EnvVar{
-			{
-				Name:  fv1.ResourceVersionCount,
-				Value: fmt.Sprintf("%d", rvCount),
-			},
-		},
+		Env:       platformEnv,
 		// https://istio.io/docs/setup/kubernetes/additional-setup/requirements/
 		Ports: []apiv1.ContainerPort{
 			{
@@ -244,7 +265,21 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            deployName,
+			Name:      deployName,
+			Namespace: deployNamespace,
+			// Namespace was never set here before — harmless for every existing
+			// caller, since Create/Update take the namespace from the
+			// .Deployments(ns) client builder, not the object body, and
+			// createOrGetDeployment's own WaitForDeployment call uses the
+			// API SERVER'S returned object (which the server always populates
+			// with the correct namespace), not this raw pre-submission one.
+			// updateFuncDeployment's WaitForDeployment call is the first
+			// caller to read .ObjectMeta.Namespace directly off THIS object,
+			// and with it empty, that call became
+			// `.Deployments("").Get(...)` — a malformed request the API
+			// server answers with a generic 404 ("the server could not find
+			// the requested resource") instantly, on every single call,
+			// regardless of MinScale or replica count.
 			Labels:          deployLabels,
 			Annotations:     deployAnnotations,
 			OwnerReferences: ownerReferences,
@@ -295,6 +330,24 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		// would otherwise re-enable the kubelet auto-mount on the user
 		// container. See GHSA-85g2-pmrx-r49q.
 		deployment.Spec.Template.Spec.AutomountServiceAccountToken = new(false)
+	}
+
+	// Fill-if-nil: applies env.Spec.RuntimeClassName only when the merge
+	// above (or the base spec) left RuntimeClassName unset, so a
+	// Runtime.PodSpec override always wins. Unconditional — an env can set
+	// RuntimeClassName with no Runtime.PodSpec at all.
+	util.ApplyEnvRuntimeClass(&deployment.Spec.Template.Spec, env)
+
+	// RFC-0030 per-function env. This must run AFTER the
+	// env.Spec.Runtime.PodSpec merge (and after the container merge above):
+	// MergePodSpec appends the environment podspec container's Env/EnvFrom,
+	// so applying earlier would let the environment's entries land last and
+	// win — inverting the specified precedence (env podspec < function
+	// EnvFrom < function Env) — and would leave a duplicate env name for
+	// MergeContainer to reject outright. It also targets mainContainerName,
+	// not env.Name: a custom runtime container renames the user container.
+	if err := util.ApplyFunctionEnv(&deployment.Spec.Template.Spec, mainContainerName, deployNamespace, fn, platformEnv); err != nil {
+		return nil, err
 	}
 
 	// Re-mount the fission-fetcher SA token at the canonical Kubernetes
@@ -356,7 +409,9 @@ func (deploy *NewDeploy) mainContainerName(env *fv1.Environment) (string, error)
 // getResources overrides only the resources which are overridden at function level otherwise
 // default to resources specified at environment level
 func (deploy *NewDeploy) getResources(env *fv1.Environment, fn *fv1.Function) apiv1.ResourceRequirements {
-	resources := env.Spec.Resources
+	// deep copy: env is the shared cached Environment; writing the function's
+	// overrides into its maps raced other functions and leaked between them
+	resources := *env.Spec.Resources.DeepCopy()
 	if resources.Requests == nil {
 		resources.Requests = make(map[apiv1.ResourceName]resource.Quantity)
 	}

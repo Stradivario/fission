@@ -28,6 +28,7 @@ import (
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/executor/fscache"
+	"github.com/fission/fission/pkg/executor/metrics"
 	"github.com/fission/fission/pkg/executor/reaper"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
 	"github.com/fission/fission/pkg/utils"
@@ -90,11 +91,16 @@ func (r *Reaper) Start(ctx context.Context) {
 
 func (r *Reaper) reapOnce(ctx context.Context, s Strategy) {
 	if err := s.Prepare(ctx); err != nil {
+		// Counted, not just logged: a Prepare failure skips the WHOLE pass, so
+		// nothing is reaped and no lag is sampled. Without this the likeliest
+		// way for reaping to stop dead looks exactly like a quiet cluster.
+		metrics.RecordIdleReapError(ctx, s.ExecutorType(), metrics.ReapStagePrepare)
 		r.logger.Error(err, "skipping idle reaper pass", "strategy", s.Name())
 		return
 	}
 	funcSvcs, err := s.ListIdle()
 	if err != nil {
+		metrics.RecordIdleReapError(ctx, s.ExecutorType(), metrics.ReapStageList)
 		r.logger.Error(err, "error listing idle function services", "strategy", s.Name())
 		return
 	}
@@ -110,6 +116,7 @@ func (r *Reaper) reapOnce(ctx context.Context, s Strategy) {
 		wg.Go(func() {
 			defer func() { <-sem }()
 			if err := s.Reap(ctx, fsvc); err != nil {
+				metrics.RecordIdleReapError(ctx, s.ExecutorType(), metrics.ReapStageReap)
 				r.logger.Error(err, "error reaping idle function service", "strategy", s.Name(), "function", fsvc.Function.Name)
 			}
 		})
@@ -124,6 +131,17 @@ func idleThreshold(fn *fv1.Function, def time.Duration) time.Duration {
 		return time.Duration(*fn.Spec.IdleTimeout) * time.Second
 	}
 	return def
+}
+
+// reapLag is how long a function service sat past its idle deadline before the
+// reaper acted: idleFor is the age of its last access, threshold the idle
+// timeout that made it eligible.
+//
+// Callers pass the SAME idleFor they tested against the threshold rather than
+// re-reading the clock; a request landing mid-reap moves Atime forward, and a
+// second time.Since would then yield a negative lag.
+func reapLag(idleFor, threshold time.Duration) float64 {
+	return (idleFor - threshold).Seconds()
 }
 
 // listEnvUIDs returns the set of Environment UIDs across the Fission resource
@@ -195,13 +213,24 @@ type PoolDeleteStrategy struct {
 	// function-Services flag — without slices there is nothing to drain from.
 	drainBeforeDelete bool
 
+	// retained reports whether a live FunctionAlias still references a
+	// (function UID, generation) pin (RFC-0025 versionretain.View.Retained),
+	// forwarded to ListOldForPool so a non-latest generation an alias points
+	// at is not drained just because a newer generation exists. nil keeps the
+	// pre-RFC-0025 behaviour (every non-latest generation drains).
+	retained func(uid k8sTypes.UID, gen int64) bool
+
 	// Per-tick state populated by Prepare. Ticks for a strategy never overlap
 	// (wait.UntilWithContext), and Reap goroutines only read these maps.
 	envUIDs map[k8sTypes.UID]struct{}
 	fnByUID map[k8sTypes.UID]fv1.Function
+
+	// provisionedPods is the set of "<namespace>/<name>" keys for pods carrying
+	// the fission.io/provisioned label, refreshed on every Prepare.
+	provisionedPods map[string]struct{}
 }
 
-func NewPoolDeleteStrategy(logger logr.Logger, fissionClient versioned.Interface, fsCache *fscache.FunctionServiceCache, kubeClient kubernetes.Interface, reapTime, interval time.Duration, drainBeforeDelete bool) *PoolDeleteStrategy {
+func NewPoolDeleteStrategy(logger logr.Logger, fissionClient versioned.Interface, fsCache *fscache.FunctionServiceCache, kubeClient kubernetes.Interface, reapTime, interval time.Duration, drainBeforeDelete bool, retained func(uid k8sTypes.UID, gen int64) bool) *PoolDeleteStrategy {
 	return &PoolDeleteStrategy{
 		logger:            logger,
 		fissionClient:     fissionClient,
@@ -210,6 +239,7 @@ func NewPoolDeleteStrategy(logger logr.Logger, fissionClient versioned.Interface
 		reapTime:          reapTime,
 		interval:          interval,
 		drainBeforeDelete: drainBeforeDelete,
+		retained:          retained,
 	}
 }
 
@@ -218,7 +248,7 @@ func (s *PoolDeleteStrategy) ExecutorType() fv1.ExecutorType { return fv1.Execut
 func (s *PoolDeleteStrategy) Interval() time.Duration        { return s.interval }
 
 func (s *PoolDeleteStrategy) ListIdle() ([]*fscache.FuncSvc, error) {
-	return s.fsCache.ListOldForPool(idleListAge)
+	return s.fsCache.ListOldForPool(idleListAge, s.retained)
 }
 
 func (s *PoolDeleteStrategy) Prepare(ctx context.Context) error {
@@ -231,11 +261,51 @@ func (s *PoolDeleteStrategy) Prepare(ctx context.Context) error {
 		return err
 	}
 	s.envUIDs, s.fnByUID = envUIDs, fnByUID
+	s.provisionedPods, err = listProvisionedPodKeys(ctx, s.kubeClient)
+	if err != nil {
+		return err
+	}
 	return nil
+}
+
+// listProvisionedPodKeys returns the set of "<namespace>/<name>" keys for
+// pods carrying the fission.io/provisioned label.
+func listProvisionedPodKeys(ctx context.Context, kubeClient kubernetes.Interface) (map[string]struct{}, error) {
+	result := make(map[string]struct{})
+	for _, namespace := range utils.DefaultNSResolver().FunctionNamespaces() {
+		pods, err := kubeClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=%s", fv1.PROVISIONED_LABEL, fv1.PROVISIONED_VALUE),
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, pod := range pods.Items {
+			result[pod.Namespace+"/"+pod.Name] = struct{}{}
+		}
+	}
+	return result, nil
+}
+
+func podKeyFromFsvc(fsvc *fscache.FuncSvc) string {
+	for _, obj := range fsvc.KubernetesObjects {
+		if strings.EqualFold(obj.Kind, "Pod") {
+			return obj.Namespace + "/" + obj.Name
+		}
+	}
+	return ""
 }
 
 func (s *PoolDeleteStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) error {
 	if _, ok := s.fsCache.WebsocketFsvc.Load(fsvc.Name); ok {
+		return nil
+	}
+	// Skip provisioned pods — the provisioner (RFC-0026) is actively
+	// maintaining them. The provisioner clears fission.io/provisioned
+	// before letting the reaper retire them (target drop, window close,
+	// generation bump, spec deletion). Per-pod-label check: only pods
+	// carrying fission.io/provisioned=true are exempt, so overflow pods
+	// (target drop, window close) are reaped normally.
+	if _, provisioned := s.provisionedPods[podKeyFromFsvc(fsvc)]; provisioned {
 		return nil
 	}
 	// For a function whose environment no longer exists, reap the idle pod as
@@ -251,7 +321,8 @@ func (s *PoolDeleteStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) er
 	if fn, ok := s.fnByUID[fsvc.Function.UID]; ok {
 		reapTime = idleThreshold(&fn, s.reapTime)
 	}
-	if time.Since(fsvc.Atime) < reapTime {
+	idleFor := time.Since(fsvc.Atime)
+	if idleFor < reapTime {
 		return nil
 	}
 
@@ -260,12 +331,17 @@ func (s *PoolDeleteStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) er
 		return err
 	}
 	if deleted {
+		// Gated on deleted: DeleteOldPoolCache re-reads the clock and returns
+		// false when a request moved Atime past the threshold between the check
+		// above and the delete, which is a reap that did not happen.
+		metrics.RecordIdleReap(ctx, s.ExecutorType(), reapLag(idleFor, reapTime))
 		if s.drainBeforeDelete {
 			s.drainThenDelete(ctx, fsvc)
 			return nil
 		}
 		for i := range fsvc.KubernetesObjects {
-			s.logger.Info("release idle function resources",
+			s.logger.Info(
+				"release idle function resources",
 				"function", fsvc.Function.Name,
 				"address", fsvc.Address,
 				"executor", string(fsvc.Executor),
@@ -316,7 +392,8 @@ func (s *PoolDeleteStrategy) drainThenDelete(ctx context.Context, fsvc *fscache.
 			s.logger.Error(err, "error unlabeling idle pod for drain", "pod", obj.Name, "ns", obj.Namespace)
 		}
 	}
-	s.logger.Info("draining idle function resources before delete",
+	s.logger.Info(
+		"draining idle function resources before delete",
 		"function", fsvc.Function.Name,
 		"address", fsvc.Address,
 		"pod", fsvc.Name,
@@ -330,7 +407,8 @@ func (s *PoolDeleteStrategy) drainThenDelete(ctx context.Context, fsvc *fscache.
 		dctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		for i := range objs {
-			logger.Info("release drained idle function resources",
+			logger.Info(
+				"release drained idle function resources",
 				"function", fsvc.Function.Name,
 				"address", fsvc.Address,
 				"pod", fsvc.Name,
@@ -424,7 +502,9 @@ func (s *ScaleDownStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) err
 		}
 	}
 
-	if time.Since(fsvc.Atime) < idleThreshold(fn, s.reapTime) {
+	threshold := idleThreshold(fn, s.reapTime)
+	idleFor := time.Since(fsvc.Atime)
+	if idleFor < threshold {
 		return nil
 	}
 
@@ -438,8 +518,13 @@ func (s *ScaleDownStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) err
 	}
 	minScale := int32(fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale)
 	// Do nothing if the current replica count is already at or below MinScale.
+	// Not a reap: nothing was released, so it stays out of the metrics.
 	if currentDeploy.Spec.Replicas != nil && *currentDeploy.Spec.Replicas <= minScale {
 		return nil
 	}
-	return scaleDeploymentToMinScale(ctx, s.logger, s.kubeClient, deployObj.Namespace, deployObj.Name, minScale)
+	if err := scaleDeploymentToMinScale(ctx, s.logger, s.kubeClient, deployObj.Namespace, deployObj.Name, minScale); err != nil {
+		return err
+	}
+	metrics.RecordIdleReap(ctx, s.ExecutorType(), reapLag(idleFor, threshold))
+	return nil
 }

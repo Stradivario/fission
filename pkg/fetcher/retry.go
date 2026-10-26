@@ -6,7 +6,13 @@ package fetcher
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/http"
 	"time"
+
+	"github.com/fission/fission/pkg/error/network"
+	"github.com/fission/fission/pkg/utils"
 )
 
 // Retry policy for the specialization cold path: per-error-class sleep
@@ -69,5 +75,55 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-time.After(d):
 		return true
+	}
+}
+
+// archiveDownloadRetrySchedule is the sleep sequence for transient failures
+// downloading a package archive (storagesvc or an external backend), ~28s in
+// total. The motivating case is a freshly joined node: for its first seconds
+// the node-local DNS and CNI are not up, so the lookup of storagesvc fails
+// ("dial udp 10.96.0.10:53: connect: no route to host") and, without a retry,
+// the pod stays unspecialized and not-ready until something replaces it.
+var archiveDownloadRetrySchedule = []time.Duration{
+	250 * time.Millisecond, 500 * time.Millisecond, 1 * time.Second,
+	2 * time.Second, 4 * time.Second, 4 * time.Second, 4 * time.Second,
+	4 * time.Second, 4 * time.Second, 4 * time.Second,
+}
+
+// isTransientDownloadError reports whether an archive download error is worth
+// retrying: a network failure (DNS, dial, timeout, reset — also mid-body) or a
+// 429/5xx response. A 4xx such as a missing archive's 404 is permanent, as are
+// local file errors and a cancelled context.
+func isTransientDownloadError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if statusErr, ok := errors.AsType[*utils.HTTPStatusError](err); ok {
+		return statusErr.StatusCode >= http.StatusInternalServerError || statusErr.StatusCode == http.StatusTooManyRequests
+	}
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*net.OpError](err); ok {
+		return true
+	}
+	if netErr := network.Adapter(err); netErr != nil {
+		return netErr.IsTimeoutError() || netErr.IsConnResetError()
+	}
+	return false
+}
+
+// downloadWithRetry runs download, retrying transient failures (see
+// isTransientDownloadError) on schedule. It returns the last error.
+func downloadWithRetry(ctx context.Context, schedule []time.Duration, onRetry func(attempt int, err error), download func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := download()
+		if err == nil || attempt >= len(schedule) || !isTransientDownloadError(err) {
+			return err
+		}
+		onRetry(attempt+1, err)
+		if !sleepCtx(ctx, schedule[attempt]) {
+			return err
+		}
 	}
 }

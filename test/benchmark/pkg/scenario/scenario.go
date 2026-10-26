@@ -10,7 +10,7 @@ package scenario
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -84,14 +84,17 @@ type Params struct {
 	// BurstSize is the number of simultaneous first-requests the cold-burst
 	// scenarios fire; sized above Poolsize so the burst forces pool exhaustion
 	// and refill rather than being absorbed by warm pods.
-	BurstSize         int                `json:"burstSize"`
-	WarmDuration      Duration           `json:"warmDuration"`
-	WarmWarmup        Duration           `json:"warmWarmup"`
-	WarmConcurrency   int                `json:"warmConcurrency"`
-	ConcurrencyLevels []int              `json:"concurrencyLevels"`
-	RPSLevels         []int              `json:"rpsLevels"`
-	PayloadSizes      []int              `json:"payloadSizes"` // bytes
-	Executors         []fv1.ExecutorType `json:"executors"`
+	BurstSize                 int                `json:"burstSize"`
+	ProvisionedWarmTarget     int                `json:"provisionedWarmTarget"`     // A's target during the burst
+	ProvisionedWarmPoolsize   int                `json:"provisionedWarmPoolsize"`   // pool size for the shared env
+	ProvisionedWarmIterations int                `json:"provisionedWarmIterations"` // B cold-start samples per phase
+	WarmDuration              Duration           `json:"warmDuration"`
+	WarmWarmup                Duration           `json:"warmWarmup"`
+	WarmConcurrency           int                `json:"warmConcurrency"`
+	ConcurrencyLevels         []int              `json:"concurrencyLevels"`
+	RPSLevels                 []int              `json:"rpsLevels"`
+	PayloadSizes              []int              `json:"payloadSizes"` // bytes
+	Executors                 []fv1.ExecutorType `json:"executors"`
 
 	// Number of Secrets/ConfigMaps the cold-start-poolmgr-configdeps scenario's
 	// function references, sizing the per-reference specialization-time lookups.
@@ -103,29 +106,45 @@ type Params struct {
 	IndexScaleCount   int      `json:"indexScaleCount"`
 	RouteChurnCount   int      `json:"routeChurnCount"`
 	BuildTimeout      Duration `json:"buildTimeout"`
+
+	// UpgradeCmd is the shell command upgrade-under-load executes mid-load
+	// (helm upgrade …). The scenario is built ONLY when this is non-empty, so
+	// a regular benchmark run can never upgrade the cluster it is measuring.
+	UpgradeCmd      string   `json:"upgradeCmd"`
+	UpgradeBaseline Duration `json:"upgradeBaseline"` // pre-upgrade load window
+	UpgradeSettle   Duration `json:"upgradeSettle"`   // post-rollout load window
+	UpgradeRPS      int      `json:"upgradeRPS"`      // per-target request rate
+	UpgradeTimeout  Duration `json:"upgradeTimeout"`  // upgrade cmd + rollout budget
 }
 
 // DefaultParams returns the standard full-run parameters.
 func DefaultParams() Params {
 	return Params{
-		Poolsize:             3,
-		ColdIterations:       20,
-		Repetitions:          1,
-		BurstSize:            10,
-		WarmDuration:         Duration(60 * time.Second),
-		WarmWarmup:           Duration(10 * time.Second),
-		WarmConcurrency:      50,
-		ConcurrencyLevels:    []int{10, 50, 100, 250, 500},
-		RPSLevels:            []int{100, 250, 500, 1000},
-		PayloadSizes:         []int{1 << 10, 10 << 10, 100 << 10, 1 << 20},
-		Executors:            []fv1.ExecutorType{fv1.ExecutorTypePoolmgr, fv1.ExecutorTypeNewdeploy},
-		ConfigDepsSecrets:    5,
-		ConfigDepsConfigMaps: 5,
-		AutoscaleMaxScale:    5,
-		AutoscaleObserve:     Duration(3 * time.Minute),
-		IndexScaleCount:      1000,
-		RouteChurnCount:      500,
-		BuildTimeout:         Duration(5 * time.Minute),
+		Poolsize:                  3,
+		ColdIterations:            20,
+		Repetitions:               1,
+		BurstSize:                 10,
+		ProvisionedWarmTarget:     20,
+		ProvisionedWarmPoolsize:   30,
+		ProvisionedWarmIterations: 10,
+		WarmDuration:              Duration(60 * time.Second),
+		WarmWarmup:                Duration(10 * time.Second),
+		WarmConcurrency:           50,
+		ConcurrencyLevels:         []int{10, 50, 100, 250, 500},
+		RPSLevels:                 []int{100, 250, 500, 1000},
+		PayloadSizes:              []int{1 << 10, 10 << 10, 100 << 10, 1 << 20},
+		Executors:                 []fv1.ExecutorType{fv1.ExecutorTypePoolmgr, fv1.ExecutorTypeNewdeploy},
+		ConfigDepsSecrets:         5,
+		ConfigDepsConfigMaps:      5,
+		AutoscaleMaxScale:         5,
+		AutoscaleObserve:          Duration(3 * time.Minute),
+		IndexScaleCount:           1000,
+		RouteChurnCount:           500,
+		BuildTimeout:              Duration(5 * time.Minute),
+		UpgradeBaseline:           Duration(30 * time.Second),
+		UpgradeSettle:             Duration(2 * time.Minute),
+		UpgradeRPS:                20,
+		UpgradeTimeout:            Duration(10 * time.Minute),
 	}
 }
 
@@ -142,6 +161,15 @@ func (p Params) normalize() Params {
 	}
 	if p.BurstSize == 0 {
 		p.BurstSize = d.BurstSize
+	}
+	if p.ProvisionedWarmTarget == 0 {
+		p.ProvisionedWarmTarget = d.ProvisionedWarmTarget
+	}
+	if p.ProvisionedWarmPoolsize == 0 {
+		p.ProvisionedWarmPoolsize = d.ProvisionedWarmPoolsize
+	}
+	if p.ProvisionedWarmIterations == 0 {
+		p.ProvisionedWarmIterations = d.ProvisionedWarmIterations
 	}
 	if p.WarmDuration == 0 {
 		p.WarmDuration = d.WarmDuration
@@ -185,6 +213,18 @@ func (p Params) normalize() Params {
 	if p.BuildTimeout == 0 {
 		p.BuildTimeout = d.BuildTimeout
 	}
+	if p.UpgradeBaseline == 0 {
+		p.UpgradeBaseline = d.UpgradeBaseline
+	}
+	if p.UpgradeSettle == 0 {
+		p.UpgradeSettle = d.UpgradeSettle
+	}
+	if p.UpgradeRPS == 0 {
+		p.UpgradeRPS = d.UpgradeRPS
+	}
+	if p.UpgradeTimeout == 0 {
+		p.UpgradeTimeout = d.UpgradeTimeout
+	}
 	return p
 }
 
@@ -208,6 +248,19 @@ func BuildAll(p Params) []Scenario {
 	out = append(out, &buildTime{timeout: p.BuildTimeout.D()})
 	out = append(out, &routerIndexScale{count: p.IndexScaleCount})
 	out = append(out, &routeChurn{count: p.RouteChurnCount})
+	out = append(out, &asyncInvoke{duration: p.WarmDuration.D(), warmup: p.WarmWarmup.D(), concurrency: p.WarmConcurrency, poolsize: p.Poolsize})
+	out = append(out, &eventingTopic{duration: p.WarmDuration.D(), warmup: p.WarmWarmup.D(), concurrency: p.WarmConcurrency, poolsize: p.Poolsize})
+	out = append(out, &provisionedWarm{burstTarget: p.ProvisionedWarmTarget, poolsize: p.ProvisionedWarmPoolsize, iterations: p.ProvisionedWarmIterations})
+	if p.UpgradeCmd != "" {
+		out = append(out, &upgradeUnderLoad{
+			cmd:      p.UpgradeCmd,
+			baseline: p.UpgradeBaseline.D(),
+			settle:   p.UpgradeSettle.D(),
+			rps:      p.UpgradeRPS,
+			poolsize: p.Poolsize,
+			timeout:  p.UpgradeTimeout.D(),
+		})
+	}
 	return out
 }
 
@@ -406,6 +459,13 @@ const (
 // pool). methods controls the route's allowed HTTP methods. The returned
 // fnName feeds per-function PromQL (e.g. the cold-start counter delta).
 func provisionWarmFunction(ctx context.Context, sc *harness.Scope, executor fv1.ExecutorType, runtime warmRuntime, poolsize, requestsPerPod int, methods []string) (route, fnName string, err error) {
+	return provisionWarmFunctionNamed(ctx, sc, "", executor, runtime, poolsize, requestsPerPod, methods)
+}
+
+// provisionWarmFunctionNamed is provisionWarmFunction with a name prefix, for
+// scenarios that provision more than one function in the same scope (scope
+// names are label+run scoped, so two unprefixed calls collide on "env"/"fn").
+func provisionWarmFunctionNamed(ctx context.Context, sc *harness.Scope, prefix string, executor fv1.ExecutorType, runtime warmRuntime, poolsize, requestsPerPod int, methods []string) (route, fnName string, err error) {
 	env := sc.Env()
 	image, code, entrypoint := env.Images.Python, pythonHello, "main"
 	if runtime == runtimeNode {
@@ -415,15 +475,22 @@ func provisionWarmFunction(ctx context.Context, sc *harness.Scope, executor fv1.
 	if image == "" {
 		return "", "", skip("runtime image unset (PYTHON_RUNTIME_IMAGE / NODE_RUNTIME_IMAGE)")
 	}
-	envName := sc.Name("env")
-	if err = sc.CreateEnv(ctx, harness.EnvOptions{Name: envName, Image: image, Version: 1, Poolsize: poolsize}); err != nil {
+	envName := sc.Name(prefix + "env")
+	// GracePeriod is load-bearing and NOT redundant with the CRD default:
+	// the upgrade scenario provisions fixtures on the N-1 control plane,
+	// whose CRD predates the terminationGracePeriod default — an Environment
+	// created there without the field gets 0, pods are SIGKILLed the instant
+	// a roll or reap deletes them, and every in-flight request on them dies
+	// as a connection reset. 90s mirrors the chart's router posture (75s
+	// drain + margin) and covers the 60s default function timeout.
+	if err = sc.CreateEnv(ctx, harness.EnvOptions{Name: envName, Image: image, Version: 1, Poolsize: poolsize, GracePeriod: 90}); err != nil {
 		return "", "", err
 	}
 	minScale := 0
 	if executor != fv1.ExecutorTypePoolmgr {
 		minScale = 1
 	}
-	fnName = sc.Name("fn")
+	fnName = sc.Name(prefix + "fn")
 	route = "/" + fnName
 	if err = sc.CreateCodeFunction(ctx, harness.FunctionOptions{
 		Name: fnName, Env: envName, Code: []byte(code), Entrypoint: entrypoint,
@@ -431,7 +498,7 @@ func provisionWarmFunction(ctx context.Context, sc *harness.Scope, executor fv1.
 	}); err != nil {
 		return "", "", err
 	}
-	if err = sc.CreateRoute(ctx, harness.RouteOptions{Function: fnName, URL: route, Methods: methods}); err != nil {
+	if err = sc.CreateRoute(ctx, harness.RouteOptions{Name: sc.Name(prefix + "route"), Function: fnName, URL: route, Methods: methods}); err != nil {
 		return "", "", err
 	}
 	if err = env.WaitForRoutable(ctx, route, 3*time.Minute); err != nil {

@@ -8,50 +8,49 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-func Test_checkConflicts(t *testing.T) {
-	type args struct {
-		objs any
-	}
+func Test_checkNameConflicts(t *testing.T) {
+	t.Parallel()
+	containerName := func(c apiv1.Container) string { return c.Name }
 	tests := []struct {
 		name    string
-		args    args
-		wantErr bool
+		objs    []apiv1.Container
+		wantErr string // substring; empty means no error
 	}{
 		{
-			name:    "container name",
-			args:    args{[]apiv1.Container{{Name: "test1"}, {Name: "test2"}, {Name: "test3"}}},
-			wantErr: false,
+			name: "distinct names",
+			objs: []apiv1.Container{{Name: "test1"}, {Name: "test2"}, {Name: "test3"}},
 		},
 		{
-			name:    "pass non-slice",
-			args:    args{apiv1.Container{Name: "test1"}},
-			wantErr: true,
+			name: "empty slice",
+			objs: nil,
 		},
 		{
-			name:    "conflict container name",
-			args:    args{[]any{apiv1.Container{Name: "test1"}, apiv1.Container{Name: "test1"}, apiv1.Container{Name: "test3"}}},
-			wantErr: true,
+			name:    "duplicate name",
+			objs:    []apiv1.Container{{Name: "test1"}, {Name: "test1"}, {Name: "test3"}},
+			wantErr: "duplicate name in v1.Container: test1",
 		},
 		{
-			name:    "different types",
-			args:    args{[]any{apiv1.VolumeMount{Name: "test1"}, apiv1.EnvFromSource{Prefix: "", ConfigMapRef: nil, SecretRef: nil}}},
-			wantErr: true,
-		},
-		{
-			name:    "type without target field",
-			args:    args{[]any{apiv1.EnvFromSource{Prefix: "", ConfigMapRef: nil, SecretRef: nil}}},
-			wantErr: true,
+			name:    "every duplicate is reported",
+			objs:    []apiv1.Container{{Name: "a"}, {Name: "a"}, {Name: "b"}, {Name: "b"}},
+			wantErr: "b",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := checkSliceConflicts("Name", tt.args.objs); (err != nil) != tt.wantErr {
-				t.Errorf("checkNameConflict() error = %v, wantErr %v", err, tt.wantErr)
+			t.Parallel()
+			err := checkNameConflicts(tt.objs, containerName)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
 			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
 }
@@ -226,17 +225,17 @@ func Test_mergeVolumeLists(t *testing.T) {
 			name: "merge volume list",
 			args: args{
 				dst: []apiv1.Volume{
-					{Name: "vol1", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foo"}}},
-					{Name: "vol2", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/bar"}}},
+					{Name: "vol1", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foo"}},
+					{Name: "vol2", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/bar"}},
 				},
 				src: []apiv1.Volume{
-					{Name: "vol3", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foobar"}}},
+					{Name: "vol3", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foobar"}},
 				},
 			},
 			want: []apiv1.Volume{
-				{Name: "vol1", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foo"}}},
-				{Name: "vol2", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/bar"}}},
-				{Name: "vol3", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foobar"}}},
+				{Name: "vol1", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foo"}},
+				{Name: "vol2", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/bar"}},
+				{Name: "vol3", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foobar"}},
 			},
 			wantErr: false,
 		},
@@ -244,11 +243,11 @@ func Test_mergeVolumeLists(t *testing.T) {
 			name: "conflict volume name",
 			args: args{
 				dst: []apiv1.Volume{
-					{Name: "vol1", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foo"}}},
-					{Name: "vol2", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/bar"}}},
+					{Name: "vol1", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foo"}},
+					{Name: "vol2", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/bar"}},
 				},
 				src: []apiv1.Volume{
-					{Name: "vol1", VolumeSource: apiv1.VolumeSource{HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foobar"}}},
+					{Name: "vol1", HostPath: &apiv1.HostPathVolumeSource{Path: "/tmp/foobar"}},
 				},
 			},
 			want:    nil,
@@ -405,10 +404,8 @@ func TestMergePodSpec_StripsDangerousFields(t *testing.T) {
 			RunAsNonRoot: &runAsNonRoot,
 		},
 		Volumes: []apiv1.Volume{{
-			Name: "host-root",
-			VolumeSource: apiv1.VolumeSource{
-				HostPath: &apiv1.HostPathVolumeSource{Path: "/"},
-			},
+			Name:     "host-root",
+			HostPath: &apiv1.HostPathVolumeSource{Path: "/"},
 		}},
 		Containers: []apiv1.Container{{
 			Name:            "user",

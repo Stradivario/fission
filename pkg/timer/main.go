@@ -27,10 +27,16 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 	if err != nil {
 		return err
 	}
+	timer := MakeTimer(logger, routerUrl)
+	// workflow-targeting triggers create WorkflowRuns through the API
+	// (writes are not cached; RBAC: timer-rules grants workflowruns create)
+	timer.createRun = func(ctx context.Context, run *fv1.WorkflowRun) error {
+		return crMgr.GetClient().Create(ctx, run)
+	}
 	r := &TimeTriggerReconciler{
 		logger: logger.WithName("timetrigger_reconciler"),
 		client: crMgr.GetClient(),
-		timer:  MakeTimer(logger, routerUrl),
+		timer:  timer,
 	}
 	if err := controller.RegisterTenantScoped(crMgr, &fv1.TimeTrigger{}, r, "timetrigger"); err != nil {
 		return fmt.Errorf("error registering timetrigger reconciler: %w", err)

@@ -34,6 +34,22 @@ type FunctionListerExpansion interface{}
 // FunctionNamespaceLister.
 type FunctionNamespaceListerExpansion interface{}
 
+// FunctionAliasListerExpansion allows custom methods to be added to
+// FunctionAliasLister.
+type FunctionAliasListerExpansion interface{}
+
+// FunctionAliasNamespaceListerExpansion allows custom methods to be added to
+// FunctionAliasNamespaceLister.
+type FunctionAliasNamespaceListerExpansion interface{}
+
+// FunctionVersionListerExpansion allows custom methods to be added to
+// FunctionVersionLister.
+type FunctionVersionListerExpansion interface{}
+
+// FunctionVersionNamespaceListerExpansion allows custom methods to be added to
+// FunctionVersionNamespaceLister.
+type FunctionVersionNamespaceListerExpansion interface{}
+
 // HTTPTriggerListerExpansion allows custom methods to be added to
 // HTTPTriggerLister.
 type HTTPTriggerListerExpansion interface{}
@@ -73,3 +89,19 @@ type TimeTriggerListerExpansion interface{}
 // TimeTriggerNamespaceListerExpansion allows custom methods to be added to
 // TimeTriggerNamespaceLister.
 type TimeTriggerNamespaceListerExpansion interface{}
+
+// WorkflowListerExpansion allows custom methods to be added to
+// WorkflowLister.
+type WorkflowListerExpansion interface{}
+
+// WorkflowNamespaceListerExpansion allows custom methods to be added to
+// WorkflowNamespaceLister.
+type WorkflowNamespaceListerExpansion interface{}
+
+// WorkflowRunListerExpansion allows custom methods to be added to
+// WorkflowRunLister.
+type WorkflowRunListerExpansion interface{}
+
+// WorkflowRunNamespaceListerExpansion allows custom methods to be added to
+// WorkflowRunNamespaceLister.
+type WorkflowRunNamespaceListerExpansion interface{}

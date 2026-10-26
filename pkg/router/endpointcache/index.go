@@ -12,6 +12,7 @@ package endpointcache
 import (
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,11 +52,17 @@ type dialStrike struct {
 }
 
 type (
-	// FnKey identifies a function by its CR coordinates (the labels mirrored
-	// from the function's Service onto its slices).
+	// FnKey identifies a function by its CR coordinates plus, when present,
+	// the RFC-0025 published version it was specialized for (the labels
+	// mirrored from the function's Service onto its slices). Version is ""
+	// for the unversioned (live-spec) pool -- today's only pool, until phase
+	// 3 starts stamping fission.io/function-version on Function objects --
+	// so two versions of one function occupy distinct FnKeys and therefore
+	// distinct, independently addressable warm pools.
 	FnKey struct {
 		Namespace string
 		Name      string
+		Version   string
 	}
 
 	// Endpoint is one slice endpoint, pre-resolved to a dialable address.
@@ -118,6 +125,12 @@ type (
 		// eps is the merged endpoint list, swapped copy-on-write. Hot-path
 		// readers load it without taking mu.
 		eps atomic.Pointer[[]Endpoint]
+		// stickyLast is the sticky teleport-detection sketch: per key-hash
+		// bucket, the last owner pick as (key fingerprint << 32 | address
+		// hash). O(buckets) memory instead of per-key state; lazily allocated
+		// on the first sticky admit, nil for the (common) functions that
+		// never see a sticky key. Counting semantics live in noteStickyPick.
+		stickyLast atomic.Pointer[[stickyBuckets]atomic.Uint64]
 	}
 )
 
@@ -130,24 +143,40 @@ func NewIndex() *Index {
 	return ix
 }
 
+// fnv1a32 is the 32-bit FNV-1a of s; fnv1a32Add continues an in-progress
+// hash (shard() feeds multiple segments through it). Plain functions over a
+// string instead of hash.Hash32 via fnv.New32a, which would heap-allocate on
+// every call of these per-request paths. Shared by shard() and
+// noteStickyPick so a checksum-sensitive algorithm exists exactly once.
+func fnv1a32(s string) uint32 { return fnv1a32Add(2166136261, s) }
+
+func fnv1a32Add(h uint32, s string) uint32 {
+	for i := 0; i < len(s); i++ {
+		h = (h ^ uint32(s[i])) * 16777619
+	}
+	return h
+}
+
 func (ix *Index) shard(key FnKey) *indexShard {
-	// Inline FNV-1a over the key strings: hash.Hash32 via fnv.New32a would
-	// heap-allocate on every call of this per-request path.
-	h := uint32(2166136261)
-	for i := 0; i < len(key.Namespace); i++ {
-		h = (h ^ uint32(key.Namespace[i])) * 16777619
-	}
+	h := fnv1a32(key.Namespace)
+	h = (h ^ uint32('/')) * 16777619 // one FNV-1a step for the separator byte
+	h = fnv1a32Add(h, key.Name)
 	h = (h ^ uint32('/')) * 16777619
-	for i := 0; i < len(key.Name); i++ {
-		h = (h ^ uint32(key.Name[i])) * 16777619
-	}
+	h = fnv1a32Add(h, key.Version)
 	return &ix.shards[h%shardCount]
 }
 
 // Lookup returns the function's merged endpoint list (nil when unknown). The
 // returned slice is immutable — callers must not modify it.
-func (ix *Index) Lookup(namespace, name string) []Endpoint {
-	key := FnKey{Namespace: namespace, Name: name}
+//
+// version selects which of a function's warm pools to read (RFC-0025),
+// mirroring Admit: "" is the unversioned (live-spec) pool, a non-empty
+// version reads only that version's own FnKey entry -- it never falls back
+// to, or merges with, another version's endpoints. Callers resolving a
+// versioned backend (a Version/Alias trigger reference) pass the resolved
+// fv1.FUNCTION_VERSION label; everything else passes "".
+func (ix *Index) Lookup(namespace, name, version string) []Endpoint {
+	key := FnKey{Namespace: namespace, Name: name, Version: version}
 	s := ix.shard(key)
 	s.mu.RLock()
 	e, ok := s.m[key]
@@ -163,9 +192,11 @@ func (ix *Index) Lookup(namespace, name string) []Endpoint {
 }
 
 // ReadyCount returns how many ready endpoints the function has.
-func (ix *Index) ReadyCount(namespace, name string) int {
+//
+// version selects the warm pool, mirroring Lookup (see its doc comment).
+func (ix *Index) ReadyCount(namespace, name, version string) int {
 	n := 0
-	for _, ep := range ix.Lookup(namespace, name) {
+	for _, ep := range ix.Lookup(namespace, name, version) {
 		if ep.Ready {
 			n++
 		}
@@ -180,14 +211,17 @@ func (ix *Index) Size() int {
 
 // fnKeyForSlice maps a slice to its function via the labels the EndpointSlice
 // controller mirrors from the function's Service. ok=false for slices that do
-// not carry function labels (not Fission-managed).
+// not carry function labels (not Fission-managed). Version comes from the
+// same mirrored fission.io/function-version label, "" when the Service (and
+// so the slice) carries none -- the unversioned pool.
 func fnKeyForSlice(es *discoveryv1.EndpointSlice) (FnKey, bool) {
 	name := es.Labels[fv1.FUNCTION_NAME]
 	namespace := es.Labels[fv1.FUNCTION_NAMESPACE]
 	if name == "" || namespace == "" {
 		return FnKey{}, false
 	}
-	return FnKey{Namespace: namespace, Name: name}, true
+	version := es.Labels[fv1.FUNCTION_VERSION]
+	return FnKey{Namespace: namespace, Name: name, Version: version}, true
 }
 
 // endpointsFromSlice flattens one slice into Endpoints. The port is taken from
@@ -308,6 +342,58 @@ func (ix *Index) DeleteSlice(es *discoveryv1.EndpointSlice) {
 	}
 }
 
+// RemoveNamespace drops every slice whose object namespace matches, used when a
+// tenant is offboarded and its informer is stopped (nsinformers.go Sync).
+// FnKey.Namespace comes from the slice's functionNamespace label and may differ
+// from the namespace containing the slice, so cleanup must inspect the stored
+// slice keys. Function entries are rebuilt or removed after matching slices are
+// deleted.
+//
+// Two side effects worth noting, neither a bug:
+//
+//  1. A partially-removed entry (slices in multiple namespaces, only the
+//     offboarded one matched) has its quarantined set and strike map cleared
+//     for the surviving addresses. The old code never touched surviving
+//     entries. This is consistent with the "any slice event lifts quarantines"
+//     rule applied by ApplySlice/DeleteSlice, but it is a new side effect for
+//     offboard.
+//
+//  2. The shard lock is held for the full sweep with one entry lock taken per
+//     inhabited entry, so on a large index offboard briefly stalls concurrent
+//     Lookup/Admit. Acceptable because offboard is rare (a tenant removal), but
+//     a caller doing bulk offboard on a hot router should expect a short
+//     admission pause proportional to the shard size.
+func (ix *Index) RemoveNamespace(ns string) {
+	for i := range ix.shards {
+		s := &ix.shards[i]
+		s.mu.Lock()
+		for key, e := range s.m {
+			e.mu.Lock()
+			removed := false
+			for sliceKey := range e.slices {
+				sliceNamespace, _, ok := strings.Cut(sliceKey, "/")
+				if ok && sliceNamespace == ns {
+					delete(e.slices, sliceKey)
+					removed = true
+				}
+			}
+			if !removed {
+				e.mu.Unlock()
+				continue
+			}
+			e.quarantined.Store(nil)
+			e.strikes = nil
+			e.rebuildLocked()
+			if len(e.slices) == 0 {
+				delete(s.m, key)
+				ix.size.Add(-1)
+			}
+			e.mu.Unlock()
+		}
+		s.mu.Unlock()
+	}
+}
+
 // rebuildLocked re-merges the per-slice endpoint lists into the copy-on-write
 // snapshot, attaching each pod's shared in-flight counter (created on first
 // sight, pruned when the pod leaves every slice). Caller holds e.mu.
@@ -354,21 +440,105 @@ const (
 	AdmitContention AdmitResult = "cas_contention"
 )
 
-// Admit picks the ready, non-quarantined endpoint with the most free capacity
-// (least outstanding requests below requestsPerPod), increments its in-flight
-// counter, and returns it with a release func that the caller MUST invoke when
-// the request completes (response done / stream drained). A non-Admitted
-// result names why no endpoint was admissible.
+// hrwScore is the rendezvous (highest-random-weight) hash of (key, endpoint):
+// a pure function, so every router replica ranks endpoints identically with
+// no shared ring state (RFC-0023 S4), and removing an endpoint moves only the
+// keys that ranked it first (S5).
+//
+// Inlined FNV-1a (offset basis 14695981039346656037, prime 1099511628211)
+// over a local uint64 accumulator instead of fnv.New64a(): going through
+// hash.Hash64 heap-allocates the hasher on every call, and this runs once per
+// candidate endpoint per sticky-keyed Admit -- the per-request hot path.
+// Byte-for-byte identical to
+// fnv.New64a().Write([]byte(key)).Write([]byte{0}).Write([]byte(address)).Sum64()
+// for the same inputs (see TestHrwScoreMatchesFNV64a), so existing sticky
+// assignments do not shift on deploy. Mirrors the inline pattern documented
+// on shard() above, the 64-bit multi-segment analog of the same fix.
+func hrwScore(key, address string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(key); i++ {
+		h = (h ^ uint64(key[i])) * prime64
+	}
+	// FNV-1a step for the 0x00 separator byte: h ^ 0 is always h, so only the
+	// multiply survives -- still a required step, not a no-op omission.
+	h *= prime64
+	for i := 0; i < len(address); i++ {
+		h = (h ^ uint64(address[i])) * prime64
+	}
+	return h
+}
+
+// stickyBuckets sizes fnEntry.stickyLast: 256 buckets is 2KiB per
+// sticky-using function. The size trades coverage, not accuracy — keys
+// sharing a bucket suppress each other's counting (see noteStickyPick).
+const stickyBuckets = 256
+
+// noteStickyPick records the admitted address for the sticky key's bucket and
+// reports whether THIS key's pick changed (a "teleport"). The bucket stores
+// (key fingerprint << 32 | address hash): a bucket last written by a
+// different key (fingerprint mismatch) or never written reports false, so
+// bucket contention between keys UNDERcounts instead of fabricating
+// teleports from interleaved overwrites. The residual failure odds are two
+// keys colliding in both bucket index AND 32-bit fingerprint — negligible
+// against the churn rates this counter observes.
+func noteStickyPick(e *fnEntry, stickyKey, address string) bool {
+	buckets := e.stickyLast.Load()
+	if buckets == nil {
+		e.stickyLast.CompareAndSwap(nil, &[stickyBuckets]atomic.Uint64{})
+		buckets = e.stickyLast.Load()
+	}
+	kh := fnv1a32(stickyKey)
+	packed := uint64(kh)<<32 | uint64(fnv1a32(address))
+	b := &buckets[kh%stickyBuckets]
+	old := b.Load()
+	if old == packed {
+		// Steady state (same key, same owner): a read, not an atomic RMW, so
+		// the hot path doesn't write-invalidate the shared cache line on
+		// every sticky admit.
+		return false
+	}
+	if !b.CompareAndSwap(old, packed) {
+		// A concurrent admit updated the bucket first; that admit owns the
+		// count — reporting true here too would double-count one move.
+		return false
+	}
+	return old != 0 && uint32(old>>32) == kh
+}
+
+// Admit picks a ready, non-quarantined endpoint with free capacity (below
+// requestsPerPod), increments its in-flight counter, and returns it with a
+// release func that the caller MUST invoke when the request completes
+// (response done / stream drained). A non-Admitted result names why no
+// endpoint was admissible.
+//
+// The pick: least-outstanding by default; with a non-empty stickyKey
+// (RFC-0023 sticky routing) the highest HRW-ranked ADMISSIBLE endpoint
+// instead — a branch in this scan, not a strategy object, so the fused
+// pick+admit atomicity and the release-closure accounting seam are
+// untouched. A saturated sticky winner is simply not admissible: the key
+// overflows to its next-ranked endpoint rather than queueing (stickiness is
+// an optimization, never a correctness dependency — durable truth lives
+// behind the state API).
 //
 // Enforcement is per-router-replica by design (RFC-0002): worst-case
 // over-admission is (replicas-1)×requestsPerPod per pod, degrading to brief
 // queueing at the pod. Functions needing exact global accounting use the
 // strict-mode annotation, which bypasses this path entirely.
-func (ix *Index) Admit(namespace, name string, requestsPerPod int) (Endpoint, func(), AdmitResult) {
+//
+// version selects which of a function's warm pools to admit from (RFC-0025):
+// "" is the unversioned (live-spec) pool, today's only pool until phase 3
+// starts stamping fission.io/function-version. A non-empty version admits
+// only from that version's own FnKey entry -- it never falls back to, or
+// bleeds into, another version's endpoints.
+func (ix *Index) Admit(namespace, name, version string, requestsPerPod int, stickyKey string) (Endpoint, func(), AdmitResult) {
 	if requestsPerPod <= 0 {
 		requestsPerPod = 1
 	}
-	key := FnKey{Namespace: namespace, Name: name}
+	key := FnKey{Namespace: namespace, Name: name, Version: version}
 	s := ix.shard(key)
 	s.mu.RLock()
 	e, ok := s.m[key]
@@ -387,12 +557,21 @@ func (ix *Index) Admit(namespace, name string, requestsPerPod int) (Endpoint, fu
 		now = time.Now()
 	}
 
-	// Least-outstanding selection with a bounded CAS retry: the snapshot is
+	// Endpoint selection with a bounded CAS retry: the snapshot is
 	// immutable, only the counters move.
 	result := NoEntry
 	for range 4 {
 		var best *Endpoint
 		var bestLoad int64
+		var bestScore uint64
+		// ownerAddr is the sticky key's true HRW winner among ready,
+		// non-quarantined endpoints INCLUDING saturated ones (an address is
+		// never "", so "" doubles as the unset sentinel). The teleport
+		// accounting below records a pick only when the admitted endpoint IS
+		// the owner, so a busy-owner overflow (and the later snap-back) is
+		// load shedding, not a counted teleport.
+		var ownerAddr string
+		var ownerScore uint64
 		counted, quarantinedN, busy := 0, 0, 0
 		for i := range *epsp {
 			ep := &(*epsp)[i]
@@ -407,11 +586,22 @@ func (ix *Index) Admit(namespace, name string, requestsPerPod int) (Endpoint, fu
 				}
 			}
 			load := ep.inflight.Load()
+			var score uint64
+			if stickyKey != "" {
+				score = hrwScore(stickyKey, ep.Address)
+				if ownerAddr == "" || score > ownerScore {
+					ownerAddr, ownerScore = ep.Address, score
+				}
+			}
 			if load >= int64(requestsPerPod) {
 				busy++
 				continue
 			}
-			if best == nil || load < bestLoad {
+			if stickyKey != "" {
+				if best == nil || score > bestScore {
+					best, bestLoad, bestScore = ep, load, score
+				}
+			} else if best == nil || load < bestLoad {
 				best, bestLoad = ep, load
 			}
 		}
@@ -426,6 +616,11 @@ func (ix *Index) Admit(namespace, name string, requestsPerPod int) (Endpoint, fu
 			}
 		}
 		if best.inflight.CompareAndSwap(bestLoad, bestLoad+1) {
+			// Overflow picks (admitted != HRW owner) leave the bucket
+			// untouched: neither the detour nor the return counts.
+			if stickyKey != "" && best.Address == ownerAddr && noteStickyPick(e, stickyKey, best.Address) {
+				RecordStickyTeleport(key.Namespace, key.Name, key.Version)
+			}
 			counter := best.inflight
 			var once sync.Once
 			release := func() { once.Do(func() { counter.Add(-1) }) }
@@ -444,8 +639,14 @@ func (ix *Index) Admit(namespace, name string, requestsPerPod int) (Endpoint, fu
 // executor-resolved path climbs a retry ladder before invalidating. Each new
 // (or expired-and-renewed) quarantine is counted in
 // fission_router_endpointcache_quarantines_total.
-func (ix *Index) Quarantine(namespace, name, address string) {
-	key := FnKey{Namespace: namespace, Name: name}
+//
+// version selects the warm pool to quarantine within, mirroring Admit/Lookup
+// (see their doc comments): resolver_fallback's Invalidate passes the
+// resolved backend's fv1.FUNCTION_VERSION label, so a dial failure against a
+// versioned endpoint quarantines it within its OWN pool rather than silently
+// missing (finding no entry under "") or bleeding into the unversioned pool.
+func (ix *Index) Quarantine(namespace, name, version, address string) {
+	key := FnKey{Namespace: namespace, Name: name, Version: version}
 	s := ix.shard(key)
 	s.mu.RLock()
 	e, ok := s.m[key]
@@ -499,8 +700,12 @@ func (e *fnEntry) quarantineLocked(address string, now time.Time, ttl time.Durat
 // reports whether THIS call stored a new quarantine — false both below the
 // limit and when a concurrent report already quarantined the address, so
 // callers can log escalations without storm-duplicated noise.
-func (ix *Index) ReportDialTimeout(namespace, name, address string) bool {
-	key := FnKey{Namespace: namespace, Name: name}
+//
+// version selects the warm pool, mirroring Quarantine (see its doc comment):
+// a dial timeout reported against a versioned endpoint strikes within its
+// OWN pool's entry rather than silently recording nothing.
+func (ix *Index) ReportDialTimeout(namespace, name, version, address string) bool {
+	key := FnKey{Namespace: namespace, Name: name, Version: version}
 	s := ix.shard(key)
 	s.mu.RLock()
 	e, ok := s.m[key]

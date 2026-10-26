@@ -29,7 +29,9 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/crd"
 	ferror "github.com/fission/fission/pkg/error"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/executor/executortype"
 	"github.com/fission/fission/pkg/executor/fscache"
 	"github.com/fission/fission/pkg/executor/metrics"
@@ -81,6 +83,8 @@ type (
 		objectReaperIntervalSecond time.Duration
 
 		enableOwnerReferences bool
+
+		deployEventHook *eventhook.Dispatcher
 
 		// imageVolumeOK is the once-evaluated RFC-0001 Path B gate:
 		// ENABLE_OCI_IMAGE_VOLUME opted in AND the cluster supports
@@ -135,6 +139,8 @@ func MakeNewDeploy(
 		podSpecPatch: podSpecPatch,
 
 		enableOwnerReferences: utils.IsOwnerReferencesEnabled(),
+
+		deployEventHook: eventhook.NewFunctionDeployDispatcher(logger),
 	}
 
 	// The Function and Environment watches are controller-runtime reconcilers now
@@ -163,9 +169,16 @@ func (deploy *NewDeploy) GetFuncSvc(ctx context.Context, fn *fv1.Function) (*fsc
 }
 
 // GetFuncSvcFromCache returns a function service from cache; error otherwise.
+// The lookup is keyed (UID, Generation), never bare UID: fn may be an
+// RFC-0025 versioned projection pinning an older Generation of a UID whose
+// live entry is also cached, and a UID-only lookup would return whichever
+// generation's fsvc was cached last — silently serving the wrong version's
+// code (IsValid only checks the backing objects exist).
 func (deploy *NewDeploy) GetFuncSvcFromCache(ctx context.Context, fn *fv1.Function) (*fscache.FuncSvc, error) {
 	otelUtils.SpanTrackEvent(ctx, "GetFuncSvcFromCache")
-	return deploy.fsCache.GetByFunctionUID(fn.UID)
+	// Version-matched: the live Deployment is updated in place, so the live
+	// entry must never answer a versioned projection (nor the reverse).
+	return deploy.fsCache.GetByFunctionVersion(&fn.ObjectMeta)
 }
 
 // DeleteFuncSvcFromCache deletes a function service from cache.
@@ -263,7 +276,7 @@ func (deploy *NewDeploy) RefreshFuncPods(ctx context.Context, logger logr.Logger
 
 	// Ideally there should be only one deployment but for now we rely on label/selector to ensure that condition
 	for _, deployment := range dep.Items {
-		rvCount, err := executorUtils.ReferencedResourcesRVSum(ctx, deploy.kubernetesClient, f.Namespace, f.Spec.Secrets, f.Spec.ConfigMaps)
+		rvCount, err := executorUtils.ReferencedResourcesRVSum(ctx, deploy.kubernetesClient, f.Namespace, f.Spec)
 		if err != nil {
 			return err
 		}
@@ -361,11 +374,16 @@ func (deploy *NewDeploy) createFunction(ctx context.Context, fn *fv1.Function) (
 
 	logger := otelUtils.LoggerWithTraceID(ctx, deploy.logger)
 
-	fsvcObj, err := deploy.throttler.RunOnce(string(fn.UID), func(ableToCreate bool) (any, error) {
+	// Single-flight per (UID, Generation), not per UID: RFC-0025 versioned
+	// projections share the live function's UID but create distinct
+	// per-version Deployments, so their creates must neither serialize
+	// behind each other nor have a loser handed another generation's fsvc
+	// from the cache fallback.
+	fsvc, err := deploy.throttler.RunOnce(crd.CacheKeyUGFromMeta(&fn.ObjectMeta).String(), func(ableToCreate bool) (*fscache.FuncSvc, error) {
 		if ableToCreate {
 			return deploy.fnCreate(ctx, fn)
 		}
-		return deploy.fsCache.GetByFunctionUID(fn.UID)
+		return deploy.fsCache.GetByFunction(&fn.ObjectMeta)
 	})
 
 	if err != nil {
@@ -374,16 +392,9 @@ func (deploy *NewDeploy) createFunction(ctx context.Context, fn *fv1.Function) (
 			"function_namespace", fn.Namespace)
 		return nil, fmt.Errorf("error creating k8s resources for function %s: %w", k8sCache.MetaObjectToName(fn), err)
 	}
-
-	fsvc, ok := fsvcObj.(*fscache.FuncSvc)
-	if !ok {
-		logger.Error(nil, "receive unknown object while creating function - expected pointer of function service object")
-
-		panic("receive unknown object while creating function - expected pointer of function service object")
-	}
 	otelUtils.SpanTrackEvent(ctx, "fnSvcResponse", fscache.GetAttributesForFuncSvc(fsvc)...)
 
-	return fsvc, err
+	return fsvc, nil
 }
 
 func (deploy *NewDeploy) deleteFunction(ctx context.Context, fn *fv1.Function) error {
@@ -454,6 +465,15 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 				"namespace", ns, "name", name)
 		}
 	}
+
+	// Do not provision the deployment until the function's package has finished
+	// building. Otherwise the pod's fetcher sidecar specializes on startup, fails
+	// to fetch a deploy archive that does not exist yet, and the pod
+	// CrashLoopBackOffs until the build eventually lands.
+	if err := deploy.waitForBuild(ctx, fn); err != nil {
+		return nil, err
+	}
+
 	env, err := deploy.fissionClient.CoreV1().
 		Environments(fn.Spec.Environment.Namespace).
 		Get(ctx, fn.Spec.Environment.Name, metav1.GetOptions{})
@@ -484,7 +504,10 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 		}
 		return nil, fmt.Errorf("error creating service %s: %w", objName, err)
 	}
-	svcAddress := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
+	// Absolute FQDN, deliberately: the router dials this on every proxied
+	// request whose connection isn't already warm, and the short name's
+	// search-path walk is what melts down in-cluster DNS under load.
+	svcAddress := utils.ServiceFQDN(svc.Name, svc.Namespace)
 
 	depl, err := deploy.createOrGetDeployment(ctx, fn, env, objName, deployLabels, deployAnnotations, ns)
 	if err != nil {
@@ -561,7 +584,95 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 	metrics.RecordColdStart(ctx, fn.Name, fn.Namespace)
 	executorUtils.SetFunctionReady(ctx, deploy.logger, deploy.fissionClient, fn, fv1.FunctionReasonReady, "newdeploy deployment is ready")
 
+	deploy.deployEventHook.Send(ctx, eventhook.Event{
+		Event:                eventhook.EventFunctionDeployReady,
+		Namespace:            fn.Namespace,
+		Function:             fn.Name,
+		DeploymentGeneration: strconv.FormatInt(depl.Generation, 10),
+	})
+
 	return fsvc, nil
+}
+
+// defaultBuildWaitTimeout is how long (in seconds) waitForBuild polls for a
+// function's package to finish building before giving up and provisioning the
+// deployment anyway. Overridable via the NEWDEPLOY_BUILD_WAIT_TIMEOUT env var.
+const defaultBuildWaitTimeout uint = 600
+
+// notFoundGraceTicks bounds how many consecutive polls waitForBuild tolerates
+// the referenced package being genuinely absent (apiserver NotFound), separate
+// from the full build-wait window above. A brand-new package can briefly 404
+// right after creation before it becomes visible; a package that is simply gone
+// (deleted, or a Function referencing one that was never created) must fail
+// fast rather than block a cold-start invocation for the full
+// defaultBuildWaitTimeout.
+const notFoundGraceTicks uint = 5
+
+// waitForBuild blocks until the package referenced by fn is ready to be fetched,
+// so newdeploy never provisions a deployment whose fetcher sidecar would
+// CrashLoopBackOff fetching a deploy archive that has not been built yet
+// (fetcher.Fetch rejects packages whose BuildStatus is not "succeeded"/"none").
+//
+//   - succeeded / none          -> ready, return nil and provision.
+//   - failed                    -> return an error and skip provisioning; the pod
+//     would crash-loop forever anyway.
+//   - pending / running / empty -> keep polling until the build settles or the
+//     wait window elapses, after which we provision anyway so an unusually slow
+//     build can never permanently block the function (the fetcher sidecar then
+//     retries until the build lands).
+//
+// The poll is cancellation-aware: on executor shutdown / loss of leadership it
+// returns ctx.Err() rather than holding the reconcile worker for the full window.
+func (deploy *NewDeploy) waitForBuild(ctx context.Context, fn *fv1.Function) error {
+	pkgRef := fn.Spec.Package.PackageRef
+	if pkgRef.Name == "" {
+		return nil
+	}
+
+	logger := otelUtils.LoggerWithTraceID(ctx, deploy.logger)
+
+	timeoutSec, err := utils.GetUIntValueFromEnv("NEWDEPLOY_BUILD_WAIT_TIMEOUT")
+	if err != nil {
+		timeoutSec = defaultBuildWaitTimeout
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	var notFoundStreak uint
+	for i := uint(0); i < timeoutSec; i++ {
+		pkg, err := deploy.fissionClient.CoreV1().Packages(pkgRef.Namespace).Get(ctx, pkgRef.Name, metav1.GetOptions{})
+		if err != nil {
+			// Just after the package is created the API server may briefly return
+			// NotFound; keep waiting for it to become visible. Any other error is real.
+			if !k8sErrs.IsNotFound(err) {
+				return fmt.Errorf("error getting package %s.%s while waiting for build: %w", pkgRef.Name, pkgRef.Namespace, err)
+			}
+			notFoundStreak++
+			if notFoundStreak > notFoundGraceTicks {
+				return fmt.Errorf("package %s.%s not found, not provisioning deployment", pkgRef.Name, pkgRef.Namespace)
+			}
+		} else {
+			notFoundStreak = 0
+			switch pkg.Status.BuildStatus {
+			case fv1.BuildStatusSucceeded, fv1.BuildStatusNone:
+				return nil
+			case fv1.BuildStatusFailed:
+				return fmt.Errorf("package %s.%s build failed, not provisioning deployment", pkg.Name, pkg.Namespace)
+			}
+		}
+
+		// pending / running / empty / not-yet-visible -> keep polling.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+
+	logger.Info("package build did not finish within the wait window, provisioning deployment anyway",
+		"package", pkgRef.Name, "namespace", pkgRef.Namespace, "timeout_seconds", timeoutSec)
+	return nil
 }
 
 func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function, newFn *fv1.Function) error {
@@ -606,7 +717,10 @@ func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function
 		// deployment of the function in fission-function ns, so cleaning up resources there
 		ns := deploy.nsResolver.GetFunctionNS(newFn.Namespace)
 
-		fsvc, err := deploy.fsCache.GetByFunctionUID(newFn.UID)
+		// Live entry only: updates arrive for the live Function CR, and its
+		// versioned projections' entries (which share the UID) are immutable
+		// snapshots whose HPA must not be touched here.
+		fsvc, err := deploy.fsCache.GetLiveByFunctionUID(newFn.UID)
 		if err != nil {
 			return fmt.Errorf("error updating function due to unable to find function service cache %s: %w", k8sCache.MetaObjectToName(oldFn), err)
 		}
@@ -664,33 +778,9 @@ func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function
 		}
 	}
 
-	if oldFn.Spec.Environment != newFn.Spec.Environment ||
-		oldFn.Spec.Package.PackageRef != newFn.Spec.Package.PackageRef ||
-		oldFn.Spec.Package.FunctionName != newFn.Spec.Package.FunctionName {
+	if podTemplateChanged(oldFn, newFn) {
 		deploy.logger.V(1).Info("deployment changed", "msg", "deployment changed")
 		deployChanged = true
-	}
-
-	// If length of slice has changed then no need to check individual elements
-	if len(oldFn.Spec.Secrets) != len(newFn.Spec.Secrets) {
-		deployChanged = true
-	} else {
-		for i, newSecret := range newFn.Spec.Secrets {
-			if newSecret != oldFn.Spec.Secrets[i] {
-				deployChanged = true
-				break
-			}
-		}
-	}
-	if len(oldFn.Spec.ConfigMaps) != len(newFn.Spec.ConfigMaps) {
-		deployChanged = true
-	} else {
-		for i, newConfig := range newFn.Spec.ConfigMaps {
-			if newConfig != oldFn.Spec.ConfigMaps[i] {
-				deployChanged = true
-				break
-			}
-		}
 	}
 
 	if deployChanged {
@@ -707,17 +797,16 @@ func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function
 }
 
 // reconcileDeploymentSpec brings an already-existing deployment up to the
-// function's current spec when it lags. createFunction only *adopts/scales* an
-// existing deployment (it does not rewrite the pod spec), and updateFunction is
-// diff-based against the last-reconciled object. So if a function's create and a
-// later spec update coalesce into a single first reconcile — common when the
-// router specializes the function on-demand (creating the deployment) just before
-// `fission fn update` lands — the deployment can be left on the old spec with no
-// transition for updateFunction to diff. The deployment carries the function's
-// ResourceVersion as a metadata annotation (getDeployAnnotations), so compare it:
-// if stale, push the current spec. A no-op when already current.
+// function's current spec when it lags — the level-trigger half of every
+// create-routed reconcile (see createAndConverge in reconciler.go for why it
+// must follow createFunction). The deployment carries the function's
+// ResourceVersion as a metadata annotation (getDeployAnnotations), so compare
+// it: if stale, push the current spec. A no-op when already current.
 func (deploy *NewDeploy) reconcileDeploymentSpec(ctx context.Context, fn *fv1.Function) error {
-	fsvc, err := deploy.fsCache.GetByFunctionUID(fn.UID)
+	// Live entry only: fn is the live Function CR here, and versioned
+	// projections sharing its UID pin immutable snapshots that must not be
+	// rewritten to the live spec.
+	fsvc, err := deploy.fsCache.GetLiveByFunctionUID(fn.UID)
 	if err != nil {
 		// Not specialized yet — no deployment to reconcile; the on-demand path will
 		// create it from the current spec when the function is first invoked.
@@ -731,7 +820,8 @@ func (deploy *NewDeploy) reconcileDeploymentSpec(ctx context.Context, fn *fv1.Fu
 		}
 		return err
 	}
-	if existingDepl.Annotations[fv1.FUNCTION_RESOURCE_VERSION] == fn.ResourceVersion {
+	deplRV := existingDepl.Annotations[fv1.FUNCTION_RESOURCE_VERSION]
+	if deplRV == fn.ResourceVersion {
 		return nil // deployment already reflects the current function spec
 	}
 	env, err := deploy.fissionClient.CoreV1().Environments(fn.Spec.Environment.Namespace).
@@ -739,14 +829,23 @@ func (deploy *NewDeploy) reconcileDeploymentSpec(ctx context.Context, fn *fv1.Fu
 	if err != nil {
 		return err
 	}
-	deploy.logger.Info("reconciling stale deployment to current function spec on first sight",
+	deploy.logger.Info("reconciling stale deployment to current function spec",
 		"function", fn.Name, "deployment", fsvc.Name,
-		"deployment_rv", existingDepl.Annotations[fv1.FUNCTION_RESOURCE_VERSION], "function_rv", fn.ResourceVersion)
+		"deployment_rv", deplRV, "function_rv", fn.ResourceVersion)
 	return deploy.updateFuncDeployment(ctx, fn, env)
 }
 
 func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment) error {
-	fsvc, err := deploy.fsCache.GetByFunctionUID(fn.UID)
+	// When the update points the function at a freshly created package (e.g. a new
+	// revision), wait for that package to finish building before rolling the
+	// deployment, so the new pod does not crash-loop fetching an unbuilt archive.
+	if err := deploy.waitForBuild(ctx, fn); err != nil {
+		return err
+	}
+
+	// Live entry only — see updateFunction: versioned projections' entries
+	// share the UID but must keep their pinned spec.
+	fsvc, err := deploy.fsCache.GetLiveByFunctionUID(fn.UID)
 	if err != nil {
 		return fmt.Errorf("error updating function due to unable to find function service cache: %s: %w", k8sCache.MetaObjectToName(fn), err)
 	}
@@ -807,6 +906,77 @@ func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Funct
 		deploy.updateStatus(fn, err, "failed to update deployment while updating function")
 		return err
 	}
+	// The live Deployment now runs fn's new spec: move its cache entry to the
+	// new Generation, or a FunctionVersion pinning the old Generation would be
+	// served by this (updated) Deployment instead of its own -v<seq> objects.
+	if rerr := deploy.fsCache.Rekey(fsvc, &fn.ObjectMeta); rerr != nil {
+		deploy.logger.Error(rerr, "failed to re-key the function's cache entry after update", "function", fn.Name)
+	}
+
+	// Unlike fnCreate (which always waits for the Deployment to become
+	// available via createOrGetDeployment's own WaitForDeployment call), this
+	// update path has historically returned immediately after patching the
+	// spec — the rolling update then proceeds in the background, outside this
+	// reconcile. That's fine when nothing is watching for the outcome. But
+	// when a function.deploy event consumer IS configured, only waiting here
+	// closes the race described in docs/features/build-deploy-webhooks.md: an
+	// event fired right after updateDeployment would race the actual rollout
+	// and could be observed before the new pod is even scheduled, let alone
+	// ready. So this wait is entirely gated on deployEventHook.Enabled() — an
+	// install that hasn't configured it sees byte-for-byte the same behavior
+	// as before this change.
+	if deploy.deployEventHook.Enabled() {
+		// Wait for the SAME replica count this update actually asked for —
+		// newDeployment.Spec.Replicas, which getDeploymentSpec set to
+		// existingDepl.Spec.Replicas above ("use current replicas instead of
+		// minscale"), not fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale.
+		// A scale-to-zero function (MinScale 0) legitimately has 0 replicas
+		// between invocations; updateFuncDeployment does not scale it up (only
+		// createOrGetDeployment does, and only at create time). Flooring to 1
+		// here would wait for a replica that is never going to appear on its
+		// own, falsely firing function.deploy.failed even though the spec
+		// patch fully succeeded and is correctly served on the next on-demand
+		// specialize. Waiting for 0 succeeds immediately (0 >= 0) and
+		// correctly fires function.deploy.ready right away: the new spec IS
+		// live, there is just no pod expected to exist yet.
+		desiredReplicas := int32(1)
+		if newDeployment.Spec.Replicas != nil {
+			desiredReplicas = *newDeployment.Spec.Replicas
+		}
+		latestDepl, werr := executorUtils.WaitForDeployment(ctx, deploy.kubernetesClient, deploy.logger,
+			newDeployment, desiredReplicas, fn.Spec.InvokeStrategy.ExecutionStrategy.SpecializationTimeout)
+		if werr != nil {
+			// Do NOT return werr here. This wait is an observation, not a
+			// mutation — updateDeployment above already succeeded, so there is
+			// nothing left for a reconcile requeue to usefully retry; the
+			// rolling update keeps progressing in the background regardless of
+			// what WE observed. Returning the error instead turns a single
+			// slow/stuck rollout into an unbounded requeue loop (controller-
+			// runtime requeues a failed Reconcile with exponential backoff),
+			// which re-runs this whole wait AND re-fires this event on every
+			// attempt. Same "never permanently block, never keep
+			// re-litigating" posture as waitForBuild's own timeout fallback.
+			//
+			// A timeout also isn't proof of a genuine failure (crash-loop,
+			// image pull error) — on a loaded/slow cluster it just as often
+			// means "still coming up" — so this is a best-effort "we gave up
+			// waiting" signal, not a confirmed failure.
+			deploy.logger.Error(werr, "gave up waiting for deployment to become available after update; not retrying this reconcile for it",
+				"deployment", fnObjName, "function", fn.Name)
+			deploy.deployEventHook.Send(ctx, eventhook.Event{
+				Event:     eventhook.EventFunctionDeployFailed,
+				Namespace: fn.Namespace,
+				Function:  fn.Name,
+			})
+			return nil
+		}
+		deploy.deployEventHook.Send(ctx, eventhook.Event{
+			Event:                eventhook.EventFunctionDeployReady,
+			Namespace:            fn.Namespace,
+			Function:             fn.Name,
+			DeploymentGeneration: strconv.FormatInt(latestDepl.Generation, 10),
+		})
+	}
 
 	return nil
 }
@@ -814,22 +984,25 @@ func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Funct
 func (deploy *NewDeploy) fnDelete(ctx context.Context, fn *fv1.Function) error {
 	var errs error
 
-	// GetByFunction uses resource version as part of cache key, however,
-	// the resource version in function metadata will be changed when a function
-	// is deleted and cause newdeploy backend fails to delete the entry.
-	// Use GetByFunctionUID instead of GetByFunction here to find correct
-	// fsvc entry.
-	objName := deploy.getObjName(fn)
-	fsvc, err := deploy.fsCache.GetByFunctionUID(fn.UID)
-	if err != nil {
-		// Not in cache (never specialized, evicted, or executor restarted).
-		// The backing object names are deterministic, so proceed with
-		// cleanup using the computed name instead of failing — bailing out
-		// here would leak the Deployment/Service/HPA.
+	// GetByFunction keys on UID+Generation (see #3596), but the fn passed in
+	// on delete can carry a Generation the cache entries were never keyed
+	// under (a delete racing a spec update, or a stale informer snapshot) —
+	// so enumerate ALL cached entries for the UID instead. With RFC-0025 a
+	// UID can back several entries at once (the live function plus versioned
+	// projections, each with its own -v<seq> Deployment/Service/HPA), and
+	// deleting the live Function must tear down every one of them, not just
+	// whichever entry happened to be cached last. The computed name is always
+	// included: entries can be missing (never specialized, evicted, executor
+	// restarted) and bailing out would leak the live objects.
+	computedName := deploy.getObjName(fn)
+	objNames := map[string]struct{}{computedName: {}}
+	fsvcs := deploy.fsCache.ListByFunctionUID(fn.UID)
+	if len(fsvcs) == 0 {
 		deploy.logger.V(1).Info("fsvc not in cache, cleaning up by computed name",
-			"function", k8sCache.MetaObjectToName(fn), "obj_name", objName)
-	} else {
-		objName = fsvc.Name
+			"function", k8sCache.MetaObjectToName(fn), "obj_name", computedName)
+	}
+	for _, fsvc := range fsvcs {
+		objNames[fsvc.Name] = struct{}{}
 		if _, err := deploy.fsCache.DeleteOld(fsvc, time.Second*0); err != nil {
 			errs = errors.Join(errs, fmt.Errorf("error deleting the function from cache"))
 		}
@@ -839,34 +1012,95 @@ func (deploy *NewDeploy) fnDelete(ctx context.Context, fn *fv1.Function) error {
 	// deployment of the function in fission-function ns, so cleaning up resources there
 	ns := deploy.nsResolver.GetFunctionNS(fn.Namespace)
 
-	errs = errors.Join(errs, deploy.cleanupNewdeploy(ctx, ns, objName))
+	// Cache-INDEPENDENT enumeration: the cache walk above only finds
+	// generations with a live fscache entry, and the computed name only covers
+	// the Function object passed in (typically the live spec, no version
+	// label). Per-version -v<seq> objects specialized by a previous executor
+	// incarnation — or whose entry was evicted — would leak past both, so
+	// additionally list Deployments/Services/HPAs by the identity labels every
+	// created object carries (getDeployLabels) and tear down everything found.
+	selector := labels.Set{
+		fv1.EXECUTOR_TYPE: string(fv1.ExecutorTypeNewdeploy),
+		fv1.FUNCTION_UID:  string(fn.UID),
+	}.AsSelector().String()
+	listed, listErr := executorUtils.FunctionObjectNames(ctx, deploy.kubernetesClient, ns, selector)
+	errs = errors.Join(errs, listErr)
+	for objName := range listed {
+		objNames[objName] = struct{}{}
+	}
+
+	for objName := range objNames {
+		errs = errors.Join(errs, deploy.cleanupNewdeploy(ctx, ns, objName))
+	}
 
 	return errs
 }
 
-// getObjName returns a unique name for kubernetes objects of function
-func (deploy *NewDeploy) getObjName(fn *fv1.Function) string {
-	// use meta uuid of function, this ensure we always get the same name for the same function.
-	uid := fn.UID[len(fn.UID)-17:]
-	var functionMetadata string
-	if len(fn.Name)+len(fn.Namespace) < 35 {
-		functionMetadata = fn.Name + "-" + fn.Namespace
-	} else {
-		if len(fn.Name) > 17 {
-			functionMetadata = fn.Name[:17]
-		} else {
-			functionMetadata = fn.Name
-		}
-		if len(fn.Namespace) > 17 {
-			functionMetadata = functionMetadata + "-" + fn.Namespace[:17]
-		} else {
-			functionMetadata = functionMetadata + "-" + fn.Namespace
+// CleanupFunctionVersion tears down the per-version Deployment/Service/HPA
+// set (and the fscache entry) a deleted FunctionVersion's projection left
+// behind, driven by the executor's versiongc reconciler. Without it those
+// objects leak until the whole Function is deleted: retention GC (or a manual
+// delete passing the webhook guard) removes only the FunctionVersion CR.
+//
+// Label-based teardown is used INSTEAD of an ownerReference on the objects
+// pointing at the FunctionVersion, for two reasons (see also
+// pkg/executor/versiongc's package doc):
+//   - Kubernetes ownerRefs require owner and dependent in the same namespace,
+//     but with the chart's functionNamespace value set, a default-namespace
+//     function's objects deploy to that namespace (nsResolver.GetFunctionNS)
+//     while its FunctionVersion stays in the function's namespace — the GC
+//     would treat the cross-namespace owner as absent and delete the
+//     per-version Deployment right after creation.
+//   - These objects already carry a controller ownerRef to the Function when
+//     enableOwnerReferences is on; a FunctionVersion ownerRef ADDED to it
+//     would never cascade (the GC keeps a dependent while ANY owner is
+//     alive), and REPLACING it changes teardown semantics for the flag-off /
+//     cross-namespace installs the flag exists for.
+//
+// fnNamespace is the function CR's namespace — also the FunctionVersion CR's
+// namespace and the FUNCTION_NAMESPACE label value on the objects.
+func (deploy *NewDeploy) CleanupFunctionVersion(ctx context.Context, fnNamespace, versionName string) error {
+	var errs error
+
+	// Cache first: evict the projection's entry so the idle reaper stops
+	// tracking a service whose backing objects are about to vanish, and so
+	// its object name is torn down even if a list below fails.
+	objNames := make(map[string]struct{})
+	for _, fsvc := range deploy.fsCache.ListByFunctionVersion(fnNamespace, versionName) {
+		objNames[fsvc.Name] = struct{}{}
+		if _, err := deploy.fsCache.DeleteOld(fsvc, time.Second*0); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("error deleting the function version entry from cache: %w", err))
 		}
 	}
-	// constructed name should be 63 characters long, as it is a valid k8s name
-	// functionMetadata should be 35 characters long, as we take 17 characters from functionUid
-	// with newdeploy 10 character prefix
-	return strings.ToLower(fmt.Sprintf("newdeploy-%s-%s", functionMetadata, uid))
+
+	ns := deploy.nsResolver.GetFunctionNS(fnNamespace)
+	selector := labels.Set{
+		fv1.EXECUTOR_TYPE:      string(fv1.ExecutorTypeNewdeploy),
+		fv1.FUNCTION_NAMESPACE: fnNamespace,
+		fv1.FUNCTION_VERSION:   versionName,
+	}.AsSelector().String()
+	listed, listErr := executorUtils.FunctionObjectNames(ctx, deploy.kubernetesClient, ns, selector)
+	errs = errors.Join(errs, listErr)
+	for objName := range listed {
+		objNames[objName] = struct{}{}
+	}
+
+	for objName := range objNames {
+		errs = errors.Join(errs, deploy.cleanupNewdeploy(ctx, ns, objName))
+	}
+
+	return errs
+}
+
+// getObjName returns a unique name for kubernetes objects of function. A
+// versioned Function (fv1.FUNCTION_VERSION label present, RFC-0025) gets a
+// name suffixed with the version's bounded "-v<seq>" tail so each published
+// version's Deployment/Service/HPA is distinct; see
+// executorUtils.VersionedObjName for the truncation budget that keeps the
+// whole name within the Kubernetes 63-char limit either way. The
+// unversioned path is byte-identical to the pre-RFC-0025 behaviour.
+func (deploy *NewDeploy) getObjName(fn *fv1.Function) string {
+	return executorUtils.VersionedObjName("newdeploy-", fn)
 }
 
 func (deploy *NewDeploy) getDeployLabels(fnMeta metav1.ObjectMeta, envMeta metav1.ObjectMeta) map[string]string {
@@ -909,4 +1143,23 @@ func (deploy *NewDeploy) IdleStrategy() idle.Strategy {
 
 func (deploy *NewDeploy) DumpDebugInfo(ctx context.Context) error {
 	return nil
+}
+
+// podTemplateChanged reports whether a function update changes anything that
+// is baked into the deployment's pod template, so updateFunction knows to roll
+// it. Every field the deployment builder reads must be listed here: a field
+// that lands in the pod template but is missing from this diff leaves the CR
+// and the running container disagreeing indefinitely, because updateFunction
+// is the only steady-state path that rewrites the template (the RV-annotation
+// catch-all in reconcileDeploymentSpec runs only on create-routed reconciles —
+// first sight and drift-recreate — never on the plain update path).
+func podTemplateChanged(oldFn, newFn *fv1.Function) bool {
+	return oldFn.Spec.Environment != newFn.Spec.Environment ||
+		oldFn.Spec.Package.PackageRef != newFn.Spec.Package.PackageRef ||
+		oldFn.Spec.Package.FunctionName != newFn.Spec.Package.FunctionName ||
+		!apiequality.Semantic.DeepEqual(oldFn.Spec.Secrets, newFn.Spec.Secrets) ||
+		!apiequality.Semantic.DeepEqual(oldFn.Spec.ConfigMaps, newFn.Spec.ConfigMaps) ||
+		// RFC-0030 per-function env lands in the pod template too.
+		!apiequality.Semantic.DeepEqual(oldFn.Spec.Env, newFn.Spec.Env) ||
+		!apiequality.Semantic.DeepEqual(oldFn.Spec.EnvFrom, newFn.Spec.EnvFrom)
 }

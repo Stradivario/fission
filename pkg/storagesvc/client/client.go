@@ -7,7 +7,7 @@ package client
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -24,21 +24,28 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	hmacauth "github.com/fission/fission/pkg/auth/hmac"
 	"github.com/fission/fission/pkg/storagesvc"
+	"github.com/fission/fission/pkg/utils/httpx"
 )
 
-// internalAuthSecretName is the chart-installed Secret that holds the
-// shared HMAC key used for internal control-plane authentication. The
-// chart's name is fixed; see charts/fission-all/templates/internal-auth-secret.yaml.
-const internalAuthSecretName = "fission-internal-auth"
+// storagesvcIdleConnsPerHost sizes the shared transport's idle pool for the
+// single storagesvc upstream; the stdlib default of 2 idle conns per host
+// churns connections when archive fetches and uploads overlap.
+const storagesvcIdleConnsPerHost = 16
+
+// storagesvcBaseTransport is shared by every storagesvc client in the process
+// so repeated MakeClient* calls reuse one idle pool instead of growing a fresh
+// one each time. The per-client otel/signer wrappers layer on top.
+var storagesvcBaseTransport = httpx.PooledTransport(storagesvcIdleConnsPerHost)
 
 // internalAuthSecretKey is the data key inside that Secret.
 const internalAuthSecretKey = "secret"
 
-// internalAuthEnv is the env var that controller pods read to obtain
-// the HMAC secret. The chart mounts it as a secretKeyRef.
-const internalAuthEnv = "FISSION_INTERNAL_AUTH_SECRET"
+// defaultFissionNamespace is the install namespace assumed when the caller
+// supplies none — the same fallback the workflow-history CLI path uses.
+const defaultFissionNamespace = "fission"
 
 type (
 	ClientInterface interface {
@@ -74,7 +81,7 @@ type (
 // HMACSecretFromCluster() so they read the same Secret the cluster
 // uses.
 func MakeClient(url string, masterSecret []byte) ClientInterface {
-	var rt http.RoundTripper = otelhttp.NewTransport(http.DefaultTransport)
+	var rt http.RoundTripper = otelhttp.NewTransport(storagesvcBaseTransport)
 	if len(masterSecret) > 0 {
 		rt = hmacauth.ServiceSigner(masterSecret, hmacauth.ServiceStoragesvc, rt, time.Now)
 	}
@@ -119,7 +126,7 @@ func MakeClientNS(url string, masterSecret []byte, namespace string) ClientInter
 		return MakeClient(url, masterSecret)
 	}
 	rt := hmacauth.ServiceSignerNS(masterSecret, hmacauth.ServiceStoragesvc, namespace,
-		otelhttp.NewTransport(http.DefaultTransport), time.Now)
+		otelhttp.NewTransport(storagesvcBaseTransport), time.Now)
 	return MakeClientWithTransport(url, &namespaceHeaderRoundTripper{namespace: namespace, next: rt})
 }
 
@@ -128,25 +135,38 @@ func MakeClientNS(url string, masterSecret []byte, namespace string) ClientInter
 // the storagesvc client unsigned — the correct backwards-compatible
 // default for installs that have internalAuth disabled.
 func HMACSecretFromEnv() []byte {
-	if s := os.Getenv(internalAuthEnv); s != "" {
+	if s := os.Getenv(fv1.InternalAuthSecretEnv); s != "" {
 		return []byte(s)
 	}
 	return nil
 }
 
-// HMACSecretFromCluster reads the HMAC secret from the
-// fission-internal-auth Secret in the install namespace. Returns
-// (nil, nil) when the Secret does not exist (internalAuth disabled in
-// the chart) so callers can fall back to unsigned requests; returns
-// a descriptive error when the Secret exists but has no usable
-// `secret` key (mis-configured or hand-authored Secret) so callers
-// don't silently fall back to unsigned and confuse 401 debugging
-// downstream.
+// HMACSecretFromCluster reads the HMAC secret from the internal-auth
+// Secret in the install namespace. Returns (nil, nil) when the Secret
+// does not exist (internalAuth disabled in the chart) so callers can
+// fall back to unsigned requests; returns a descriptive error when the
+// Secret exists but has no usable `secret` key (mis-configured or
+// hand-authored Secret) so callers don't silently fall back to unsigned
+// and confuse 401 debugging downstream.
 func HMACSecretFromCluster(ctx context.Context, kubeClient kubernetes.Interface, namespace string) ([]byte, error) {
 	if kubeClient == nil {
 		return nil, nil
 	}
-	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(ctx, internalAuthSecretName, metav1.GetOptions{})
+	// Default the install namespace, because the CLI callers pass
+	// util.GetFissionNamespace() — os.Getenv("FISSION_NAMESPACE") with no
+	// fallback — and a single-install user never exports it. An empty
+	// namespace makes both the executor-Deployment discovery Get and the
+	// Secret Get target unroutable paths that 404, silently demoting every
+	// signed request to unsigned (a 401 with no named cause). The install
+	// namespace defaults to "fission"; this mirrors the workflow-history
+	// path's own fissionNamespace() helper. An operator who installed
+	// elsewhere already has to export FISSION_NAMESPACE for the CLI to find
+	// anything.
+	if namespace == "" {
+		namespace = defaultFissionNamespace
+	}
+	secretName := internalAuthSecretNameFromCluster(ctx, kubeClient, namespace)
+	secret, err := kubeClient.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
@@ -156,9 +176,54 @@ func HMACSecretFromCluster(ctx context.Context, kubeClient kubernetes.Interface,
 	value, ok := secret.Data[internalAuthSecretKey]
 	if !ok || len(value) == 0 {
 		return nil, fmt.Errorf("secret %s/%s exists but has no %q key with a non-empty value; either the chart's internalAuth materialisation has been overridden or the Secret was hand-authored",
-			namespace, internalAuthSecretName, internalAuthSecretKey)
+			namespace, secretName, internalAuthSecretKey)
 	}
 	return value, nil
+}
+
+// internalAuthSecretNameFromCluster resolves which Secret holds the
+// internal-auth master, for callers OUTSIDE the cluster — every
+// HMACSecretFromCluster caller is the CLI on a laptop, where the
+// FISSION_INTERNAL_AUTH_SECRET_NAME variable the chart sets on pods does not
+// exist. With internalAuth.existingSecret pointing the install at a
+// non-default name, resolving only env-or-default made `fission package
+// create` / `archive upload` look up the wrong Secret, get NotFound, and
+// silently send unsigned requests that 401.
+//
+// The cluster itself knows the name: the chart stamps it as a literal env on
+// every control-plane Deployment (internalAuth.envs). Read it off the
+// executor Deployment — present in every install profile. Precedence:
+//
+//  1. an explicitly exported FISSION_INTERNAL_AUTH_SECRET_NAME (user intent,
+//     and the pre-existing escape hatch) wins;
+//  2. the name the running cluster was installed with;
+//  3. the chart default, for auth-disabled installs and pre-name-env charts
+//     (where the follow-up Secret Get correctly finds nothing or the
+//     default).
+//
+// Discovery is deliberately best-effort: ANY error reading the Deployment —
+// absent (old chart), Forbidden (a least-privilege kubeconfig with secrets:get
+// but not deployments:get), or transport — falls through to the default name,
+// because the old code needed only secrets:get and making a Deployment read
+// mandatory would newly break those least-privilege users on the common
+// default-name install. The one configuration this cannot serve — a
+// non-default existingSecret name AND no Deployment read — must set
+// FISSION_INTERNAL_AUTH_SECRET_NAME explicitly (precedence 1).
+func internalAuthSecretNameFromCluster(ctx context.Context, kubeClient kubernetes.Interface, namespace string) string {
+	if name := os.Getenv(fv1.InternalAuthSecretNameEnv); name != "" {
+		return name
+	}
+	depl, err := kubeClient.AppsV1().Deployments(namespace).Get(ctx, "executor", metav1.GetOptions{})
+	if err == nil {
+		for _, c := range depl.Spec.Template.Spec.Containers {
+			for _, e := range c.Env {
+				if e.Name == fv1.InternalAuthSecretNameEnv && e.Value != "" {
+					return e.Value
+				}
+			}
+		}
+	}
+	return fv1.DefaultInternalAuthSecret
 }
 
 // Upload sends the local file pointed to by filePath to the storage
@@ -223,6 +288,8 @@ func (c *client) UploadReader(ctx context.Context, fileName string, r io.Reader,
 	}
 
 	var ur storagesvc.UploadResponse
+	// Decode of JSON produced by our own marshaler (storagesvc.uploadHandler);
+	// plain v2 Unmarshal is safe (no RawMessage).
 	err = json.Unmarshal(body, &ur)
 	if err != nil {
 		return "", err
@@ -256,6 +323,10 @@ func (c *client) List(ctx context.Context) ([]string, error) {
 	}
 
 	var ids []string
+	// Decode of JSON produced by our own marshaler (storagesvc.listItems);
+	// plain v2 Unmarshal is safe (no RawMessage) — a JSON null decodes to the
+	// Go zero value (nil slice), matching v1's nil/empty distinction on the
+	// unmarshal side without any option needed.
 	err = json.Unmarshal(body, &ids)
 	if err != nil {
 		return []string{}, err

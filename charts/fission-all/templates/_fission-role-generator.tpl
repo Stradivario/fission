@@ -5,8 +5,11 @@ kind: Role
 metadata:
 {{- if eq "preupgrade" .component }}
   annotations:
-    helm.sh/hook: pre-upgrade
-    helm.sh/hook-delete-policy: before-hook-creation
+    # pre-install: see the fission.crdsMode helper in _helpers.tpl. Without it
+    # the checker lists Fission CRs on a fresh cluster with no namespaced
+    # grant and the install fails with a 403 AFTER applying the CRDs.
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: hook-succeeded,hook-failed,before-hook-creation
     helm.sh/hook-weight: "-2"
 {{- end }}
   name: "{{ .Release.Name }}-{{ .component }}-fission-cr"
@@ -23,8 +26,17 @@ metadata:
 {{- if eq "mcp" .component }}
 {{- include "mcp-rules" . }}
 {{- end }}
+{{- if eq "workflow" .component }}
+{{- include "workflow-rules" . }}
+{{- end }}
+{{- if eq "statesvc" .component }}
+{{- include "statesvc-rules" . }}
+{{- end }}
 {{- if eq "kafka" .component }}
 {{- include "kafka-rules" . }}
+{{- end }}
+{{- if eq "statestore-mqt" .component }}
+{{- include "statestore-mqt-rules" . }}
 {{- end }}
 {{- if eq "keda" .component }}
 {{- include "keda-rules" . }}
@@ -51,8 +63,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
 {{- if eq "preupgrade" .component }}
   annotations:
-    helm.sh/hook: pre-upgrade
-    helm.sh/hook-delete-policy: before-hook-creation
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: hook-succeeded,hook-failed,before-hook-creation
+    helm.sh/hook-weight: "-1"
 {{- end }}
   name: "{{ .Release.Name }}-{{ .component }}-fission-cr"
   namespace: {{ .namespace }}
@@ -91,6 +104,12 @@ metadata:
 {{- if eq "mcp" .component }}
 {{- include "mcp-rules" . }}
 {{- end }}
+{{- if eq "workflow" .component }}
+{{- include "workflow-rules" . }}
+{{- end }}
+{{- if eq "statesvc" .component }}
+{{- include "statesvc-rules" . }}
+{{- end }}
 {{- if eq "kafka" .component }}
 {{- include "kafka-rules" . }}
 {{- end }}
@@ -108,6 +127,9 @@ metadata:
 {{- end }}
 {{- if eq "executor" .component }}
 {{- include "executor-rules" . }}
+{{- end }}
+{{- if eq "statestore-mqt" .component }}
+{{- include "statestore-mqt-rules" . }}
 {{- end }}
 # Read FissionTenant (cluster-scoped) so the component's resolver-sync keeps its
 # live tenant set current and a runtime-onboarded namespace reaches its

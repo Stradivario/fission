@@ -29,6 +29,33 @@ type HTTPTargetConfig struct {
 	// It is the injection point for HMAC signing of the router internal
 	// listener; loadgen itself stays free of Fission auth code.
 	WrapTransport func(http.RoundTripper) http.RoundTripper
+
+	// ObserveHeader names a response header whose value is captured per
+	// request and handed to Observe. Loadgen stays protocol-generic: the
+	// caller decides what the header means (Fission's upgrade scoring reads
+	// the RFC-0015 X-Fission-Component attribution header through this).
+	ObserveHeader string
+	// Observe, if set, is called once per issued request from the request
+	// goroutine. It must be safe for concurrent use.
+	Observe func(Observation)
+}
+
+// Observation is one issued request's outcome, as seen by the client.
+type Observation struct {
+	// Status is the HTTP status code, or 0 when the request produced no
+	// response at all (dial error, connection reset, client timeout) — the
+	// transport-level failures a status-only view cannot distinguish from
+	// the load driver's own saturation accounting.
+	Status int
+	// HeaderVal is the response's ObserveHeader value ("" when absent or on
+	// transport error).
+	HeaderVal string
+	// Err is nil exactly when the request completed with a 2xx status.
+	Err error
+	// Latency is the client-side request duration, including any transport
+	// error path — a 30s value on a transport failure is a client timeout,
+	// which reads very differently from a fast connection refusal.
+	Latency time.Duration
 }
 
 // HTTPTarget is a reusable, tuned HTTP client bound to one request shape. Its
@@ -75,14 +102,27 @@ func (t *HTTPTarget) Do(ctx context.Context) (int64, error) {
 	if t.cfg.Headers != nil {
 		req.Header = maps.Clone(t.cfg.Headers)
 	}
+	start := time.Now()
 	resp, err := t.client.Do(req)
 	if err != nil {
+		if t.cfg.Observe != nil {
+			t.cfg.Observe(Observation{Err: err, Latency: time.Since(start)})
+		}
 		return 0, err
 	}
 	defer resp.Body.Close()
 	n, _ := io.Copy(io.Discard, resp.Body)
+	var statusErr error
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return n, fmt.Errorf("unexpected status %d", resp.StatusCode)
+		statusErr = fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
-	return n, nil
+	if t.cfg.Observe != nil {
+		t.cfg.Observe(Observation{
+			Status:    resp.StatusCode,
+			HeaderVal: resp.Header.Get(t.cfg.ObserveHeader),
+			Err:       statusErr,
+			Latency:   time.Since(start),
+		})
+	}
+	return n, statusErr
 }

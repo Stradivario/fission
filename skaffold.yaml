@@ -29,6 +29,17 @@ manifests:
         namespace: fission
         setValues:
           analytics: "false"
+          # Single replicas for local/CI clusters. The chart defaults to 2 for
+          # router and webhook (RFC-0028: a single replica makes every rollout
+          # an outage), but a kind runner has ~4 vCPU and doubling both control
+          # -plane front ends starves the builders and the executor — which
+          # surfaces as builds stuck in "running" and executor RPC deadlines
+          # across unrelated tests, not as an obvious capacity error.
+          router.replicas: "1"
+          webhook.replicas: "1"
+          # RFC-0024 async invocation needs the RFC-0021 statestore; enable both
+          # (embedded SQLite) so the integration suite can exercise async invoke.
+          asyncInvocation.enabled: "true"
           builderNamespace: ""
           builderPodSpec.enabled: "false"
           canaryDeployment.enabled: "false"
@@ -40,6 +51,8 @@ manifests:
           fetcher.allowInsecureRegistries: ""
           fetcher.imageTag: ""
           functionNamespace: ""
+          # RFC-0023 keyed state rides the same statestore (statesvc head).
+          functionState.enabled: "true"
           gatewayAPI.enabled: "false"
           gatewayAPI.defaultParentRef: ""
           grafana.dashboards.enabled: "false"
@@ -67,6 +80,10 @@ manifests:
           serviceMonitor.additionalServiceMonitorLabels.release: prometheus
           serviceMonitor.enabled: "false"
           serviceMonitor.namespace: monitoring
+          statestore.enabled: "true"
+          statestore.mode: "embedded"
+          # RFC-0022 durable workflows ride the same statestore.
+          workflows.enabled: "true"
           storagesvc.archivePruner.enabled: "true"
           storagesvc.archivePruner.interval: "60"
           # Multi-namespace tenancy is static by default; the dynamic-tenancy and
@@ -76,10 +93,10 @@ manifests:
           terminationMessagePath: /var/log/termination-log
           terminationMessagePolicy: FallbackToLogsOnError
         setValueTemplates:
-          fetcher.image: '{{.IMAGE_FULLY_QUALIFIED_fetcher}}'
-          image: '{{.IMAGE_FULLY_QUALIFIED_fission_bundle}}'
-          postInstallReportImage: '{{.IMAGE_FULLY_QUALIFIED_reporter}}'
-          preUpgradeChecks.image: '{{.IMAGE_FULLY_QUALIFIED_pre_upgrade_checks}}'
+          fetcher.image: "{{.IMAGE_FULLY_QUALIFIED_fetcher}}"
+          image: "{{.IMAGE_FULLY_QUALIFIED_fission_bundle}}"
+          postInstallReportImage: "{{.IMAGE_FULLY_QUALIFIED_reporter}}"
+          preUpgradeChecks.image: "{{.IMAGE_FULLY_QUALIFIED_pre_upgrade_checks}}"
         wait: true
 deploy:
   helm: {}
@@ -92,6 +109,12 @@ profiles:
       - op: replace
         path: /manifests/helm/releases/0/setValues/routerServiceType
         value: NodePort
+      - op: add
+        path: /manifests/helm/releases/0/setValues/executor.provisionedConcurrency.enabled
+        value: "true"
+      - op: add
+        path: /manifests/helm/releases/0/setValues/executor.provisionedConcurrency.reconcileInterval
+        value: "10s"
   - name: kind-debug
     patches:
       - op: replace
@@ -179,6 +202,23 @@ profiles:
       # The RFC-0002 EndpointSlice data plane is on by chart default (phase 4);
       # one workflow leg pins the router back to mode=off post-deploy so the
       # legacy RPC path stays covered.
+
+      # Enable executor debug logging (DEBUG_ENV=true) in CI so flaky-test
+      # root-causing can inspect SetSvcValue/UnTapService/MarkAvailable traces.
+      - op: replace
+        path: /manifests/helm/releases/0/setValues/debugEnv
+        value: true
+
+      # Enable the RFC-0026 provisioned-concurrency provisioner (keep N pods
+      # warm) and shorten its periodic reconcile tick from the 30s chart
+      # default to 10s so self-heal-after-pod-delete integration tests
+      # converge faster. Paired with the TestProvisionedConcurrency* suite.
+      - op: add
+        path: /manifests/helm/releases/0/setValues/executor.provisionedConcurrency.enabled
+        value: "true"
+      - op: add
+        path: /manifests/helm/releases/0/setValues/executor.provisionedConcurrency.reconcileInterval
+        value: "10s"
   # dynamic-tenancy turns on multi-namespace tenancy (the dynamic, restart-free
   # onboarding model). Composed onto kind-ci as `-p kind-ci,dynamic-tenancy` on
   # the non-legacy CI legs, so the whole suite runs against a dynamic-mode

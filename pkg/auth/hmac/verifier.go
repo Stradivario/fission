@@ -5,10 +5,9 @@
 package hmac
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -74,10 +73,36 @@ type VerifierOpts struct {
 	// The cap is only applied when enforcement is on (Secret non-empty); the
 	// pass-through short-circuit deliberately leaves the body untouched.
 	MaxBodyBytes int64
+	// SpoolThresholdBytes, when positive, bounds how much of the request body
+	// the verifier holds in memory while hashing: bodies up to the threshold
+	// stay in memory as before, larger ones spool to a temp file that the
+	// re-injected r.Body reads back from — so verifier memory is bounded by
+	// the threshold (not MaxBodyBytes) per request. Zero or negative keeps
+	// the fully in-memory behavior. The trade is a disk write+read for
+	// spooled bodies: set it on listeners where large bodies are real
+	// (storagesvc archive uploads) and leave it off on latency-sensitive
+	// ones (the router internal listener).
+	//
+	// Contract: a spooled request's re-injected r.Body is backed by the temp
+	// file, which the middleware removes when the handler RETURNS. Handlers
+	// must finish reading the body synchronously — retaining it for a
+	// goroutine that outlives ServeHTTP reads a closed file. (The in-memory
+	// path hands out a detached reader with no such bound, so code must not
+	// rely on that leniency.) Spool files go to os.TempDir; for the on-disk
+	// footprint and ephemeral-storage sizing rule, see the "Maximum body
+	// size" section of docs/internal-auth/00-design.md.
+	SpoolThresholdBytes int64
 	// Logger receives V(1) messages on each rejection. The zero value is
 	// substituted with logr.Discard() at construction so callers that don't
 	// care about audit logs don't crash. Rejection log lines deliberately
-	// omit the signature and timestamp values to avoid log poisoning.
+	// omit the signature and timestamp values to avoid log poisoning;
+	// body-read rejections do include the I/O error string (which for
+	// malformed client framing can quote escaped client-chosen bytes) —
+	// that is the debugging signal, and the logr encoder bounds it.
+	// Spool-storage faults log at error level, not V(1): they fire during
+	// the pre-verification drain, so during a disk fault expect one
+	// error-level line per over-threshold request from any allowlisted
+	// peer, signed or not — the loud signal a broken disk should produce.
 	Logger logr.Logger
 	// KeysFromRequestLabeled, when set, supplies the ordered candidate keys to try
 	// for each request, each tagged with the principal namespace recorded (via
@@ -176,40 +201,45 @@ func Verifier(opts VerifierOpts) func(http.Handler) http.Handler {
 				return
 			}
 
-			var body []byte
+			bodyHash := emptyBodyHashHex
 			if r.Body != nil {
 				if opts.MaxBodyBytes > 0 {
 					r.Body = http.MaxBytesReader(w, r.Body, opts.MaxBodyBytes)
 				}
-				body, err = io.ReadAll(r.Body)
-				if err != nil {
-					var maxErr *http.MaxBytesError
-					if errors.As(err, &maxErr) {
-						opts.Logger.V(1).Info("HMAC verification failed",
-							"reason", "body exceeds MaxBodyBytes",
-							"method", r.Method, "path", r.URL.Path,
-							"remoteAddr", r.RemoteAddr,
-							"limit", maxErr.Limit)
-						w.WriteHeader(http.StatusRequestEntityTooLarge)
-						return
-					}
-					opts.Logger.V(1).Info("HMAC verification failed",
-						"reason", "body read error",
-						"method", r.Method, "path", r.URL.Path,
-						"remoteAddr", r.RemoteAddr)
-					w.WriteHeader(http.StatusUnauthorized)
+				// Spooling disabled resolves to an effectively-infinite
+				// threshold: the single drain path below then keeps every
+				// body in memory, which is the historical behavior.
+				spoolAt := opts.SpoolThresholdBytes
+				if spoolAt <= 0 {
+					spoolAt = math.MaxInt64 - 1
+				}
+				spool, spoolErr := spoolBody(r.Body, spoolAt)
+				if spoolErr != nil {
+					rejectBodyReadError(w, r, opts.Logger, spoolErr)
 					return
 				}
-				r.Body = io.NopCloser(bytes.NewReader(body))
+				// The temp file (if the body spilled) must outlive the
+				// downstream handler, which reads the re-injected body
+				// from it; remove it once the handler returns.
+				defer spool.cleanup()
+				body, readerErr := spool.reader()
+				if readerErr != nil {
+					rejectBodyReadError(w, r, opts.Logger, readerErr)
+					return
+				}
+				bodyHash = spool.hashHex
+				r.Body = body
 			}
 
 			// Sign over RequestURI (path + raw query) so query parameters
-			// like ?id= are bound to the signature. Try each candidate key in
-			// order (active, then rotation, or the per-request namespace keys);
-			// constant-time compare happens inside Verify per candidate.
+			// like ?id= are bound to the signature. The body was hashed ONCE
+			// while draining it; try each candidate key in order (active,
+			// then rotation, or the per-request namespace keys) against the
+			// same hash; constant-time compare happens inside VerifyFromHash
+			// per candidate.
 			ru := r.URL.RequestURI()
 			for _, c := range opts.labeledCandidates(r) {
-				if len(c.Key) > 0 && Verify(c.Key, r.Method, ru, body, tsNum, sig) {
+				if len(c.Key) > 0 && VerifyFromHash(c.Key, r.Method, ru, bodyHash, tsNum, sig) {
 					// Record the principal whose key matched so downstream
 					// handlers authorize on the authenticated namespace rather
 					// than a caller-controlled header.
@@ -225,4 +255,38 @@ func Verifier(opts VerifierOpts) func(http.Handler) http.Handler {
 			w.WriteHeader(http.StatusUnauthorized)
 		})
 	}
+}
+
+// rejectBodyReadError writes the response for a body the verifier could not
+// drain, classifying by fault domain: an *http.MaxBytesError means the body
+// exceeded MaxBodyBytes (413, the caller sent too much); a *spoolIOError
+// means the verifier's own spool storage failed (500 at error log level —
+// the server's disk is broken, and answering 401 would send operators
+// debugging HMAC configuration during a disk fault); anything else is an
+// error reading from the client (401). The underlying error is logged in
+// every arm — it is an I/O error string, not caller-controlled auth data,
+// so the no-signature-values-in-logs stance is preserved.
+func rejectBodyReadError(w http.ResponseWriter, r *http.Request, logger logr.Logger, err error) {
+	if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		logger.V(1).Info("HMAC verification failed",
+			"reason", "body exceeds MaxBodyBytes",
+			"method", r.Method, "path", r.URL.Path,
+			"remoteAddr", r.RemoteAddr,
+			"limit", maxErr.Limit)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+	if spErr, ok := errors.AsType[*spoolIOError](err); ok {
+		logger.Error(spErr, "HMAC verifier could not spool the request body",
+			"method", r.Method, "path", r.URL.Path,
+			"remoteAddr", r.RemoteAddr)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	logger.V(1).Info("HMAC verification failed",
+		"reason", "body read error",
+		"method", r.Method, "path", r.URL.Path,
+		"remoteAddr", r.RemoteAddr,
+		"error", err.Error())
+	w.WriteHeader(http.StatusUnauthorized)
 }

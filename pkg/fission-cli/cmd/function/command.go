@@ -21,18 +21,28 @@ func Commands() *cobra.Command {
 		Optional: []flag.Flag{
 			flag.FnEnvName, flag.FnEntryPoint, flag.FnPkgName,
 			flag.FnExecutorType, flag.FnCfgMap, flag.FnSecret,
+			flag.FnEnvVar, flag.FnEnvFromSecret, flag.FnEnvFromConfigMap,
 			flag.FnSpecializationTimeout, flag.FnExecutionTimeout,
 			flag.FnIdleTimeout, flag.FnConcurrency, flag.FnRequestsPerPod,
 			flag.FnStreaming, flag.FnStreamingProtocol,
 			flag.FnStreamingIdleTimeout, flag.FnStreamingMaxDuration,
 			flag.FnExposeAsMCP, flag.FnToolDescription,
 			flag.FnToolInputSchema, flag.FnToolName,
+			flag.FnState, flag.FnStateKeyspace, flag.FnStateMaxKeys,
+			flag.FnStateMaxValueBytes, flag.FnStateTTL,
+			flag.FnStateStickySource, flag.FnStateStickyName,
+			flag.FnAsyncMaxAttempts, flag.FnAsyncMaxAge,
+			flag.FnAsyncOnSuccess, flag.FnAsyncOnFailure,
+			flag.FnAsyncOnSuccessTopic, flag.FnAsyncOnFailureTopic,
 			flag.FnOnceOnly, flag.Labels, flag.Annotation, flag.FnRetainPods,
+			flag.FnProvisionedConcurrency,
+			flag.FnVersioning, flag.FnRetainVersions,
+			flag.FnProvisionedSchedule,
 
 			// TODO retired pkg & trigger related flags from function cmd
 			flag.PkgCode, flag.PkgSrcArchive, flag.PkgDeployArchive,
 			flag.PkgSrcChecksum, flag.PkgDeployChecksum, flag.PkgInsecure,
-			flag.PkgOCI, flag.FnBuildCmd,
+			flag.PkgOCI, flag.FnBuildCmd, flag.PkgWatch, flag.PkgWatchTimeout,
 
 			flag.HtUrl, flag.HtPrefix, flag.HtMethod,
 
@@ -49,7 +59,7 @@ func Commands() *cobra.Command {
 		Short:   "Get function source code",
 	}, Get, flag.FlagSet{
 		Required: []flag.Flag{flag.FnName},
-		Optional: []flag.Flag{},
+		Optional: []flag.Flag{flag.FnGetVersion},
 	})
 
 	getmetaCmd := wrapper.SubCommand(&cobra.Command{
@@ -67,7 +77,11 @@ func Commands() *cobra.Command {
 		Short:   "Describe a function's health in one view (summary, conditions, build, pods)",
 	}, Describe, flag.FlagSet{
 		Required: []flag.Flag{flag.FnName},
-		Optional: []flag.Flag{},
+		Optional: []flag.Flag{
+			// RFC-0025: --version swaps the live view for the SNAPSHOT
+			// inspector of one pinned FunctionVersion.
+			flag.FnDescribeVersion,
+		},
 	})
 
 	updateCmd := wrapper.SubCommand(&cobra.Command{
@@ -79,13 +93,23 @@ func Commands() *cobra.Command {
 		Optional: []flag.Flag{
 			flag.FnEnvName, flag.FnEntryPoint, flag.FnPkgName,
 			flag.FnExecutorType, flag.FnSecret, flag.FnCfgMap,
+			flag.FnEnvVar, flag.FnEnvFromSecret, flag.FnEnvFromConfigMap,
 			flag.FnSpecializationTimeout, flag.FnExecutionTimeout,
 			flag.FnIdleTimeout, flag.FnConcurrency, flag.FnRequestsPerPod,
 			flag.FnStreaming, flag.FnStreamingProtocol,
 			flag.FnStreamingIdleTimeout, flag.FnStreamingMaxDuration,
 			flag.FnExposeAsMCP, flag.FnToolDescription,
 			flag.FnToolInputSchema, flag.FnToolName,
+			flag.FnState, flag.FnStateKeyspace, flag.FnStateMaxKeys,
+			flag.FnStateMaxValueBytes, flag.FnStateTTL,
+			flag.FnStateStickySource, flag.FnStateStickyName,
+			flag.FnAsyncMaxAttempts, flag.FnAsyncMaxAge,
+			flag.FnAsyncOnSuccess, flag.FnAsyncOnFailure,
+			flag.FnAsyncOnSuccessTopic, flag.FnAsyncOnFailureTopic,
 			flag.FnOnceOnly, flag.Labels, flag.Annotation, flag.FnRetainPods,
+			flag.FnProvisionedConcurrency,
+			flag.FnVersioning, flag.FnRetainVersions,
+			flag.FnProvisionedSchedule,
 
 			flag.PkgCode, flag.PkgSrcArchive, flag.PkgDeployArchive,
 			flag.PkgSrcChecksum, flag.PkgDeployChecksum, flag.PkgInsecure,
@@ -126,7 +150,10 @@ func Commands() *cobra.Command {
 		Optional: []flag.Flag{
 			flag.FnLogFollow, flag.FnLogReverseQuery, flag.FnLogCount,
 			flag.FnLogDetail, flag.FnLogPod, flag.FnLogDBType, flag.NamespacePod, flag.FnLogAllPods,
-			flag.FnLogRequestID, flag.FnLogTraceID, flag.FnLogLevel},
+			flag.FnLogRequestID, flag.FnLogTraceID, flag.FnLogLevel,
+			// RFC-0025: read logs for a specific alias/version's pods.
+			flag.FnLogAlias, flag.FnLogVersion,
+		},
 	})
 
 	testCmd := wrapper.SubCommand(&cobra.Command{
@@ -136,10 +163,13 @@ func Commands() *cobra.Command {
 	}, Test, flag.FlagSet{
 		Required: []flag.Flag{flag.FnName},
 		Optional: []flag.Flag{flag.HtMethod, flag.FnTestHeader, flag.FnTestBody,
-			flag.FnTestQuery, flag.FnTestTimeout,
+			flag.FnTestQuery, flag.FnTestTimeout, flag.FnTestAsync,
 			// for getting log from log database if we failed to get logs from function pod.
 			flag.FnLogDBType,
 			flag.FnSubPath,
+			// RFC-0025: test a specific alias (e.g. prod) or pinned version
+			// instead of the live function.
+			flag.FnTestAlias, flag.FnTestVersion,
 		},
 	})
 
@@ -163,7 +193,7 @@ func Commands() *cobra.Command {
 			flag.FnRunEnvVersion, flag.FnEntryPoint, flag.FnPort,
 			flag.HtMethod, flag.FnTestHeader, flag.FnTestBody, flag.FnSubPath,
 			flag.FnRunKeep, flag.FnRunWatch, flag.FnRunEnvVar, flag.FnRunEnvFile,
-			flag.FnSecret, flag.FnCfgMap, flag.FnRunDebugPort,
+			flag.FnSecret, flag.FnCfgMap, flag.FnSecretMount, flag.FnCfgMapMount, flag.FnRunDebugPort,
 			flag.FnRunBuild, flag.FnRunBuilderImage, flag.FnBuildCmd,
 		},
 	})
@@ -177,6 +207,7 @@ func Commands() *cobra.Command {
 		Optional: []flag.Flag{
 			flag.FnPort, flag.FnCommand, flag.FnArgs,
 			flag.FnCfgMap, flag.FnSecret,
+			flag.FnEnvVar, flag.FnEnvFromSecret, flag.FnEnvFromConfigMap,
 			flag.FnExecutionTimeout,
 			flag.FnIdleTimeout,
 			flag.FnTerminationGracePeriod,
@@ -202,6 +233,7 @@ func Commands() *cobra.Command {
 			flag.FnImageName, flag.FnPort,
 			flag.FnCommand, flag.FnArgs,
 			flag.FnSecret, flag.FnCfgMap,
+			flag.FnEnvVar, flag.FnEnvFromSecret, flag.FnEnvFromConfigMap,
 			flag.FnExecutionTimeout, flag.FnIdleTimeout,
 			flag.Labels, flag.Annotation,
 
@@ -220,7 +252,11 @@ func Commands() *cobra.Command {
 		Long:    "List pods currently used by a function",
 	}, ListPods, flag.FlagSet{
 		Required: []flag.Flag{flag.FnName},
-		Optional: []flag.Flag{},
+		Optional: []flag.Flag{
+			// RFC-0025: list pods for a specific alias/version instead of all
+			// of the function's pods.
+			flag.FnPodsAlias, flag.FnPodsVersion,
+		},
 	})
 
 	waitCmd := wrapper.SubCommand(&cobra.Command{
@@ -238,13 +274,61 @@ func Commands() *cobra.Command {
 		Optional: []flag.Flag{flag.Output},
 	})
 
+	publishCmd := wrapper.SubCommand(&cobra.Command{
+		Use:   "publish",
+		Short: "Publish the function's current spec as an immutable version",
+		Long: "Publish the function's current spec as an immutable FunctionVersion snapshot (RFC-0025); " +
+			"idempotent -- called again with an unchanged spec and package digest, it returns the existing " +
+			"newest version instead of minting a duplicate. --output/-o accepts: (default table) prints " +
+			"\"created <name>\" or \"unchanged <name>\"; \"name\" prints only the bare FunctionVersion name, " +
+			"one line, for scripting (mirrors kubectl's -o name); \"json\"/\"yaml\" marshal the full " +
+			"FunctionVersion object; \"wide\" renders the same as the default table (no extra columns).",
+	}, Publish, flag.FlagSet{
+		Required: []flag.Flag{flag.FnName},
+		Optional: []flag.Flag{flag.PublishDescription, flag.PublishWait, flag.WaitTimeout, flag.Output},
+	})
+
+	versionsCmd := wrapper.SubCommand(&cobra.Command{
+		Use:   "versions",
+		Short: "List a function's published versions",
+	}, Versions, flag.FlagSet{
+		Required: []flag.Flag{flag.FnName},
+		Optional: []flag.Flag{flag.Output},
+	})
+
+	rollbackCmd := wrapper.SubCommand(&cobra.Command{
+		Use:   "rollback",
+		Short: "Roll a function alias back to a previous FunctionVersion (RFC-0025)",
+		Long: "Repoint a FunctionAlias at a previously resolved FunctionVersion: by default the alias's " +
+			"previous target (Status.History's last entry), or an explicit --to version. Always a full " +
+			"repoint — clears Weight/SecondaryVersion, so a rollback issued mid-canary stops the traffic " +
+			"split rather than only rolling back the primary target. Refuses to touch an alias managed by " +
+			"`fission spec` (Git) unless --detach. For a one-off repoint to a version you already know, " +
+			"see `fission alias update --version --wait` instead.",
+	}, Rollback, flag.FlagSet{
+		Required: []flag.Flag{flag.FnName, flag.FnRollbackAlias},
+		Optional: []flag.Flag{flag.FnRollbackTo, flag.FnRollbackDetach, flag.FnRollbackWait, flag.WaitTimeout},
+	})
+
+	gcVersionsCmd := wrapper.SubCommand(&cobra.Command{
+		Use:   "gc-versions",
+		Short: "Sweep a function's old FunctionVersions down to its retain floor (RFC-0025)",
+		Long: "Runs one on-demand retention-GC sweep, the same engine the buildermgr-hosted controller runs " +
+			"automatically. Never deletes a version referenced by any FunctionAlias, or the newest/only " +
+			"version, however low --keep is set.",
+	}, GCVersions, flag.FlagSet{
+		Required: []flag.Flag{flag.FnName},
+		Optional: []flag.Flag{flag.GCVersionsKeep},
+	})
+
 	command := &cobra.Command{
 		Use:     "function",
 		Aliases: []string{"fn"},
 		Short:   "Create, update and manage functions",
 	}
 	command.AddCommand(createCmd, getCmd, getmetaCmd, describeCmd, updateCmd, deleteCmd, listCmd, logsCmd, testCmd,
-		runLocalCmd, runContainerCmd, updateContainerCmd, listPodsCmd, waitCmd, toolsCmd)
+		runLocalCmd, runContainerCmd, updateContainerCmd, listPodsCmd, waitCmd, toolsCmd, publishCmd, versionsCmd,
+		rollbackCmd, gcVersionsCmd, DLQCommands(), StateCommands())
 
 	return command
 }

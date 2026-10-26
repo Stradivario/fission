@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
@@ -29,9 +30,11 @@ import (
 	"github.com/fission/fission/pkg/controller"
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/generated/clientset/versioned/scheme"
+	"github.com/fission/fission/pkg/router/streaming"
 	storagesvcClient "github.com/fission/fission/pkg/storagesvc/client"
 	"github.com/fission/fission/pkg/utils/crmanager"
 	"github.com/fission/fission/pkg/utils/httpserver"
+	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
 // envAllowInsecure, when "true", permits the MCP server to start without a
@@ -90,7 +93,20 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		return fmt.Errorf("refusing to start MCP server without authentication: set JWT_SIGNING_KEY to scope agent access, or %s=true to explicitly run the endpoint unauthenticated (dev only)", envAllowInsecure)
 	}
 
-	proxy := NewProxy(routerInternalURL, storagesvcClient.HMACSecretFromEnv(), logger)
+	// Honor the same cluster-wide streaming idle-timeout override the router
+	// applies to IdleTimeoutSeconds=0 functions (pkg/router/config.go), with
+	// the shared validation — a function must get one idle policy regardless
+	// of whether it is invoked via HTTPTrigger or tools/call. Unset (zero)
+	// keeps the fv1.DefaultStreamIdleSeconds package default.
+	var streamIdleDefault time.Duration
+	if v := os.Getenv("ROUTER_STREAM_IDLE_TIMEOUT"); v != "" {
+		d, perr := streaming.ParseIdleTimeout("ROUTER_STREAM_IDLE_TIMEOUT", v)
+		if perr != nil {
+			return perr
+		}
+		streamIdleDefault = d
+	}
+	proxy := NewProxy(routerInternalURL, storagesvcClient.HMACSecretFromEnv(), logger, streamIdleDefault)
 	registry := NewRegistry()
 	server := NewServer(registry, proxy, authz, logger)
 
@@ -120,6 +136,19 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		return fmt.Errorf("error registering mcp function reconciler: %w", err)
 	}
 
+	// RFC-0025: re-reconcile a Tool-bearing Function's entry when the
+	// FunctionAlias it targets repoints. Permissive predicates -- see
+	// FunctionAliasToolReconciler's doc comment on why the default
+	// GenerationChangedPredicate would drop every resolver repoint.
+	aliasR := &FunctionAliasToolReconciler{
+		logger: logger.WithName("function_alias_tool_reconciler"),
+		client: crMgr.GetClient(),
+		tool:   r,
+	}
+	if err := controller.RegisterTenantScopedWithPredicates(crMgr, &fv1.FunctionAlias{}, aliasR, "mcp-functionalias", 0); err != nil {
+		return fmt.Errorf("error registering mcp functionalias reconciler: %w", err)
+	}
+
 	// ready flips true once the Function cache has synced (the manager starts
 	// added runnables only after cache sync), so a replica reports ready only
 	// after its registry is being populated. Without this an agent that connects
@@ -144,7 +173,18 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
-	mux.Handle("/mcp", server.HTTPHandler())
+	// Server spans on the /mcp mount only -- NOT the whole mux (/healthz and
+	// /readyz stay unspanned, kubelet-probe-noise-free, by simply never being
+	// wrapped, no filter list needed). otel wraps OUTSIDE authz.HTTPMiddleware
+	// (already inside server.HTTPHandler()), matching the router-public
+	// precedent (otelUtils.GetHandlerWithOTEL wraps outside the
+	// per-route auth wrapper so an unauthenticated 401/403 still gets a
+	// span). No filter is needed here: the MCP transport has no
+	// infinite-lifetime SSE route -- streaming tool calls ride the POST
+	// request's own SSE response (progress notifications), which completes
+	// when the buffered CallToolResult returns, so its server span has the
+	// same bounded lifetime as any other POST /mcp request.
+	mux.Handle("/mcp", otelUtils.GetHandlerWithOTEL(server.HTTPHandler(), "fission-mcp"))
 	mgr.Go(func() error {
 		httpserver.Serve(ctx, logger, mgr, httpserver.ServerOptions{
 			Name: "mcp", Addr: strconv.Itoa(opts.Port), Listener: opts.Listener, Handler: mux,

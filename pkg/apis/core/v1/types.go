@@ -8,7 +8,9 @@ import (
 	asv2 "k8s.io/api/autoscaling/v2"
 	apiv1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -27,6 +29,62 @@ const (
 	// RouteProviderGateway creates a gateway.networking.k8s.io HTTPRoute.
 	RouteProviderGateway RouteProviderType = "gateway"
 )
+
+// Workflow state kinds (RFC-0022). The enum marker on WorkflowStateType must
+// list exactly these values; both grow together as later phases add
+// Parallel/Map/Wait.
+const (
+	WorkflowStateTask     WorkflowStateType = "Task"
+	WorkflowStateChoice   WorkflowStateType = "Choice"
+	WorkflowStateParallel WorkflowStateType = "Parallel"
+	WorkflowStateMap      WorkflowStateType = "Map"
+	WorkflowStateWait     WorkflowStateType = "Wait"
+	WorkflowStateSucceed  WorkflowStateType = "Succeed"
+	WorkflowStateFail     WorkflowStateType = "Fail"
+)
+
+// WorkflowRun lifecycle phases.
+const (
+	WorkflowRunPending   WorkflowRunPhase = "Pending"
+	WorkflowRunRunning   WorkflowRunPhase = "Running"
+	WorkflowRunSucceeded WorkflowRunPhase = "Succeeded"
+	WorkflowRunFailed    WorkflowRunPhase = "Failed"
+	WorkflowRunCancelled WorkflowRunPhase = "Cancelled"
+	WorkflowRunTimedOut  WorkflowRunPhase = "TimedOut"
+)
+
+// Built-in workflow error classes: the wire contract Catch routes on. A
+// function signals a typed error by returning non-2xx with a JSON body
+// {"errorType": "<Name>", "cause": ...}; these built-ins classify everything
+// else (4xx = permanent, 5xx/transport = retryable, attempt timeout).
+const (
+	WorkflowErrAll             = "Fission.All"
+	WorkflowErrPermanentError  = "Fission.PermanentError"
+	WorkflowErrFunctionError   = "Fission.FunctionError"
+	WorkflowErrTimeout         = "Fission.Timeout"
+	WorkflowErrInvalidPath     = "Fission.InvalidPath"
+	WorkflowErrNoChoiceMatched = "Fission.NoChoiceMatched"
+	// WorkflowErrFailed is the class a bare Fail state fails the run with.
+	WorkflowErrFailed = "Fission.Failed"
+	// WorkflowErrBranchFailed is the class a Parallel/Map state fails with
+	// when a branch fails terminally (fail-fast); a Catch on the state may
+	// route it.
+	WorkflowErrBranchFailed = "Fission.BranchFailed"
+)
+
+// WorkflowBuiltinErrorTypes is the canonical list of the classes above —
+// consumers (e.g. the webhook's typo warning) derive lookups from it rather
+// than re-enumerating the constants and drifting.
+var WorkflowBuiltinErrorTypes = []string{
+	WorkflowErrAll,
+	WorkflowErrPermanentError,
+	WorkflowErrFunctionError,
+	WorkflowErrTimeout,
+	WorkflowErrInvalidPath,
+	WorkflowErrNoChoiceMatched,
+	WorkflowErrFailed,
+	WorkflowErrBranchFailed,
+}
 
 //
 // To add a Fission CRD type:
@@ -289,6 +347,541 @@ type (
 	}
 
 	//
+	// Workflows (RFC-0022)
+	//
+
+	// Workflow declares a durable state machine whose task states are Fission
+	// functions (RFC-0022). The engine executes WorkflowRuns against a snapshot
+	// of this spec embedded in the run's event stream; editing a Workflow never
+	// changes in-flight runs.
+	// +genclient
+	// +kubebuilder:object:root=true
+	// +kubebuilder:subresource:status
+	// +kubebuilder:resource:scope="Namespaced",shortName={wf}
+	// +kubebuilder:printcolumn:name="StartAt",type=string,JSONPath=`.spec.startAt`
+	// +kubebuilder:printcolumn:name="Validated",type=string,JSONPath=`.status.conditions[?(@.type=="Validated")].status`
+	// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+	Workflow struct {
+		metav1.TypeMeta   `json:",inline"`
+		metav1.ObjectMeta `json:"metadata"`
+		Spec              WorkflowSpec `json:"spec"`
+		// +optional
+		Status WorkflowStatus `json:"status,omitempty"`
+	}
+
+	// WorkflowList is a list of Workflows.
+	// +kubebuilder:object:root=true
+	WorkflowList struct {
+		metav1.TypeMeta `json:",inline"`
+		metav1.ListMeta `json:"metadata"`
+		Items           []Workflow `json:"items"`
+	}
+
+	// WorkflowRun is one execution of a Workflow. Full step history lives in
+	// the statestore EventLog stream for the run, never in etcd; status carries
+	// a bounded tail for kubectl visibility.
+	// +genclient
+	// +kubebuilder:object:root=true
+	// +kubebuilder:subresource:status
+	// +kubebuilder:resource:scope="Namespaced",shortName={wfr}
+	// +kubebuilder:printcolumn:name="Workflow",type=string,JSONPath=`.spec.workflowRef`
+	// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+	// +kubebuilder:printcolumn:name="Started",type=date,JSONPath=`.status.startedAt`
+	// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+	WorkflowRun struct {
+		metav1.TypeMeta   `json:",inline"`
+		metav1.ObjectMeta `json:"metadata"`
+		Spec              WorkflowRunSpec `json:"spec"`
+		// +optional
+		Status WorkflowRunStatus `json:"status,omitempty"`
+	}
+
+	// WorkflowRunList is a list of WorkflowRuns.
+	// +kubebuilder:object:root=true
+	WorkflowRunList struct {
+		metav1.TypeMeta `json:",inline"`
+		metav1.ListMeta `json:"metadata"`
+		Items           []WorkflowRun `json:"items"`
+	}
+
+	// WorkflowStateType enumerates the state kinds the engine executes.
+	// +kubebuilder:validation:Enum=Task;Choice;Parallel;Map;Wait;Succeed;Fail
+	WorkflowStateType string
+
+	// WorkflowSpec is a state machine: states are data, logic lives in
+	// functions.
+	WorkflowSpec struct {
+		// StartAt names the state execution begins at.
+		StartAt string `json:"startAt"`
+
+		// States is the state machine graph, keyed by state name. The size
+		// bound mirrors validation.MaxWorkflowStates and lets the apiserver's
+		// CEL cost estimator bound rules on nested types.
+		// +kubebuilder:validation:MinProperties=1
+		// +kubebuilder:validation:MaxProperties=100
+		States map[string]WorkflowState `json:"states"`
+
+		// DefaultRetry applies to Task states that do not set their own Retry.
+		// +optional
+		DefaultRetry *RetryPolicy `json:"defaultRetry,omitempty"`
+
+		// Timeout bounds a whole run; expiry fails it with errorType
+		// Fission.Timeout. Defaults to 24h (a mis-authored graph or endlessly
+		// caught-and-retried loop must not hold an active run forever).
+		// +optional
+		Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+		// HistoryRetention bounds stored history (count + age) per finished run.
+		// +optional
+		HistoryRetention *WorkflowRetentionPolicy `json:"historyRetention,omitempty"`
+	}
+
+	// WorkflowState is one state in the machine. Exactly the fields for its
+	// Type may be set (enforced at admission).
+	WorkflowState struct {
+		Type WorkflowStateType `json:"type"`
+
+		// Function is the Task state's target.
+		// +optional
+		Function *FunctionReference `json:"function,omitempty"`
+
+		// Timeout bounds one attempt of a Task invocation.
+		// +optional
+		Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+		// Retry overrides the workflow's DefaultRetry for this Task.
+		// +optional
+		Retry *RetryPolicy `json:"retry,omitempty"`
+
+		// Catch routes a failed Task (retries exhausted, or a permanent error)
+		// to another state by matched errorType; first match wins.
+		// +optional
+		Catch []WorkflowCatchRoute `json:"catch,omitempty"`
+
+		// Choices are the Choice state's ordered rules; first match wins.
+		// +optional
+		Choices []WorkflowChoiceRule `json:"choices,omitempty"`
+
+		// Default names the state a Choice falls through to when no rule
+		// matches; without it, no-match fails the run (Fission.NoChoiceMatched).
+		// +optional
+		Default string `json:"default,omitempty"`
+
+		// Branches are the Parallel state's concurrent sub-machines (or the
+		// Map state's single iterator template). Branch states cannot nest
+		// further fan-out — enforced by the bounded WorkflowBranchState type.
+		// +optional
+		// +kubebuilder:validation:MaxItems=10
+		Branches []WorkflowBranch `json:"branches,omitempty"`
+
+		// ItemsPath selects the array a Map state iterates (one branch per
+		// element, input = the element).
+		// +optional
+		ItemsPath string `json:"itemsPath,omitempty"`
+
+		// Duration is how long a Wait state pauses the run — durably: the
+		// delay is a statestore Queue message, so a controller restart never
+		// loses it (robfig/cron-style absolute schedules stay with the timer
+		// subsystem; only durations here).
+		// +optional
+		Duration *metav1.Duration `json:"duration,omitempty"`
+
+		// MaxConcurrency throttles how many branches execute at once. Zero
+		// means the engine default (10) — NOT unbounded: an unthrottled
+		// large Map against poolmgr is a self-inflicted cold-start burst.
+		// The default is applied by the engine, not the schema: a schema
+		// default would stamp the field onto every state type.
+		// +optional
+		// +kubebuilder:validation:Minimum=0
+		MaxConcurrency int32 `json:"maxConcurrency,omitempty"`
+
+		// InputPath/ResultPath/OutputPath shape step I/O with JSONPath
+		// (Step Functions semantics; dialect pinned in pkg/workflow/expr).
+		// +optional
+		InputPath string `json:"inputPath,omitempty"`
+		// +optional
+		ResultPath string `json:"resultPath,omitempty"`
+		// +optional
+		OutputPath string `json:"outputPath,omitempty"`
+
+		// Next names the state to run after this one; exactly one of Next/End
+		// is set on Task states (Succeed/Fail are implicitly terminal).
+		// +optional
+		Next string `json:"next,omitempty"`
+		// +optional
+		End bool `json:"end,omitempty"`
+	}
+
+	// WorkflowBranch is one concurrent sub-machine of a Parallel state (or
+	// the iterator template of a Map state).
+	WorkflowBranch struct {
+		StartAt string `json:"startAt"`
+		// MaxProperties=20 (vs 100 top-level) keeps the apiserver's CEL cost
+		// estimate for doubly-nested rules under budget — the phase-1 lesson.
+		// +kubebuilder:validation:MinProperties=1
+		// +kubebuilder:validation:MaxProperties=20
+		States map[string]WorkflowBranchState `json:"states"`
+	}
+
+	// WorkflowBranchState is WorkflowState minus the fan-out fields: nested
+	// Parallel/Map is impossible BY TYPE, which is what keeps the CRD schema
+	// non-recursive (controller-gen cannot render a self-referential type).
+	WorkflowBranchState struct {
+		Type WorkflowStateType `json:"type"`
+		// +optional
+		Function *FunctionReference `json:"function,omitempty"`
+		// +optional
+		Duration *metav1.Duration `json:"duration,omitempty"`
+		// +optional
+		Timeout *metav1.Duration `json:"timeout,omitempty"`
+		// +optional
+		Retry *RetryPolicy `json:"retry,omitempty"`
+		// +optional
+		Catch []WorkflowCatchRoute `json:"catch,omitempty"`
+		// +optional
+		Choices []WorkflowChoiceRule `json:"choices,omitempty"`
+		// +optional
+		Default string `json:"default,omitempty"`
+		// +optional
+		InputPath string `json:"inputPath,omitempty"`
+		// +optional
+		ResultPath string `json:"resultPath,omitempty"`
+		// +optional
+		OutputPath string `json:"outputPath,omitempty"`
+		// +optional
+		Next string `json:"next,omitempty"`
+		// +optional
+		End bool `json:"end,omitempty"`
+	}
+
+	// WorkflowCatchRoute routes a matched error class to a next state.
+	WorkflowCatchRoute struct {
+		// ErrorType matches a typed function error ({"errorType": ...} body),
+		// a built-in class (Fission.PermanentError, Fission.FunctionError,
+		// Fission.Timeout), or Fission.All (matches anything).
+		ErrorType string `json:"errorType"`
+		Next      string `json:"next"`
+		// ResultPath, when set, merges the error object
+		// ({"errorType": ..., "cause": ...}) into the flowing document at
+		// this JSONPath, so the catch target still sees the business data
+		// (e.g. retry a charge after a grace period). Unset keeps the
+		// Step-Functions-parity default: the error object REPLACES the
+		// document.
+		// +optional
+		ResultPath string `json:"resultPath,omitempty"`
+	}
+
+	// WorkflowChoiceCondition is a leaf comparison against the state input.
+	// Exactly one operator must be set. Numeric values use resource.Quantity
+	// (CRDs cannot carry floats; Quantity accepts YAML numbers and strings).
+	WorkflowChoiceCondition struct {
+		// Variable is a JSONPath into the state's (shaped) input. Required on
+		// every leaf condition — enforced by the webhook, not the schema: this
+		// struct is inline-embedded in WorkflowChoiceRule, and a
+		// schema-required field would wrongly reject composite (and/or/not)
+		// rules that carry no inline leaf.
+		// +optional
+		Variable string `json:"variable,omitempty"`
+		// +optional
+		StringEquals *string `json:"stringEquals,omitempty"`
+		// +optional
+		NumericEquals *resource.Quantity `json:"numericEquals,omitempty"`
+		// +optional
+		NumericGreaterThan *resource.Quantity `json:"numericGreaterThan,omitempty"`
+		// +optional
+		NumericLessThan *resource.Quantity `json:"numericLessThan,omitempty"`
+		// +optional
+		BooleanEquals *bool `json:"booleanEquals,omitempty"`
+		// +optional
+		IsPresent *bool `json:"isPresent,omitempty"`
+		// +optional
+		IsNull *bool `json:"isNull,omitempty"`
+	}
+
+	// WorkflowChoiceRule is one ordered rule of a Choice state: either a leaf
+	// condition (inline) or exactly one of And/Or/Not over leaf conditions
+	// (depth-1 composition; deeper nesting is additive later).
+	WorkflowChoiceRule struct {
+		WorkflowChoiceCondition `json:",inline"`
+
+		// +optional
+		And []WorkflowChoiceCondition `json:"and,omitempty"`
+		// +optional
+		Or []WorkflowChoiceCondition `json:"or,omitempty"`
+		// +optional
+		Not *WorkflowChoiceCondition `json:"not,omitempty"`
+
+		// Next names the state to transition to when this rule matches.
+		Next string `json:"next"`
+	}
+
+	// WorkflowRetentionPolicy bounds retained history for finished runs.
+	WorkflowRetentionPolicy struct {
+		// +optional
+		MaxCount *int32 `json:"maxCount,omitempty"`
+		// +optional
+		MaxAge *metav1.Duration `json:"maxAge,omitempty"`
+	}
+
+	// WorkflowStatus describes the observed state of a Workflow.
+	WorkflowStatus struct {
+		// +optional
+		ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+		// +optional
+		// +patchMergeKey=type
+		// +patchStrategy=merge
+		// +listType=map
+		// +listMapKey=type
+		Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+	}
+
+	// WorkflowRunPhase is the run's coarse lifecycle phase.
+	// +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed;Cancelled;TimedOut
+	WorkflowRunPhase string
+
+	// WorkflowRunSpec identifies the Workflow to execute and the run's input.
+	WorkflowRunSpec struct {
+		// WorkflowRef names the Workflow (same namespace) this run executes.
+		WorkflowRef string `json:"workflowRef"`
+
+		// WorkflowGeneration records (for observability) which Workflow
+		// generation this run executes. It is NOT the pinning mechanism: the
+		// authoritative spec is the snapshot the engine embeds in the run's
+		// event stream at RunStarted; a Workflow edit or deletion mid-run can
+		// neither fork nor strand a run. Set by the CLI; 0 means unknown.
+		// +optional
+		WorkflowGeneration int64 `json:"workflowGeneration,omitempty"`
+
+		// Input is the run's initial input document — ANY JSON value
+		// (apiextensionsv1.JSON, not RawExtension: the RawExtension schema is
+		// type=object and the apiserver would reject a bare string/array/
+		// number). Webhook-capped at 256KiB (etcd objects cap at ~1.5MiB) —
+		// pass larger inputs by reference.
+		// +optional
+		Input *apiextensionsv1.JSON `json:"input,omitempty"`
+	}
+
+	// WorkflowRunEventSummary is one bounded-tail history entry for kubectl
+	// visibility; the full history lives in the statestore EventLog.
+	WorkflowRunEventSummary struct {
+		Seq  int64  `json:"seq"`
+		Type string `json:"type"`
+		// +optional
+		State string `json:"state,omitempty"`
+		// +optional
+		Attempt int32       `json:"attempt,omitempty"`
+		At      metav1.Time `json:"at"`
+		// +optional
+		Note string `json:"note,omitempty"`
+	}
+
+	// WorkflowRunStatus describes the observed state of a WorkflowRun.
+	WorkflowRunStatus struct {
+		// +optional
+		Phase WorkflowRunPhase `json:"phase,omitempty"`
+
+		// ActiveStates lists the state names currently executing.
+		// +optional
+		ActiveStates []string `json:"activeStates,omitempty"`
+
+		// +optional
+		StartedAt *metav1.Time `json:"startedAt,omitempty"`
+		// +optional
+		FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+
+		// Output holds the final output inline up to the step-I/O spill
+		// threshold — ANY JSON value (see Input for why apiextensionsv1.JSON);
+		// larger outputs spill to the statestore KV and OutputRef points
+		// there (the CLI dereferences).
+		// +optional
+		Output *apiextensionsv1.JSON `json:"output,omitempty"`
+		// +optional
+		OutputRef string `json:"outputRef,omitempty"`
+
+		// ErrorType and Cause carry the terminal failure classification so
+		// kubectl answers "why did it fail" without the history endpoint.
+		// Cause is bounded; the full detail lives in the run history.
+		// +optional
+		ErrorType string `json:"errorType,omitempty"`
+		// +optional
+		// +kubebuilder:validation:MaxLength=1024
+		Cause string `json:"cause,omitempty"`
+
+		// RecentEvents is a bounded (<=20) tail; full history is in the
+		// EventLog.
+		// +optional
+		RecentEvents []WorkflowRunEventSummary `json:"recentEvents,omitempty"`
+
+		// +optional
+		ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+		// +optional
+		// +patchMergeKey=type
+		// +patchStrategy=merge
+		// +listType=map
+		// +listMapKey=type
+		Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+	}
+
+	//
+	// Function versions & aliases (RFC-0025)
+	//
+
+	// FunctionVersion is an immutable snapshot of a Function's spec at publish
+	// time (RFC-0025). Versions are minted by the version-control loop (auto
+	// mode) or `fission fn publish` (manual mode) and are never mutated after
+	// creation — only garbage collected once unreferenced by any FunctionAlias
+	// and beyond the retain floor. FunctionVersion carries no Status: its
+	// content is fixed at creation, so there is nothing to reconcile.
+	// +genclient
+	// +kubebuilder:object:root=true
+	// +kubebuilder:resource:scope="Namespaced",shortName={fnver}
+	// +kubebuilder:printcolumn:name="Sequence",type=integer,JSONPath=`.spec.sequence`
+	// +kubebuilder:printcolumn:name="PackageDigest",type=string,JSONPath=`.spec.packageDigest`
+	// +kubebuilder:printcolumn:name="PublishedAt",type=date,JSONPath=`.spec.publishedAt`
+	FunctionVersion struct {
+		metav1.TypeMeta   `json:",inline"`
+		metav1.ObjectMeta `json:"metadata"`
+		Spec              FunctionVersionSpec `json:"spec"`
+	}
+
+	// FunctionVersionList is a list of FunctionVersions.
+	// +kubebuilder:object:root=true
+	FunctionVersionList struct {
+		metav1.TypeMeta `json:",inline"`
+		metav1.ListMeta `json:"metadata"`
+		Items           []FunctionVersion `json:"items"`
+	}
+
+	// FunctionAlias is a mutable, named pointer at one (or, during a weighted
+	// rollout, two) FunctionVersion(s) of a Function (RFC-0025). Aliases are
+	// what triggers reference in production; moving an alias is how a rollout
+	// or rollback happens without touching the trigger.
+	// +genclient
+	// +kubebuilder:object:root=true
+	// +kubebuilder:subresource:status
+	// +kubebuilder:resource:scope="Namespaced",shortName={fnalias}
+	// +kubebuilder:printcolumn:name="Function",type=string,JSONPath=`.spec.functionName`
+	// +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.spec.version`
+	// +kubebuilder:printcolumn:name="Weight",type=integer,JSONPath=`.spec.weight`
+	// +kubebuilder:printcolumn:name="ResolvedVersion",type=string,JSONPath=`.status.resolvedVersion`
+	FunctionAlias struct {
+		metav1.TypeMeta   `json:",inline"`
+		metav1.ObjectMeta `json:"metadata"`
+		Spec              FunctionAliasSpec `json:"spec"`
+		// +optional
+		Status FunctionAliasStatus `json:"status,omitempty"`
+	}
+
+	// FunctionAliasList is a list of FunctionAliases.
+	// +kubebuilder:object:root=true
+	FunctionAliasList struct {
+		metav1.TypeMeta `json:",inline"`
+		metav1.ListMeta `json:"metadata"`
+		Items           []FunctionAlias `json:"items"`
+	}
+
+	// VersioningMode selects when versions are minted.
+	// +kubebuilder:validation:Enum=auto;manual
+	VersioningMode string
+
+	// VersioningConfig opts a Function into RFC-0025 immutable version
+	// snapshots and named aliases.
+	VersioningConfig struct {
+		// Mode auto (default) mints a version on every runtime-affecting
+		// update once the referenced package build succeeds; manual mints
+		// only on explicit `fission fn publish`.
+		// +kubebuilder:default:=auto
+		// +optional
+		Mode VersioningMode `json:"mode,omitempty"`
+		// Retain bounds unaliased version history per function (GC floor 1).
+		// Defaults to 10. Alias-referenced versions are never GC'd.
+		// +kubebuilder:validation:Minimum=1
+		// +optional
+		Retain *int `json:"retain,omitempty"`
+	}
+
+	// FunctionVersionSpec is the immutable snapshot recorded by one publish.
+	FunctionVersionSpec struct {
+		// +kubebuilder:validation:MaxLength=63
+		FunctionName string `json:"functionName"`
+		// FunctionUID and FunctionGeneration pin the executor identity of this
+		// snapshot: (UID, Generation) is the pool/cache key (crd.CacheKeyUG),
+		// so a version is a generation pin, not a new identity.
+		FunctionUID        types.UID `json:"functionUID"`
+		FunctionGeneration int64     `json:"functionGeneration"`
+		// +kubebuilder:validation:Minimum=1
+		Sequence int64 `json:"sequence"`
+		// Snapshot is the function spec at publish time with Versioning
+		// zeroed (never nested) and, for legacy packages, PackageRef
+		// repointed at the version-owned snapshot Package.
+		Snapshot FunctionSpec `json:"snapshot"`
+		// PackageDigest pins content: the OCI digest or sha256:<archive checksum>.
+		PackageDigest string `json:"packageDigest"`
+		// Environment observation at publish time (observational, not pinning).
+		// +optional
+		EnvObservedGeneration int64 `json:"envObservedGeneration,omitempty"`
+		// +optional
+		EnvRuntimeImage string      `json:"envRuntimeImage,omitempty"`
+		PublishedAt     metav1.Time `json:"publishedAt"`
+	}
+
+	// Repo convention (types.go:755,778,955): guard BOTH absent and explicit-empty on optional strings.
+	// +kubebuilder:validation:XValidation:rule="(has(self.version) && self.version != '') != (has(self.packageDigest) && self.packageDigest != '')",message="exactly one of version and packageDigest must be set"
+	// +kubebuilder:validation:XValidation:rule="!has(self.weight) || (has(self.secondaryVersion) && self.secondaryVersion != '')",message="weight requires secondaryVersion"
+	// +kubebuilder:validation:XValidation:rule="!has(self.secondaryVersion) || self.secondaryVersion == '' || !has(self.version) || self.secondaryVersion != self.version",message="secondaryVersion must differ from version"
+	FunctionAliasSpec struct {
+		// +kubebuilder:validation:MaxLength=63
+		FunctionName string `json:"functionName"`
+		// Version pins by FunctionVersion name (imperative path). XOR PackageDigest.
+		// +optional
+		Version string `json:"version,omitempty"`
+		// PackageDigest pins declaratively (GitOps): resolved asynchronously to
+		// the FunctionVersion that recorded this digest; eventually consistent.
+		// +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
+		// +optional
+		PackageDigest string `json:"packageDigest,omitempty"`
+		// Weight (0-100) served by the primary target; nil = 100%.
+		// +kubebuilder:validation:Minimum=0
+		// +kubebuilder:validation:Maximum=100
+		// +optional
+		Weight *int `json:"weight,omitempty"`
+		// SecondaryVersion receives 100-Weight. Name-pinned only.
+		// +optional
+		SecondaryVersion string `json:"secondaryVersion,omitempty"`
+	}
+
+	// AliasTargetRecord is one entry in FunctionAliasStatus.History: a
+	// previously resolved target, kept for audit / rollback visibility.
+	AliasTargetRecord struct {
+		Version       string      `json:"version"`
+		PackageDigest string      `json:"packageDigest,omitempty"`
+		SwitchedAt    metav1.Time `json:"switchedAt"`
+	}
+
+	// FunctionAliasStatus describes the observed state of a FunctionAlias.
+	FunctionAliasStatus struct {
+		// ResolvedVersion is the FunctionVersion name this alias currently
+		// resolves to (always name-pinned, even when Spec.PackageDigest
+		// declares the target declaratively).
+		// +optional
+		ResolvedVersion string `json:"resolvedVersion,omitempty"`
+
+		// History is a bounded tail of previously resolved targets, most
+		// recent last.
+		// +optional
+		History []AliasTargetRecord `json:"history,omitempty"`
+
+		// +optional
+		// +patchMergeKey=type
+		// +patchStrategy=merge
+		// +listType=map
+		// +listMapKey=type
+		Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+	}
+
+	//
 	// Functions and packages
 	//
 
@@ -318,6 +911,7 @@ type (
 	// zipped literal archive. The literal/oci combination is instead
 	// rejected by the webhook (Archive.Validate), with the same message.
 	// +kubebuilder:validation:XValidation:rule="!has(self.oci) || !has(self.url) || self.url == ''",message="at most one of literal, url, or oci may be set"
+	// +kubebuilder:validation:XValidation:rule="!has(self.secretref) || (has(self.url) && self.url != '' && !has(self.oci))",message="secretref requires a url archive"
 	Archive struct {
 		// Type defines how the package is specified: literal, URL, or OCI.
 		// Available value:
@@ -343,12 +937,26 @@ type (
 		// +kubebuilder:validation:XValidation:rule="((!has(self.type) || self.type == '') && (!has(self.sum) || self.sum == '')) || self.type == 'sha256'",message="checksum must be empty, or its type must be 'sha256' (the only supported checksum type)"
 		Checksum Checksum `json:"checksum,omitempty"`
 
-		// OCI references an OCI image holding the deployment code.
-		// Mutually exclusive with Literal and URL. Supported only on
-		// PackageSpec.Deployment; PackageSpec.Validate rejects it on Source
-		// (source archives feed the builder, which has no OCI pull path).
+		// OCI references an OCI image holding the archive contents.
+		// Mutually exclusive with Literal and URL. Valid on both
+		// PackageSpec.Deployment and PackageSpec.Source (RFC-0031): a
+		// source OCI archive is pulled by the builder pod's fetcher, whose
+		// keychain resolves the builder pod's ServiceAccount
+		// imagePullSecrets plus the archive's ImagePullSecrets.
 		// +optional
 		OCI *OCIArchive `json:"oci,omitempty"`
+
+		// SecretRef names a Secret holding credentials for fetching URL.
+		// Keys: username+password (basic auth), token (bearer), headers
+		// (extra headers, one "Name: Value" per line). Like
+		// OCIArchive.ImagePullSecrets it is resolved in the namespace of
+		// the pod that performs the fetch: the function pod's namespace
+		// for deployment archives, the builder pod's namespace for source
+		// archives. Valid only for a url archive whose URL is not a
+		// storagesvc archive URL; credentials are attached only to
+		// requests to the URL's exact origin.
+		// +optional
+		SecretRef *apiv1.LocalObjectReference `json:"secretref,omitempty"`
 	}
 
 	// OCIArchive references an OCI image whose flattened filesystem
@@ -404,6 +1012,25 @@ type (
 		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 		// +kubebuilder:validation:MaxLength=63
 		Name string `json:"name"`
+		// MountPath redirects this secret's file projection from the default
+		// /secrets/<namespace>/<name> to the given path, which is relative to
+		// the /secrets root (RFC-0030 §4): generic pool pods share a fixed
+		// volume set frozen at pool creation, so an arbitrary absolute path is
+		// not materializable there, and the container executor applies the
+		// same constraint for cross-executor consistency. Empty keeps today's
+		// <namespace>/<name> layout, so functions that do not set it are
+		// unaffected. No two secrets on one function may RESOLVE to the same
+		// directory (an explicit path colliding with another reference's
+		// default counts): the final segment written is the object's data
+		// key and keys are mutable after admission, so sharing a directory
+		// would let one object's later-added key collide with the other's
+		// file; the fetcher refuses such a write rather than truncating.
+		// Honoured on every executor: poolmgr and newdeploy via the fetcher,
+		// the container executor via a native projected volume. Not supported
+		// on an allowedFunctionsPerContainer:infinite environment, whose pods
+		// share one secrets tree across functions.
+		// +optional
+		MountPath string `json:"mountPath,omitempty"`
 	}
 
 	// ConfigMapReference is a reference to a kubernetes configmap.
@@ -412,6 +1039,11 @@ type (
 		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 		// +kubebuilder:validation:MaxLength=63
 		Name string `json:"name"`
+		// MountPath redirects this configmap's file projection from the
+		// default /configs/<namespace>/<name>; relative to the /configs root.
+		// See SecretReference.MountPath for the constraint rationale.
+		// +optional
+		MountPath string `json:"mountPath,omitempty"`
 	}
 
 	// BuildStatus indicates the current build status of a package.
@@ -452,6 +1084,30 @@ type (
 		// BuildLog stores build log during the compilation.
 		// +optional
 		BuildLog string `json:"buildlog,omitempty"` // output of the build (errors etc)
+
+		// ContentHash fingerprints the package's INPUT content (RFC-0029 §3):
+		// the source archive when one is present, otherwise the deployment
+		// archive. A source package's deployment is the build's own product,
+		// so folding it in would make every successful build look like a
+		// fresh change and rebuild forever.
+		//
+		// It is what makes a Git-applied Package
+		// converge without the CLI: buildermgr compares the spec's current
+		// hash against this one to decide whether the content actually
+		// changed, rather than relying on the CLI's status->pending poke.
+		//
+		// It also covers packages that never build. A deploy-only or OCI
+		// package settles at BuildStatusNone, so the build-success path that
+		// re-stamps referencing Functions never runs for it — exactly the
+		// digest-pinned-OCI-in-Git golden path. Keying the re-stamp on this
+		// hash instead covers both shapes on one code path.
+		//
+		// An EMPTY value means "not yet recorded" and must never read as
+		// "changed": every package has an empty hash on the first reconcile
+		// after this ships, and treating that as a change would rebuild the
+		// whole cluster at once. The reconciler seeds it without rebuilding.
+		// +optional
+		ContentHash string `json:"contentHash,omitempty"`
 
 		// LastUpdateTimestamp will store the timestamp the package was last updated
 		// metav1.Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.
@@ -531,6 +1187,7 @@ type (
 	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.hostIPC) || !self.podspec.hostIPC",message="spec.podspec.hostIPC is not allowed"
 	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccountName) || self.podspec.serviceAccountName == ''",message="spec.podspec.serviceAccountName override is not allowed"
 	// +kubebuilder:validation:XValidation:rule="!has(self.podspec) || !has(self.podspec.serviceAccount) || self.podspec.serviceAccount == ''",message="spec.podspec.serviceAccount override is not allowed"
+	// +kubebuilder:validation:XValidation:rule="!has(self.provisionedConcurrency) || !has(self.InvokeStrategy.ExecutionStrategy) || !has(self.InvokeStrategy.ExecutionStrategy.ExecutorType) || self.InvokeStrategy.ExecutionStrategy.ExecutorType == '' || self.InvokeStrategy.ExecutionStrategy.ExecutorType == 'poolmgr'",message="provisionedConcurrency is only supported with executortype poolmgr"
 	FunctionSpec struct {
 		// Environment is the build and runtime environment that this function is
 		// associated with. An Environment with this name should exist, otherwise the
@@ -553,6 +1210,38 @@ type (
 		// +listType=map
 		// +listMapKey=name
 		ConfigMaps []ConfigMapReference `json:"configmaps,omitempty"`
+
+		// Env lists per-function environment variables set on the function's
+		// runtime container: literals, plus key-level references into
+		// same-namespace Secrets/ConfigMaps via valueFrom (secretKeyRef /
+		// configMapKeyRef only — fieldRef and resourceFieldRef are rejected at
+		// admission because poolmgr's specialize-time injection cannot honor
+		// pod-level field refs portably; RFC-0030 §1). Function Env wins over
+		// EnvFrom, which wins over the environment podspec's merged env.
+		// Platform-reserved names (FISSION_*, RESOURCE_VERSION_COUNT, and the
+		// interpreter/proxy-hijack set) are denied at admission and enforced
+		// at injection. Additive and backward compatible.
+		// +optional
+		// +nullable
+		Env []apiv1.EnvVar `json:"env,omitempty"`
+
+		// EnvFrom projects whole same-namespace Secrets/ConfigMaps into the
+		// function's environment, with an optional prefix; later sources win
+		// over earlier ones (Kubernetes semantics), and function Env literals
+		// win over all EnvFrom keys.
+		//
+		// Two phase-1 limits, both inherent to native (kubelet) injection:
+		// the kubelet expands envFrom BEFORE container env, so a name the
+		// environment podspec sets as a literal still beats an EnvFrom-supplied
+		// key of the same name; and reserved platform names appearing as data
+		// keys of a referenced object are not filtered (they are unknowable at
+		// admission and mutable afterwards) — they are only shadowed by the
+		// platform vars actually present on the container. Key-level filtering
+		// and full precedence arrive with the poolmgr phase, which resolves
+		// values itself. Additive and backward compatible.
+		// +optional
+		// +nullable
+		EnvFrom []apiv1.EnvFromSource `json:"envFrom,omitempty"`
 
 		// cpu and memory resources as per K8S standards
 		// This is only for newdeploy to set up resource limitation
@@ -592,6 +1281,22 @@ type (
 		// +optional
 		Tool *ToolConfig `json:"tool,omitempty"`
 
+		// State, when non-nil, opts this function into the RFC-0023 keyed-state
+		// API: a scoped statesvc keyspace backed by the RFC-0021 statestore, with
+		// a per-function token injected at specialization time. Presence is the
+		// on switch (like Streaming and Tool): nil (the default) means exactly
+		// today's behavior. Additive and backward compatible.
+		// +optional
+		State *StateConfig `json:"state,omitempty"`
+
+		// Invocation, when non-nil, tunes RFC-0024 asynchronous invocation
+		// (X-Fission-Invoke-Mode: async) for this function: the durable retry policy
+		// and the maximum event age before an undelivered invocation is
+		// dead-lettered. A function without it still accepts async mode with platform
+		// defaults; this field only tunes them. Additive and backward compatible.
+		// +optional
+		Invocation *InvocationConfig `json:"invocation,omitempty"`
+
 		// Maximum number of pods to be specialized which will serve requests
 		// This is optional. If not specified default value will be taken as 500
 		// +optional
@@ -611,6 +1316,23 @@ type (
 		// This is optional. If not specified default value will be taken as 0
 		// +optional
 		RetainPods int `json:"retainPods,omitempty"`
+
+		// ProvisionedConcurrency, when non-nil, opts this function into eager
+		// pre-warming of specialized pods (RFC-0026). The executor's provisioner
+		// keeps at least the configured Target specialized pods warm, published to
+		// the function's headless Service, and exempt from the idle reaper. nil
+		// (the default) is the classic on-demand cold-start path. Additive and
+		// backward compatible. Only valid when
+		// InvokeStrategy.ExecutionStrategy.ExecutorType is poolmgr.
+		// +optional
+		ProvisionedConcurrency *ProvisionedConcurrencyConfig `json:"provisionedConcurrency,omitempty"`
+
+		// Versioning, when non-nil, opts this function into RFC-0025 immutable
+		// version snapshots and named aliases. Presence is the on switch (like
+		// Streaming and Tool): nil (the default) means exactly today's mutable
+		// in-place behavior. Additive and backward compatible.
+		// +optional
+		Versioning *VersioningConfig `json:"versioning,omitempty"`
 
 		// Podspec specifies podspec to use for executor type container based functions
 		// Different arguments mentioned for container based function are populated inside a pod.
@@ -654,6 +1376,7 @@ type (
 	// Presence of the enclosing FunctionSpec.Tool is the on switch — there is no
 	// separate enabled flag, so the in-memory zero value and the stored object
 	// never disagree (the same rationale as StreamingConfig).
+	// +kubebuilder:validation:XValidation:rule="!(has(self.alias) && self.alias != '') || self.alias.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="tool.alias must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars)"
 	ToolConfig struct {
 		// Description is the human/agent-facing tool description surfaced in the MCP
 		// tools/list response. Required.
@@ -673,6 +1396,236 @@ type (
 		// +optional
 		// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_-]{1,64}$`
 		ToolName string `json:"toolName,omitempty"`
+
+		// Alias, when set, targets a FunctionAlias by name (RFC-0025) instead of
+		// the live Function: the MCP registry serves the tool from the alias's
+		// currently-resolved FunctionVersion snapshot, and tools/call is proxied
+		// to the ":<alias>" route rather than straight to the live Function.
+		// Empty (the default) preserves today's behavior. Router/registry-side
+		// resolution lands in a later RFC-0025 task — until then this field is
+		// accepted but inert.
+		// +kubebuilder:validation:MaxLength=63
+		// +optional
+		Alias string `json:"alias,omitempty"`
+	}
+
+	// StateConfig declares a function's keyed-state keyspace and quotas
+	// (RFC-0023). Presence of the enclosing FunctionSpec.State is the on switch —
+	// there is no separate enabled flag, so the in-memory zero value and the
+	// stored object never disagree (the same rationale as StreamingConfig).
+	StateConfig struct {
+		// Keyspace names the durable keyspace this function reads and writes.
+		// Defaults to the function name; explicit so a function can be renamed
+		// without orphaning its data. The charset deliberately excludes ':' and
+		// '#' — ':' is a token-derivation info-string separator and '#' marks the
+		// platform-reserved "<keyspace>#meta" quota-accounting sibling.
+		// +optional
+		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`
+		// +kubebuilder:validation:MaxLength=63
+		Keyspace string `json:"keyspace,omitempty"`
+
+		// DefaultTTL, when set, is applied to writes that carry no explicit TTL.
+		// Must be >= 0; zero (or nil) means keys do not expire by default.
+		// +optional
+		DefaultTTL *metav1.Duration `json:"defaultTTL,omitempty"`
+
+		// MaxValueBytes caps a single value's size. 0 means the platform default
+		// (DefaultStateMaxValueBytes, 256KiB); the ceiling is
+		// MaxStateMaxValueBytes (4MiB). Blobs belong in object storage.
+		// +optional
+		// +kubebuilder:validation:Minimum=0
+		// +kubebuilder:validation:Maximum=4194304
+		MaxValueBytes int64 `json:"maxValueBytes,omitempty"`
+
+		// MaxKeys caps the number of live keys in the keyspace, enforced
+		// atomically with each write (quota.tla S3). 0 means the platform
+		// default (DefaultStateMaxKeys).
+		// +optional
+		// +kubebuilder:validation:Minimum=0
+		MaxKeys int64 `json:"maxKeys,omitempty"`
+
+		// Backend selects a named statestore driver for this keyspace. Accepted
+		// and validated in v1 but not yet acted on: statesvc serves every
+		// keyspace from its single configured driver (per-function backend
+		// selection is a documented deferral).
+		// +optional
+		Backend string `json:"backend,omitempty"`
+
+		// Sticky, when non-nil, opts the function into sticky routing: the
+		// router consistent-hashes the declared request key onto the ready-pod
+		// set so one key's requests land on one pod while the pod set is stable.
+		// Best-effort (an optimization, never a correctness dependency — S6):
+		// durable truth stays behind the state API.
+		// +optional
+		Sticky *StickyConfig `json:"sticky,omitempty"`
+	}
+
+	// StickySource selects where the router extracts the sticky routing key
+	// from an incoming request.
+	// +kubebuilder:validation:Enum=header;queryparam
+	StickySource string
+
+	// StickyConfig declares how the sticky routing key is extracted from a
+	// request. Requests missing the key fall back to the default endpoint pick.
+	StickyConfig struct {
+		// Source is where to look for the key.
+		Source StickySource `json:"source"`
+
+		// Name is the header or query-parameter name holding the key,
+		// e.g. "X-Session-Id".
+		Name string `json:"name"`
+	}
+
+	// InvocationConfig tunes RFC-0024 asynchronous invocation for a function.
+	// Presence of the enclosing FunctionSpec.Invocation is optional — a function
+	// without it still accepts async mode (X-Fission-Invoke-Mode: async) with
+	// platform defaults; this struct only tunes them. Field bounds are validated in
+	// Go (InvocationConfig.Validate, run at admission via validateForAdmission),
+	// not CEL, because metav1.Duration CEL rules are unproven in this CRD.
+	// An external dead-letter target is a later RFC-0024 phase.
+	InvocationConfig struct {
+		// Retry is the durable delivery retry policy. The zero value means platform
+		// defaults (a bounded exponential backoff over DefaultMaxAttempts attempts).
+		// +optional
+		Retry RetryPolicy `json:"retry,omitempty"`
+
+		// MaxAge caps how long an invocation may wait for successful delivery,
+		// measured from its enqueue time; once exceeded it is dead-lettered with
+		// reason "expired". nil means the platform default. Must be > 0 when set.
+		// +optional
+		MaxAge *metav1.Duration `json:"maxAge,omitempty"`
+
+		// OnSuccess, when set, invokes a destination with a Lambda-shaped result
+		// envelope after the invocation is delivered successfully (2xx).
+		// +optional
+		OnSuccess *DestinationRef `json:"onSuccess,omitempty"`
+
+		// OnFailure, when set, invokes a destination with the result envelope after
+		// the invocation permanently fails (a non-retryable 4xx, the retry budget
+		// spent, or MaxAge exceeded).
+		// +optional
+		OnFailure *DestinationRef `json:"onFailure,omitempty"`
+	}
+
+	// DestinationRef routes an async invocation's result to exactly one target: a
+	// Function (invoked async through the same machinery, depth-capped) or a Topic
+	// (published to a message queue). Exactly one of Function/Topic must be set.
+	// Topic destinations on the built-in statestore provider are supported
+	// (RFC-0027); broker types are rejected by the webhook until the egress phase
+	// lands.
+	DestinationRef struct {
+		// Function is a same-namespace function destination, invoked asynchronously
+		// with the result envelope as its body (depth-capped to stop runaway chains).
+		// +optional
+		Function *FunctionReference `json:"function,omitempty"`
+
+		// Topic publishes the result envelope to a message-queue topic.
+		// +optional
+		Topic *TopicRef `json:"topic,omitempty"`
+	}
+
+	// TopicRef is a message-queue topic destination for an async invocation result.
+	// Topics are namespace-scoped: the destination publishes to the source
+	// function's namespace (RFC-0024 rule R6).
+	TopicRef struct {
+		// MessageQueueType selects the provider: "statestore" (the RFC-0027
+		// built-in, no broker) now; broker types (e.g. kafka) with the egress phase.
+		MessageQueueType MessageQueueType `json:"messageQueueType"`
+
+		// Topic is the topic the result envelope is published to. The schema bounds
+		// mirror ValidateTopicName: a stream-safe charset excluding "/" so the
+		// topic/<namespace>/<topic> mapping cannot alias across namespaces.
+		// +kubebuilder:validation:MaxLength=249
+		// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9._-]+$`
+		Topic string `json:"topic"`
+	}
+
+	// RetryPolicy is the async delivery retry policy: the attempt budget and the
+	// exponential-backoff schedule between delivery attempts. All fields are
+	// optional; a nil field takes the platform default.
+	RetryPolicy struct {
+		// MaxAttempts is the total number of delivery attempts before the invocation
+		// is dead-lettered. nil means DefaultMaxAttempts. Must be >= 1 when set.
+		// +optional
+		MaxAttempts *int `json:"maxAttempts,omitempty"`
+
+		// BackoffBase is the delay before the first retry; it grows exponentially per
+		// attempt up to BackoffCap. nil means the platform default. Must be >= 0.
+		// +optional
+		BackoffBase *metav1.Duration `json:"backoffBase,omitempty"`
+
+		// BackoffCap bounds the per-retry backoff. nil means the platform default.
+		// Must be >= 0 and >= BackoffBase when both are set.
+		// +optional
+		BackoffCap *metav1.Duration `json:"backoffCap,omitempty"`
+
+		// Jitter, when non-nil and false, disables the randomized jitter the
+		// dispatcher otherwise adds to each backoff to avoid synchronized retries.
+		// nil means the platform default (jitter enabled).
+		// +optional
+		Jitter *bool `json:"jitter,omitempty"`
+	}
+
+	// ProvisionedConcurrencyConfig opts this function into eager pre-warming of
+	// specialized pods (RFC-0026). Presence is the on switch: nil (the default)
+	// means the function uses the classic on-demand cold-start path. When non-nil,
+	// the executor's provisioner keeps at least Target specialized pods warm and
+	// published to the function's headless Service, exempt from the idle reaper.
+	// Additive and backward compatible.
+	// +optional
+	ProvisionedConcurrencyConfig struct {
+		// Target is the base number of warm specialized pods to maintain outside
+		// any schedule window. Must be >= 1. Schedule windows may override this
+		// (see Windows). Bounded by the namespace cap
+		// (executor.provisionedConcurrency.maxPerFunction, default 20).
+		// +kubebuilder:validation:Minimum=1
+		Target int `json:"target"`
+
+		// Windows is an optional list of schedule windows that override Target
+		// during specific time ranges (RFC-0026 PR 2). Empty in PR 1 — base Target
+		// is always in effect. Each window: a cron start expression, a duration,
+		// and a window-local target (0 means "un-warm" for the window's duration).
+		// +optional
+		// +listType=map
+		// +listMapKey=name
+		// +kubebuilder:validation:MaxItems=32
+		Windows []ProvisionedWindow `json:"windows,omitempty"`
+	}
+
+	// ProvisionedWindow describes a schedule window that overrides the base
+	// ProvisionedConcurrencyConfig.Target during a time range. The window is
+	// active from the cron-triggered start for Duration; while active, the
+	// effective target is the window's Target (overlapping windows take the max).
+	// +optional
+	ProvisionedWindow struct {
+		// Name identifies this window within the function's
+		// ProvisionedConcurrencyConfig.Windows list. Must be unique within the
+		// list (listMapKey=name).
+		// +kubebuilder:validation:MinLength=1
+		// +kubebuilder:validation:MaxLength=63
+		Name string `json:"name"`
+
+		// Start is a cron expression (5-field, robfig/cron, same parser as
+		// TimeTrigger) marking when each window instance opens. Prefix with
+		// "CRON_TZ=<zone>" (e.g. "CRON_TZ=America/New_York 0 9 * * *") to
+		// evaluate the schedule in a fixed timezone. Without a CRON_TZ
+		// prefix, the schedule is evaluated in the executor process's local
+		// timezone (UTC unless the deployment is configured otherwise) —
+		// this is intended behavior, not a default that may change; specify
+		// CRON_TZ explicitly if the window must not shift when the
+		// executor's local timezone changes.
+		// +kubebuilder:validation:MinLength=1
+		Start string `json:"start"`
+
+		// Duration is how long each window instance stays open. Format is Go
+		// time.ParseDuration (e.g. "12h", "30m"). Must be > 0.
+		// +kubebuilder:validation:Pattern=`^[0-9]+(ns|us|µs|ms|s|m|h)$`
+		Duration string `json:"duration"`
+
+		// Target is the effective target while the window is open. 0 means
+		// "un-warm" — provisioned pods are drained for the window's duration.
+		// +kubebuilder:validation:Minimum=0
+		Target int `json:"target"`
 	}
 
 	// InvokeStrategy is a set of controls over how the function executes.
@@ -684,7 +1637,6 @@ type (
 	// supported; this strategy would specify the target request rate of the function,
 	// the target latency statistics, and the target cost (in terms of compute resources).
 	InvokeStrategy struct {
-
 		// ExecutionStrategy specifies low-level parameters for function execution,
 		// such as the number of instances.
 		// +optional
@@ -708,7 +1660,6 @@ type (
 	// MaxScale is the maximum number of pods that function will scale to based on TargetCPUPercent
 	// and resources allocated to the function pod.
 	ExecutionStrategy struct {
-
 		// ExecutorType is the executor type of function used. Defaults to "poolmgr".
 		//
 		// Available value:
@@ -752,7 +1703,12 @@ type (
 	FunctionReferenceType string
 
 	// FunctionReference refers to a function
-	// +kubebuilder:validation:XValidation:rule="self.type != 'name' || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))",message="functionref.name must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars) when type is 'name'"
+	// +kubebuilder:validation:XValidation:rule="!(self.type in ['name', 'workflow']) || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))",message="functionref.name must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars) when type is 'name' or 'workflow'"
+	// +kubebuilder:validation:XValidation:rule="!((has(self.alias) && self.alias != '') && (has(self.version) && self.version != ''))",message="functionref.alias and functionref.version are mutually exclusive"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.alias) && self.alias != '') || self.type == 'name'",message="functionref.alias is only valid when type is 'name'"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.version) && self.version != '') || self.type == 'name'",message="functionref.version is only valid when type is 'name'"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.alias) && self.alias != '') || self.alias.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="functionref.alias must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars)"
+	// +kubebuilder:validation:XValidation:rule="!(has(self.version) && self.version != '') || self.version.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="functionref.version must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars)"
 	FunctionReference struct {
 		// Type indicates whether this function reference is by name or selector. For now,
 		// the only supported reference type is by "name".  Future reference types:
@@ -762,11 +1718,38 @@ type (
 		// Available value:
 		// - name
 		// - function-weights
-		// +kubebuilder:validation:Enum=name;function-weights
+		// - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and
+		//   firing the trigger starts a WorkflowRun)
+		// +kubebuilder:validation:Enum=name;function-weights;workflow
 		Type FunctionReferenceType `json:"type"`
 
-		// Name of the function.
+		// Name of the function. Bounded to a DNS-1123 label length: the CEL
+		// rule on this type needs the schema bound so the apiserver's cost
+		// estimator can price the regex — without it, embedding the type
+		// under a map (WorkflowSpec.States) blows the per-CRD cost budget.
+		// +kubebuilder:validation:MaxLength=63
 		Name string `json:"name"`
+
+		// Alias, when set, targets a FunctionAlias by name instead of the live
+		// Function directly (RFC-0025): the alias is a movable pointer that the
+		// router resolves at request time to whatever FunctionVersion it
+		// currently points at, so repointing the alias (e.g. for a canary
+		// rollout or a rollback) redirects traffic without touching this
+		// reference. Valid only when Type is "name"; mutually exclusive with
+		// Version. Empty (the default) preserves today's behavior: route
+		// straight to the live Function.
+		// +kubebuilder:validation:MaxLength=63
+		// +optional
+		Alias string `json:"alias,omitempty"`
+
+		// Version, when set, pins this reference to one FunctionVersion CR by
+		// name (RFC-0025) — an immutable published snapshot that never moves,
+		// unlike Alias. Valid only when Type is "name"; mutually exclusive
+		// with Alias. Empty (the default) preserves today's behavior: route
+		// straight to the live Function.
+		// +kubebuilder:validation:MaxLength=63
+		// +optional
+		Version string `json:"version,omitempty"`
 
 		// Function Reference by weight. this map contains function name as key and its weight
 		// as the value. This is for canary upgrade purpose.
@@ -869,9 +1852,28 @@ type (
 
 		// PodSpec will store the spec of the pod that will be applied to the pod created for the builder
 		PodSpec *apiv1.PodSpec `json:"podspec,omitempty"`
+
+		// IdleTimeout specifies the length of time (in seconds) that a builder is idle
+		// before it is eligible for scaling to zero. If no builds are triggered within
+		// the idle timeout, the builder deployment will be scaled to zero to release resources.
+		// Defaults to 600 seconds (10 minutes) if not set.
+		// +optional
+		IdleTimeout *int64 `json:"idleTimeout,omitempty"`
+
+		// PoolSize is the MAXIMUM number of builder pods for this environment.
+		// Builder pods are provisioned on demand — one dedicated pod per
+		// concurrent package build — and scaled up to this cap as concurrent
+		// builds arrive, then scaled back to zero by the idle reaper once builds
+		// stop. It is a ceiling, not a fixed replica count: building a single
+		// package always uses a single pod regardless of this value. Each pod is
+		// an independent isolation domain, so an OOM in one build does not affect
+		// the others. Defaults to 1 if not set or less than 1.
+		// +optional
+		PoolSize *int32 `json:"poolsize,omitempty"`
 	}
 
 	// EnvironmentSpec contains with builder, runtime and some other related environment settings.
+	// +kubebuilder:validation:XValidation:rule="!has(self.runtimeClassName) || (size(self.runtimeClassName) <= 253 && self.runtimeClassName.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))",message="spec.runtimeClassName must be lowercase alphanumeric or '-', start and end alphanumeric, at most 253 characters"
 	EnvironmentSpec struct {
 		// Version is the Environment API version
 		//
@@ -925,10 +1927,30 @@ type (
 		Poolsize int `json:"poolsize,omitempty"`
 
 		// The grace time for pod to perform connection draining before termination. The unit is in seconds.
-		// (Optional) defaults to 360 seconds
+		// A terminating function pod keeps serving for the WHOLE grace window
+		// (the preStop hook sleeps through it, then the kubelet kills the pod),
+		// so this value is exactly how long every teardown — idle reap, env
+		// update roll, upgrade, node drain — takes per pod. 90s covers endpoint
+		// propagation (seconds) plus the 60s default function timeout with
+		// margin, mirroring the router's own 75s-drain/90s-grace posture; set
+		// it per environment for functions with longer request timeouts.
+		//
+		// The CRD default below is what makes the documented default true for
+		// API-created Environments: nil means "use the default" and the
+		// apiserver fills an absent field with 90 at serving time.
+		//
+		// The *pointer* is what makes an EXPLICIT 0 ("no drain window, kill
+		// instantly") expressible from typed Go clients: on the previous
+		// int64 field, omitempty marshalled 0 as absent and the apiserver
+		// served it back as 90, so raw YAML was the only way to say 0.
+		// In-process readers must use EffectiveTerminationGracePeriod()
+		// (env_validation.go), which mirrors the CRD default for objects
+		// that never crossed the apiserver.
+		// (Optional) defaults to 90 seconds
 		// +optional
+		// +kubebuilder:default=90
 		// +kubebuilder:validation:Minimum=0
-		TerminationGracePeriod int64 `json:"terminationGracePeriod,omitempty"`
+		TerminationGracePeriod *int64 `json:"terminationGracePeriod,omitempty"`
 
 		// KeepArchive is used by fetcher to determine if the extracted archive
 		// or unarchived file should be placed, which is then used by specialize handler.
@@ -940,6 +1962,29 @@ type (
 		// private registry.
 		// +optional
 		ImagePullSecret string `json:"imagepullsecret"`
+
+		// (Optional) RuntimeClassName opts this environment's pods into a
+		// syscall-isolating RuntimeClass — for example gVisor's "gvisor" or
+		// Kata Containers' "kata" — instead of the node's default
+		// (typically runc) container runtime. It applies to BOTH this
+		// environment's runtime (warm pool / specialized) pods AND its
+		// builder pods: an author opting into isolation means "this env's
+		// workloads," and builder pods run user build commands, arguably
+		// more arbitrary-code-shaped than the runtime pods.
+		//
+		// This is fill-if-nil only: a RuntimeClassName set directly on
+		// Runtime.PodSpec (or Builder.PodSpec) is the documented full
+		// override escape hatch and always takes precedence over this
+		// field when both are set.
+		//
+		// NOT applied to container-executor functions (Tier C) — there is
+		// no Environment in scope on that path today, consistent with how
+		// Runtime.PodSpec/Builder.PodSpec are already handled.
+		//
+		// The referenced RuntimeClass object is not required to exist at
+		// admission time; an absent one fails at pod scheduling, not here.
+		// +optional
+		RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 	}
 	// AllowedFunctionsPerContainer defaults to 'single'. Related to Fission Workflows
 	AllowedFunctionsPerContainer string
@@ -988,7 +2033,18 @@ type (
 		// +kubebuilder:validation:items:Enum=GET;HEAD;POST;PUT;PATCH;DELETE;CONNECT;OPTIONS;TRACE
 		Methods []string `json:"methods,omitempty"`
 
-		// FunctionReference is a reference to the target function.
+		// InvocationMode, when "async", forces every request to this trigger into
+		// RFC-0024 asynchronous invocation even without the X-Fission-Invoke-Mode
+		// header (webhooks from third parties cannot set headers). "" (the default)
+		// leaves the per-request header in control.
+		// +optional
+		// +kubebuilder:validation:Enum="";async
+		InvocationMode string `json:"invocationMode,omitempty"`
+
+		// FunctionReference is a reference to the target function. With type
+		// "workflow" it names a Workflow instead: a request starts a
+		// WorkflowRun with the JSON body as its input and gets 202
+		// {"run": ..., "workflow": ...} back (nothing waits for the run).
 		FunctionReference FunctionReference `json:"functionref"`
 
 		// If CreateIngress is true, router will create an ingress definition.
@@ -1183,6 +2239,7 @@ type (
 	}
 
 	// KubernetesWatchTriggerSpec defines spec of KuberenetesWatchTrigger
+	// +kubebuilder:validation:XValidation:rule="self.functionref.type != 'workflow'",message="a kubernetes watch trigger cannot target a workflow"
 	KubernetesWatchTriggerSpec struct {
 		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 		// +kubebuilder:validation:MaxLength=63
@@ -1206,6 +2263,7 @@ type (
 
 	// MessageQueueTriggerSpec defines a binding from a topic in a
 	// message queue to a function.
+	// +kubebuilder:validation:XValidation:rule="self.functionref.type != 'workflow'",message="a message queue trigger cannot target a workflow"
 	MessageQueueTriggerSpec struct {
 		// The reference to a function for message queue trigger to invoke with
 		// when receiving messages from subscribed topic.
@@ -1280,7 +2338,12 @@ type (
 		// Cron schedule
 		Cron string `json:"cron"`
 
-		// The reference to function
+		// The reference to function. Alias is read from the embedded
+		// FunctionReference.Alias (RFC-0025) — TimeTriggerSpec has no field of
+		// its own for it, so there is exactly one JSON path (spec.functionref.alias)
+		// and one Go path (spec.Alias, promoted) for the concept, never two
+		// competing ones. The timer publisher (a later RFC-0025 task) reads it
+		// the same way timer.go:80 already reads the promoted spec.Name today.
 		FunctionReference `json:"functionref"`
 
 		// HTTP Method for trigger, ex : GET, POST, PUT, DELETE, HEAD (default: "POST")
@@ -1293,6 +2356,12 @@ type (
 		// +kubebuilder:default:="/"
 		// +optional
 		Subpath string `json:"subpath,omitempty"`
+
+		// WorkflowInput is the input of every run a workflow-targeting
+		// trigger (functionref.type "workflow") starts. Any JSON value; empty
+		// means {}. Ignored for function targets.
+		// +optional
+		WorkflowInput *apiextensionsv1.JSON `json:"workflowInput,omitempty"`
 	}
 	// FailureType refers to the type of failure
 	FailureType string
@@ -1343,6 +2412,28 @@ type (
 		// controller observed when it last updated the status.
 		// +optional
 		ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+		// ProvisionedReady is the number of warm specialized pods the provisioner
+		// is currently maintaining for this function (RFC-0026). Only meaningful
+		// when Spec.ProvisionedConcurrency is non-nil. Reported by the executor's
+		// provisioner on each reconcile pass.
+		// +optional
+		ProvisionedReady int `json:"provisionedReady,omitempty"`
+
+		// ProvisionedTarget is the effective target the provisioner is currently
+		// aiming for (base Target, or a schedule-window override in PR 2). Lets
+		// `fission fn get` show "3/5 provisioned pods ready".
+		// +optional
+		ProvisionedTarget int `json:"provisionedTarget,omitempty"`
+
+		// ProvisionedSpecTarget is the raw Target from spec (before the namespace
+		// cap clamp). When ProvisionedSpecTarget > ProvisionedTarget, the
+		// provisioner clamped the target to the namespace cap
+		// (executor.provisionedConcurrency.maxPerFunction) and the Provisioned
+		// condition carries reason ProvisionedClamped. Lets `fission fn get`
+		// show the spec-vs-effective divergence.
+		// +optional
+		ProvisionedSpecTarget int `json:"provisionedSpecTarget,omitempty"`
 
 		// Conditions represent the latest observations of the function's state.
 		// +optional
@@ -1434,6 +2525,15 @@ type (
 // IsEmpty checks if the archive byte and litreal are of length 0
 func (a Archive) IsEmpty() bool {
 	return len(a.Literal) == 0 && len(a.URL) == 0 && a.OCI == nil
+}
+
+// HasBuilder reports whether this environment can run package builds: v1
+// environments predate builders, and without a builder image there is nothing
+// to run one in. Shared by buildermgr's EnvironmentReconciler (which skips
+// builder creation on !HasBuilder) and the CLI's build watch (which refuses
+// to wait on a build that can never start).
+func (env Environment) HasBuilder() bool {
+	return env.Spec.Version != 1 && len(env.Spec.Builder.Image) > 0
 }
 
 func (fn Function) GetConcurrency() int {

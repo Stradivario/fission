@@ -62,9 +62,23 @@ rules:
   - apps
   resources:
   - deployments
+  # deployments/scale is required by the builder pool: the package reconciler
+  # scales builder deployments UP on demand (reads replicas via deployments/get,
+  # writes via deployments/scale UpdateScale) and the idle reaper scales them
+  # back to zero. Without get on deployments and update on the scale subresource
+  # the buildermgr SA is RBAC-forbidden and builds fail to dispatch.
+  - deployments/scale
   verbs:
+  - get
   - list
+  - watch
   - create
+  # update: the reconciler rolls a builder Deployment whose pod template has
+  # drifted from the chart (RFC-0028 phase 3, #776). Without this verb the
+  # drift is detected and the update is denied, so the builder silently keeps
+  # running the stale image — the exact symptom the feature removes.
+  - update
+  - patch
   - delete
 - apiGroups:
   - apiextensions.k8s.io
@@ -248,6 +262,18 @@ rules:
   - list
   - watch
 {{- end }}
+{{- define "statestore-mqt-kuberules" }}
+rules:
+{{- include "leases-kuberules" . }}
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+{{- end }}
+
 {{- define "kafka-kuberules" }}
 rules:
 {{- include "leases-kuberules" . }}

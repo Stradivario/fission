@@ -45,6 +45,19 @@ func (gp *GenericPool) getDeployAnnotations(env *fv1.Environment) map[string]str
 	return deployAnnotations
 }
 
+// podRelabelPatch is the strategic-merge patch that claims a pool pod for a
+// function. No omitempty on either map: a nil map marshals as null, which is
+// delete-semantics under StrategicMergePatchType, and omitting the key would
+// silently turn that into a no-op.
+type podRelabelPatch struct {
+	Metadata podRelabelMetadata `json:"metadata"`
+}
+
+type podRelabelMetadata struct {
+	Annotations map[string]string `json:"annotations"`
+	Labels      map[string]string `json:"labels"`
+}
+
 // choosePod picks a ready pod from the pool and relabels it, waiting if necessary.
 // returns the key and pod API object.
 func (gp *GenericPool) choosePod(ctx context.Context, newLabels map[string]string) (string, *apiv1.Pod, error) {
@@ -114,7 +127,22 @@ func (gp *GenericPool) choosePod(ctx context.Context, newLabels map[string]strin
 			// requeued with exponential backoff and re-checked, so this is an
 			// expected retry, not an error (it was logged at Error with a nil
 			// error, which flooded the executor log during pool warm-up).
-			logger.V(1).Info("pod not ready, pod will be checked again", "key", key, "delay", expoDelay)
+			//
+			// Distinguish "no container statuses yet" (the race that causes
+			// fetcher i/o timeouts — kubelet has not reported container status
+			// so the fetcher HTTP server may not be listening) from "container
+			// reported but not Ready" (normal warmup) so the log line is
+			// actionable when debugging.
+			if len(pod.Status.ContainerStatuses) == 0 {
+				logger.Info("pod not ready: containerStatuses empty (kubelet has not reported yet)",
+					"key", key, "pod", pod.Name, "podIP", pod.Status.PodIP,
+					"phase", pod.Status.Phase, "delay", expoDelay)
+			} else {
+				ready, total := utils.PodContainerReadyStatus(pod)
+				logger.V(1).Info("pod not ready, pod will be checked again",
+					"key", key, "delay", expoDelay,
+					"readyContainers", ready, "totalContainers", total)
+			}
 			gp.readyPodQueue.Done(key)
 			gp.readyPodQueue.AddAfter(key, expoDelay)
 			expoDelay *= 2
@@ -130,12 +158,14 @@ func (gp *GenericPool) choosePod(ctx context.Context, newLabels map[string]strin
 			// Append executor instance id to pod annotations to
 			// indicate this pod is managed by this executor.
 			annotations := gp.getDeployAnnotations(gp.env)
-			patch := map[string]any{
-				"metadata": map[string]any{
-					"annotations": annotations,
-					"labels":      newLabels,
-				},
-			}
+			patch := podRelabelPatch{Metadata: podRelabelMetadata{
+				Annotations: annotations,
+				Labels:      newLabels,
+			}}
+			// Stays on encoding/json (v1): this is a StrategicMergePatch,
+			// where a nil map marshals as null (= delete the field) under v1
+			// but as {} (= no-op) under json/v2 — a semantic change, not just
+			// a byte-level one.
 			patchBytes, _ := json.Marshal(patch)
 			logger.Info("relabel pod", "pod", string((patchBytes)))
 			newPod, err := gp.kubernetesClient.CoreV1().Pods(chosenPod.Namespace).Patch(ctx, chosenPod.Name, k8sTypes.StrategicMergePatchType, patchBytes, metav1.PatchOptions{})
@@ -192,12 +222,16 @@ func (gp *GenericPool) labelsForFunction(metadata *metav1.ObjectMeta) map[string
 }
 
 // specializedPodLabels is labelsForFunction plus the function-generation label
-// (RFC-0002). Used for the choosePod relabel only — listing/selection paths
+// (RFC-0002), and the function-version label when metadata carries one
+// (RFC-0025) -- mirroring functionServiceSelector's belt-and-braces addition
+// so the specialized pod stays self-describing alongside the Service that
+// selects it. Used for the choosePod relabel only — listing/selection paths
 // (RefreshFuncPods, the legacy useSvc/istio selectors) keep labelsForFunction so
 // they still match pods of every generation.
 func (gp *GenericPool) specializedPodLabels(metadata *metav1.ObjectMeta) map[string]string {
 	label := gp.labelsForFunction(metadata)
 	label[fv1.FUNCTION_GENERATION] = strconv.FormatInt(metadata.Generation, 10)
+	copyVersionLabel(label, metadata.Labels)
 	return label
 }
 

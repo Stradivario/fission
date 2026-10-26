@@ -15,6 +15,7 @@ import (
 	"errors"
 
 	"github.com/dchest/uniuri"
+	apiv1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
@@ -29,6 +30,30 @@ import (
 	"github.com/fission/fission/pkg/utils"
 	"github.com/fission/fission/pkg/utils/uuid"
 )
+
+// secretFlagRequiresURL validates that a credential secret flag rides a
+// single URL archive argument (RFC-0031): local files upload to storagesvc,
+// whose internal HMAC transport must never mix with external credentials,
+// and the CLI cannot hash a private URL it holds no credentials for.
+func secretFlagRequiresURL(secretFlag, archiveFlag string, files []string) error {
+	if len(files) == 1 && utils.IsURL(files[0]) {
+		return nil
+	}
+	return fmt.Errorf("--%v requires --%v to be a single URL", secretFlag, archiveFlag)
+}
+
+// attachArchiveSecret sets the RFC-0031 SecretRef on a freshly built url
+// archive and reapplies an explicitly provided checksum. CreateArchive is
+// called with insecure=true for credentialed URLs — the anonymous
+// checksum-generation download would 401 against a private store, and the
+// CLI must never hold the archive credentials (they live in the cluster
+// Secret, read by the fetcher at fetch time).
+func attachArchiveSecret(archive *fv1.Archive, secretName, checksum string) {
+	archive.SecretRef = &apiv1.LocalObjectReference{Name: secretName}
+	if checksum != "" {
+		archive.Checksum = fv1.Checksum{Type: fv1.ChecksumTypeSHA256, Sum: checksum}
+	}
+}
 
 // CreateArchive returns a fv1.Archive made from an archive .  If specFile, then
 // create an archive upload spec in the specs directory; otherwise
@@ -143,7 +168,7 @@ func CreateArchive(client cmd.Client, input cli.Input, includeFiles []string, no
 		}
 
 		if input.Bool(flagkey.SpecDry) {
-			err := spec.SpecDry(*aus)
+			err := spec.SpecDryArchiveUploadSpec(*aus)
 			if err != nil {
 				return nil, err
 			}
@@ -155,14 +180,12 @@ func CreateArchive(client cmd.Client, input cli.Input, includeFiles []string, no
 				return nil, fmt.Errorf("error reading specs: %w", err)
 			}
 
-			obj := fr.SpecExists(aus, true, true)
-			if obj != nil {
-				oldAus := obj.(*spectypes.ArchiveUploadSpec)
+			if oldAus := fr.ArchiveUploadSpecInSpecs(aus, true, true); oldAus != nil {
 				fmt.Printf("Re-using previously created archive %v\n", oldAus.Name)
 				aus.Name = oldAus.Name
 			} else {
 				// save the uploadspec
-				err := spec.SpecSave(*aus, specFile, false)
+				err := spec.SpecSaveArchiveUploadSpec(*aus, specFile, false)
 				if err != nil {
 					return nil, fmt.Errorf("error saving archive spec: %w", err)
 				}

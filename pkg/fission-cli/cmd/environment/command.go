@@ -18,11 +18,11 @@ func Commands() *cobra.Command {
 	}, Create, flag.FlagSet{
 		Required: []flag.Flag{flag.EnvName, flag.EnvImage},
 		Optional: []flag.Flag{
-			flag.EnvPoolsize, flag.EnvBuilderImage, flag.EnvBuildCmd,
+			flag.EnvPoolsize, flag.EnvBuilderImage, flag.EnvBuildCmd, flag.EnvBuilderIdleTimeout, flag.EnvBuilderPoolsize,
 			flag.RunTimeMinCPU, flag.RunTimeMaxCPU, flag.RunTimeMinMemory, flag.RunTimeMaxMemory,
 			flag.EnvTerminationGracePeriod, flag.EnvVersion, flag.EnvImagePullSecret, flag.EnvKeepArchive,
 			flag.EnvExternalNetwork, flag.Labels, flag.Annotation,
-			flag.SpecSave, flag.SpecDry, flag.EnvBuilder, flag.EnvRuntime},
+			flag.SpecSave, flag.SpecDry, flag.EnvBuilder, flag.EnvRuntime, flag.EnvRuntimeClass},
 	})
 
 	getCmd := wrapper.SubCommand(&cobra.Command{
@@ -30,7 +30,7 @@ func Commands() *cobra.Command {
 		Short: "Get environment details",
 	}, Get, flag.FlagSet{
 		Required: []flag.Flag{flag.EnvName},
-		Optional: []flag.Flag{},
+		Optional: []flag.Flag{flag.Output},
 	})
 
 	updateCmd := wrapper.SubCommand(&cobra.Command{
@@ -39,10 +39,10 @@ func Commands() *cobra.Command {
 	}, Update, flag.FlagSet{
 		Required: []flag.Flag{flag.EnvName},
 		Optional: []flag.Flag{flag.EnvImage, flag.EnvPoolsize,
-			flag.EnvBuilderImage, flag.EnvBuildCmd, flag.EnvImagePullSecret,
+			flag.EnvBuilderImage, flag.EnvBuildCmd, flag.EnvBuilderIdleTimeout, flag.EnvBuilderPoolsize, flag.EnvImagePullSecret,
 			flag.RunTimeMinCPU, flag.RunTimeMaxCPU, flag.RunTimeMinMemory, flag.RunTimeMaxMemory,
 			flag.EnvTerminationGracePeriod, flag.EnvKeepArchive, flag.EnvRuntime,
-			flag.EnvExternalNetwork,
+			flag.EnvExternalNetwork, flag.EnvRuntimeClass,
 			flag.Labels, flag.Annotation},
 	})
 
@@ -72,13 +72,25 @@ func Commands() *cobra.Command {
 		Optional: []flag.Flag{flag.EnvExecutorType},
 	})
 
+	impactCmd := wrapper.SubCommand(&cobra.Command{
+		Use:   "impact",
+		Short: "Show functions and aliases affected by this environment, and their env-drift status",
+		Long: "List every function that references this environment and, for each of its aliases, whether the " +
+			"alias's resolved version was published under an environment generation the live environment has " +
+			"since moved past (RFC-0025 env drift) — the batch, ahead-of-an-update view of `fission fn describe`'s " +
+			"per-alias EnvDrift condition.",
+	}, Impact, flag.FlagSet{
+		Required: []flag.Flag{flag.EnvName},
+		Optional: []flag.Flag{flag.Output},
+	})
+
 	command := &cobra.Command{
 		Use:     "environment",
 		Aliases: []string{"env"},
 		Short:   "Create, update and manage environments",
 	}
 
-	command.AddCommand(createCmd, getCmd, updateCmd, deleteCmd, listCmd, listPodsCmd)
+	command.AddCommand(createCmd, getCmd, updateCmd, deleteCmd, listCmd, listPodsCmd, impactCmd)
 
 	return command
 }

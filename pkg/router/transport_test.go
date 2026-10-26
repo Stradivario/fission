@@ -20,7 +20,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/error/network"
@@ -35,9 +34,25 @@ type scriptedResolver struct {
 	fromCache   bool
 	calls       atomic.Int64
 	invalidated atomic.Int64
+	// lastStickyKey records the stickyKey RoundTrip passed into the most
+	// recent Resolve call (RFC-0025 Task 5 test seam: proves the Admit-side
+	// key the resolver ranks endpoints by is exactly what the caller
+	// computed, e.g. what a weighted pick already consumed).
+	lastStickyKey atomic.Pointer[string]
+	// lastFnName records the resolved fn's Name from the most recent Resolve
+	// call -- a second RFC-0025 Task 5 test seam, proving WHICH backend the
+	// weighted pick actually chose (fh.function is unobservable from outside
+	// handler() directly, since functionHandler.handler has a value
+	// receiver).
+	lastFnName atomic.Pointer[string]
 }
 
-func (s *scriptedResolver) Resolve(_ context.Context, _ *fv1.Function) (ResolvedEntry, error) {
+func (s *scriptedResolver) Resolve(_ context.Context, fn *fv1.Function, stickyKey string) (ResolvedEntry, error) {
+	s.lastStickyKey.Store(&stickyKey)
+	if fn != nil {
+		name := fn.Name
+		s.lastFnName.Store(&name)
+	}
 	n := int(s.calls.Add(1)) - 1
 	if n >= len(s.answers) {
 		n = len(s.answers) - 1
@@ -68,7 +83,7 @@ func (n *nopTapper) UnTap(_ context.Context, _ *fv1.Function, u *url.URL) error 
 }
 
 func poolmgrFnForTransport() *fv1.Function {
-	fn := &fv1.Function{ObjectMeta: metav1.ObjectMeta{Name: "fn", Namespace: "default"}}
+	fn := &fv1.Function{Name: "fn", Namespace: "default"}
 	fn.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType = fv1.ExecutorTypePoolmgr
 	return fn
 }
@@ -199,7 +214,7 @@ type releaseTrackingResolver struct {
 	mu          sync.Mutex
 }
 
-func (s *releaseTrackingResolver) Resolve(_ context.Context, _ *fv1.Function) (ResolvedEntry, error) {
+func (s *releaseTrackingResolver) Resolve(_ context.Context, _ *fv1.Function, _ string) (ResolvedEntry, error) {
 	n := int(s.calls.Add(1)) - 1
 	if n >= len(s.answers) {
 		n = len(s.answers) - 1
@@ -519,7 +534,7 @@ type reasonRecordingResolver struct {
 	hard   atomic.Int64
 }
 
-func (s *reasonRecordingResolver) Resolve(_ context.Context, _ *fv1.Function) (ResolvedEntry, error) {
+func (s *reasonRecordingResolver) Resolve(_ context.Context, _ *fv1.Function, _ string) (ResolvedEntry, error) {
 	return ResolvedEntry{SvcURL: s.answer, FromCache: true, Release: func() {}}, nil
 }
 

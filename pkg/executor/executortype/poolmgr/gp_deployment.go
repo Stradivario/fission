@@ -70,10 +70,12 @@ func (gp *GenericPool) genDeploymentSpec(env *fv1.Environment) (*appsv1.Deployme
 	deployLabels := gp.getEnvironmentPoolLabels(env)
 	// Use long terminationGracePeriodSeconds for connection draining in case that
 	// pod still runs user functions.
-	gracePeriodSeconds := int64(6 * 60)
-	if env.Spec.TerminationGracePeriod >= 0 {
-		gracePeriodSeconds = env.Spec.TerminationGracePeriod
-	}
+	// Effective value: the apiserver fills an absent field with the CRD
+	// default (90); the helper mirrors that for objects that never crossed
+	// it. An explicit 0 — expressible from typed clients since the field
+	// became a pointer — means no drain window: DrainLifecycle then emits no
+	// preStop hook.
+	gracePeriodSeconds := env.Spec.EffectiveTerminationGracePeriod()
 
 	podAnnotations := env.Annotations
 	if podAnnotations == nil {
@@ -98,12 +100,26 @@ func (gp *GenericPool) genDeploymentSpec(env *fv1.Environment) (*appsv1.Deployme
 		podAnnotations["sidecar.istio.io/inject"] = "false"
 	}
 
-	podLabels := env.Labels
+	// Clone, never alias: env is caller-owned and long-lived (gp.env, which
+	// labelsForFunction copies on every specialization). maps.Copy below
+	// writes the pool labels into this map — and since RFC-0028 a
+	// per-runtime-hash label too. Aliasing leaked both into env.Labels, from
+	// where getEnvironmentPoolLabels copies them into the RefreshFuncPods
+	// list selector and the legacy useSvc Service selector, pinning those to
+	// one runtime revision.
+	podLabels := maps.Clone(env.Labels)
 	if podLabels == nil {
 		podLabels = make(map[string]string)
 	}
 
 	maps.Copy(podLabels, deployLabels)
+	// Template labels ONLY — deployLabels doubles as the immutable Deployment
+	// selector, and a hash there would break every env update. The pod
+	// inherits this label through the RS, and choosePod's specialization
+	// relabel is additive, so specialized pods keep their birth hash — which
+	// is what lets processRS tell an env runtime change from an executor
+	// roll.
+	podLabels[fv1.ENVIRONMENT_RUNTIME_HASH] = envRuntimeHash(env)
 
 	container, err := util.MergeContainer(&apiv1.Container{
 		Name:                   env.Name,
@@ -111,6 +127,11 @@ func (gp *GenericPool) genDeploymentSpec(env *fv1.Environment) (*appsv1.Deployme
 		ImagePullPolicy:        gp.runtimeImagePullPolicy,
 		TerminationMessagePath: "/dev/termination-log",
 		Resources:              env.Spec.Resources,
+		// RFC-0023: the function-agnostic state API location. The per-function
+		// token is NOT an env var here — a generic pod's user container starts
+		// before its function is known; the fetcher writes the token file at
+		// specialize time (FISSION_STATE_TOKEN_PATH points the SDK at it).
+		Env: util.StateAPIEnvVars(gp.fetcherConfig.SharedMountPath()),
 		// Connection-draining preStop hook; see utils.DrainLifecycle.
 		Lifecycle: utils.DrainLifecycle(gracePeriodSeconds),
 		// https://istio.io/docs/setup/kubernetes/additional-setup/requirements/
@@ -232,6 +253,12 @@ func (gp *GenericPool) genDeploymentSpec(env *fv1.Environment) (*appsv1.Deployme
 		// container. See GHSA-85g2-pmrx-r49q.
 		deploymentSpec.Template.Spec.AutomountServiceAccountToken = new(false)
 	}
+
+	// Fill-if-nil: applies env.Spec.RuntimeClassName only when the merge
+	// above (or the base spec) left RuntimeClassName unset, so a
+	// Runtime.PodSpec override always wins. Unconditional — an env can set
+	// RuntimeClassName with no Runtime.PodSpec at all.
+	util.ApplyEnvRuntimeClass(&deploymentSpec.Template.Spec, env)
 
 	if gp.oci != nil {
 		// Path B: mount the package image read-only at the fetcher's store

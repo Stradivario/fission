@@ -21,6 +21,8 @@ import (
 
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	ferror "github.com/fission/fission/pkg/error"
@@ -85,6 +87,22 @@ type (
 		isDebugEnv  bool
 		funcTimeout time.Duration
 		policy      proxyPolicy // resolved once in handler; drives streaming behavior
+		// stickyKey is the RFC-0023 sticky routing key, precomputed ONCE by
+		// functionHandler.handler() (RFC-0025 Task 5) from the route's
+		// stickySource -- before any per-request weighted pick -- and passed
+		// down here unchanged. RoundTrip consumes it as-is rather than
+		// recomputing from fn (the chosen backend): recomputing here could
+		// disagree with the key the weighted pick already used, corrupting
+		// the pick/admit consistency invariant. "" means unkeyed (not
+		// sticky-declared, or the declared key was absent from the request).
+		stickyKey string
+		// bases is fn's hoisted functionURLBases result (RFC-0014-style,
+		// see functionHandler.basesFor), precomputed by functionHandler.handler()
+		// before RoundTrip is ever called. nil when a caller builds a
+		// RetryingRoundTripper directly without going through functionHandler
+		// (test harnesses) -- RoundTrip falls back to deriving it from fn on
+		// the spot in that case.
+		bases []string
 
 		closeContextFunc *context.CancelFunc
 		serviceURL       *url.URL
@@ -149,6 +167,12 @@ func (roundTripper *RetryingRoundTripper) settle(release func(), tapURL *url.URL
 func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 
+	// RFC-0023 sticky routing: the key is precomputed by functionHandler.
+	// handler() (RFC-0025 Task 5, see the stickyKey field doc) and stable
+	// across the retry loop, so every re-resolve ranks the same owner AND
+	// agrees with whatever weighted pick already consumed it.
+	stickyKey := roundTripper.stickyKey
+
 	// set the timeout for transport context
 	addForwardedHostHeader(req)
 	transport, otelTransport := roundTripper.params.sharedTransport()
@@ -163,6 +187,7 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 	// close req body
 	defer func() {
 		if req.Body != nil {
+			// SAFETY: a non-nil req.Body was wrapped in a *fakeCloseReadCloser just above, and nothing in this function replaces it.
 			err := req.Body.(*fakeCloseReadCloser).RealClose()
 			if err != nil {
 				roundTripper.logger.Error(err, "Error closing body")
@@ -202,7 +227,7 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 			}
 			// get function service url from cache or executor
 			var entry ResolvedEntry
-			entry, err = roundTripper.resolver.Resolve(ctx, roundTripper.fn)
+			entry, err = roundTripper.resolver.Resolve(ctx, roundTripper.fn, stickyKey)
 			// Return any previously-admitted slot this re-resolve abandons. The
 			// per-resolve defers below cover the classic path at exit, but a
 			// streaming request defers its release to the handler, which only
@@ -274,7 +299,14 @@ func (roundTripper *RetryingRoundTripper) RoundTrip(req *http.Request) (*http.Re
 
 			// rewrite the request to reflect the service url (which comes from
 			// the executor response) and the trigger's prefix specification.
-			rewriteFunctionURL(logger, req, roundTripper.trigger, fnMeta, roundTripper.serviceURL)
+			// bases is normally already hoisted (functionHandler.handler());
+			// the nil fallback only fires for a RetryingRoundTripper built
+			// directly (test harnesses bypassing functionHandler).
+			bases := roundTripper.bases
+			if bases == nil {
+				bases = functionURLBases(fnMeta)
+			}
+			rewriteFunctionURL(logger, req, roundTripper.trigger, bases, roundTripper.serviceURL)
 		}
 
 		// Do NOT assign returned request to "req"
@@ -594,4 +626,33 @@ func debugDumpResponse(logger logr.Logger, response *http.Response) {
 	} else {
 		logger.V(1).Info("round tripper response", "response", string(respMsg))
 	}
+}
+
+// stickyKeyFromRequest extracts the RFC-0023 sticky routing key declared by
+// the function's StickyConfig from req ("" = not sticky-declared or the key
+// is absent — the resolver then uses the default least-outstanding pick,
+// documented as a silent fallback, not an error). Also the metrics seam: a
+// declared-but-missing key is what fission_router_sticky_key_missing_total
+// surfaces to operators.
+func stickyKeyFromRequest(fn *fv1.Function, req *http.Request) string {
+	if fn == nil || fn.Spec.State == nil || fn.Spec.State.Sticky == nil {
+		return ""
+	}
+	var key string
+	switch fn.Spec.State.Sticky.Source {
+	case fv1.StickySourceHeader:
+		key = req.Header.Get(fn.Spec.State.Sticky.Name)
+	case fv1.StickySourceQueryParam:
+		key = req.URL.Query().Get(fn.Spec.State.Sticky.Name)
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("function_namespace", fn.Namespace),
+		attribute.String("function_name", fn.Name),
+	}
+	if key == "" {
+		stickyKeyMissing.Add(req.Context(), 1, metric.WithAttributes(attrs...))
+		return ""
+	}
+	stickyKeyRequests.Add(req.Context(), 1, metric.WithAttributes(attrs...))
+	return key
 }

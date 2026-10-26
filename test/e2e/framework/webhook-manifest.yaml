@@ -24,6 +24,26 @@ webhooks:
     resources:
     - packages
   sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /mutate-fission-io-v1-workflow
+  failurePolicy: Fail
+  name: mworkflow.fission.io
+  rules:
+  - apiGroups:
+    - fission.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workflows
+  sideEffects: None
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -69,6 +89,47 @@ webhooks:
     - UPDATE
     resources:
     - functions
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-fission-io-v1-functionalias
+  failurePolicy: Fail
+  name: vfunctionalias.fission.io
+  rules:
+  - apiGroups:
+    - fission.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - functionaliases
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-fission-io-v1-functionversion
+  failurePolicy: Fail
+  name: vfunctionversion.fission.io
+  rules:
+  - apiGroups:
+    - fission.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    - DELETE
+    resources:
+    - functionversions
   sideEffects: None
 - admissionReviewVersions:
   - v1
@@ -128,4 +189,44 @@ webhooks:
     - UPDATE
     resources:
     - packages
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-fission-io-v1-workflow
+  failurePolicy: Fail
+  name: vworkflow.fission.io
+  rules:
+  - apiGroups:
+    - fission.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workflows
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-fission-io-v1-workflowrun
+  failurePolicy: Fail
+  name: vworkflowrun.fission.io
+  rules:
+  - apiGroups:
+    - fission.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - workflowruns
   sideEffects: None

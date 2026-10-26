@@ -9,7 +9,17 @@ spec:
   replicas: {{ .Values.executor.replicas | default 1 }}
   {{- with .Values.executor.strategy }}
   strategy:
+    {{- if eq (.type | default "RollingUpdate") "Recreate" }}
+    {{- /* The API forbids a rollingUpdate block alongside type Recreate, and
+         helm --set MERGES into the default's rollingUpdate — so a user opting
+         out with `--set executor.strategy.type=Recreate` would otherwise
+         render an invalid Deployment (the same Forbidden error the upgrade
+         gate caught when Recreate was briefly the default). Emit only the
+         type. */}}
+    type: Recreate
+    {{- else }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
   selector:
     matchLabels:
@@ -51,12 +61,22 @@ spec:
           value: "{{ .Values.pullPolicy }}"
         - name: ADOPT_EXISTING_RESOURCES
           value: {{ .Values.executor.adoptExistingResources | default false | quote }}
+        # Consumed by utils.ServiceFQDN when building newdeploy/container
+        # function-service addresses (absolute names, no search-path walk).
+        - name: CLUSTER_DOMAIN
+          value: {{ .Values.clusterDomain | quote }}
         - name: FINALIZER_ENABLED
           value: {{ .Values.finalizerEnabled | quote }}
         - name: POD_READY_TIMEOUT
           value: {{ .Values.executor.podReadyTimeout | default false | quote }}
         - name: ENABLE_ISTIO
           value: "{{ .Values.enableIstio }}"
+        {{- if .Values.functionState.enabled }}
+        # RFC-0023: the executor stamps this URL into function pods as
+        # FISSION_STATE_URL; unset (feature off) keeps pods byte-identical.
+        - name: STATESVC_URL
+          value: "http://statesvc.{{ .Release.Namespace }}:{{ include "fission.statesvcPort" . }}"
+        {{- end }}
         - name: FETCHER_MINCPU
           value: {{ .Values.fetcher.resource.cpu.requests | quote }}
         - name: FETCHER_MINMEM
@@ -92,6 +112,16 @@ spec:
         - name: EXECUTOR_MAX_PENDING_SPECIALIZATIONS_PER_FUNCTION
           value: {{ .Values.executor.maxPendingSpecializations | quote }}
         {{- end }}
+        {{- if .Values.executor.provisionedConcurrency.enabled }}
+        - name: EXECUTOR_PROVISIONED_CONCURRENCY_ENABLED
+          value: "true"
+        - name: EXECUTOR_PROVISIONED_MAX_PER_FUNCTION
+          value: {{ .Values.executor.provisionedConcurrency.maxPerFunction | quote }}
+        - name: EXECUTOR_PROVISIONED_MAX_INFLIGHT_PER_FUNCTION
+          value: {{ .Values.executor.provisionedConcurrency.maxInflightPerFunction | quote }}
+        - name: EXECUTOR_PROVISIONED_RECONCILE_INTERVAL
+          value: {{ .Values.executor.provisionedConcurrency.reconcileInterval | quote }}
+        {{- end }}
         - name: DEBUG_ENV
           value: {{ .Values.debugEnv | quote }}
         - name: PPROF_ENABLED
@@ -124,6 +154,13 @@ spec:
           value: {{ .Release.Name | quote }}
         {{- include "opentelemtry.envs" . | indent 8 }}
         {{- include "internalAuth.envs" . | indent 8 }}
+        # Only consulted when eventHooks.functionDeploy targets a Fission function
+        # (see eventHooks.envs below); same listener/value as timer, kubewatcher,
+        # mqt — /fission-function/<ns>/<name> lives only on the router's internal
+        # listener (GHSA-3g33-6vg6-27m8).
+        - name: ROUTER_INTERNAL_URL
+          value: {{ include "fission.routerInternalURL" . | quote }}
+        {{- include "eventHooks.envs" . | indent 8 }}
         {{- include "coverage.envs" . | indent 8 }}
         resources:
           {{- toYaml .Values.executor.resources | nindent 10 }}

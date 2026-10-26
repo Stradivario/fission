@@ -1,0 +1,323 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// Package asyncinvoke implements RFC-0024 asynchronous invocation for the router:
+// the enqueue branch that durably accepts an async request (202 + invocation id)
+// and the dispatcher that leases, delivers, and settles it at-least-once against
+// the RFC-0021 statestore Queue.
+//
+// The invocation id returned to the caller is the statestore Queue's durable
+// message id, so a dedup-collapsed enqueue returns the original id and the id is
+// stable across retries and DLQ redrive. The Envelope therefore does not carry an
+// id of its own; the dispatcher reads it from the leased message.
+package asyncinvoke
+
+import (
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"net/http"
+	"strings"
+	"time"
+)
+
+const (
+	// EnvelopeVersion is the wire-format version of the durable envelope. Phase 2
+	// (destinations, result envelope) extends the format additively.
+	EnvelopeVersion = "1.0"
+
+	// DefaultQueue is the single global async-invocation queue. The namespace
+	// travels in the envelope, so one queue serves every namespace: statestore's
+	// SKIP LOCKED lets all router replicas lease it concurrently, and there is no
+	// per-namespace queue discovery or orphan-queue draining problem.
+	DefaultQueue = "asyncinv"
+
+	// DefaultMaxBodyBytes is the async request-body cap (Lambda-parity 256KiB).
+	// Oversized requests are rejected with 413, never spilled (RFC-0024 non-goal).
+	DefaultMaxBodyBytes = 256 << 10
+)
+
+// Request/replay headers. The enqueue branch reads the first three from the
+// incoming request; the dispatcher sets the last three on each delivery so the
+// function (and downstream correlation) can see the invocation identity.
+const (
+	HeaderInvokeMode        = "X-Fission-Invoke-Mode"        // "async" opts a request into async mode
+	HeaderDedupKey          = "X-Fission-Dedup-Key"          // idempotency key for enqueue collapse
+	HeaderInvocationID      = "X-Fission-Invocation-Id"      // durable invocation id, replayed on delivery
+	HeaderInvocationAttempt = "X-Fission-Invocation-Attempt" // 1-based delivery attempt, replayed on delivery
+	HeaderInvocationDepth   = "X-Fission-Invocation-Depth"   // destination-chain depth, replayed on delivery
+)
+
+// InvokeModeAsync is the HeaderInvokeMode value that requests async invocation.
+const InvokeModeAsync = "async"
+
+// Policy is the resolved async delivery policy carried in the envelope, stamped
+// from the function's InvocationConfig at enqueue so the dispatcher is
+// self-contained (it never re-reads the Function, which may have changed or been
+// deleted). Durations are nanoseconds on the wire; a zero field means the
+// dispatcher's platform default.
+type Policy struct {
+	MaxAttempts int           `json:"maxAttempts,omitempty"`
+	BackoffBase time.Duration `json:"backoffBase,omitempty"`
+	BackoffCap  time.Duration `json:"backoffCap,omitempty"`
+	MaxAge      time.Duration `json:"maxAge,omitempty"`
+	NoJitter    bool          `json:"noJitter,omitempty"`
+}
+
+// Envelope is the durable, self-contained record of one asynchronous invocation.
+// It carries everything the dispatcher needs to replay the request to the
+// function's internal listener without re-resolving the trigger, so a delivery
+// survives a router crash or redeploy. It is JSON-encoded into a statestore Queue
+// message body.
+type Envelope struct {
+	// Version is EnvelopeVersion at enqueue time.
+	Version string `json:"version"`
+	// Namespace and Function identify the resolved backend (the async branch runs
+	// after trigger resolution, so this is the concrete function, not a trigger).
+	Namespace string `json:"namespace"`
+	Function  string `json:"function"`
+	// FunctionVersion is the RFC-0025 FunctionVersion CR name the backend was
+	// pinned to: for a primary invocation, stamped at enqueue time from the
+	// resolved function object's fv1.FUNCTION_VERSION label when the invoking
+	// trigger resolved through an alias or a direct version pin (empty for an
+	// unversioned bare-name function, enqueued/delivered exactly as before
+	// this field existed); for a fired destination, stamped from the
+	// destination's own Version pin (dispatcher.go fireDestination), so a
+	// destination pinned to a specific version gets the identical fallback
+	// treatment. Either way, the deliverer targets the versioned internal
+	// route (UrlForFunction(...) + ":" + FunctionVersion) first, falling back
+	// to the bare-name route on a route-miss-MARKED 404 (utils.HeaderRouteMiss,
+	// stamped only by the router's own not-found path: the version's route was
+	// GC'd, or was never live at delivery time — a plain 404 is the function's
+	// own response and settles normally, never falls back; see the MARKER
+	// CONTRACT in deliverer.go). Distinct from Version above, which is the
+	// wire-format envelope schema version and is never touched by this field.
+	FunctionVersion string `json:"functionVersion,omitempty"`
+	// Method, Path, Query, Headers, and Body reproduce the original request. Path
+	// and Query are captured for fidelity; Headers is the replay allowlist
+	// (allowedHeaders). Body is opaque bytes (base64 on the wire).
+	Method  string            `json:"method"`
+	Path    string            `json:"path,omitempty"`
+	Query   string            `json:"query,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    []byte            `json:"body,omitempty"`
+	// EnqueueTime is when the request was accepted; the dispatcher measures MaxAge
+	// from it.
+	EnqueueTime time.Time `json:"enqueueTime"`
+	// Depth is the destination-chain depth (0 for a direct caller); phase 2's
+	// depth cap enforces against it. Carried now so phase 2 is additive.
+	Depth int `json:"depth"`
+	// FunctionTimeout is FunctionSpec.FunctionTimeout in seconds (0 = platform
+	// default). The dispatcher bounds the per-delivery timeout by it and caps that
+	// timeout strictly below the (fixed) lease duration, so a delivery's context
+	// always expires before its lease (invariant A7).
+	FunctionTimeout int `json:"functionTimeout"`
+	// Policy is the resolved retry/age policy for this invocation, stamped from
+	// the function's InvocationConfig at enqueue. Zero fields take dispatcher
+	// defaults.
+	Policy Policy `json:"policy,omitzero"`
+	// OnSuccess/OnFailure are the destinations fired after this invocation settles,
+	// stamped from the function's InvocationConfig at enqueue. nil = no destination.
+	OnSuccess *Destination `json:"onSuccess,omitempty"`
+	OnFailure *Destination `json:"onFailure,omitempty"`
+}
+
+// Destination is a settled-invocation destination stamped into the envelope: a
+// same-namespace function (FunctionName set) or a message-queue topic (Topic set).
+// It is the envelope-side flat form of fv1.DestinationRef. FunctionNamespace is
+// the destination's namespace for BOTH kinds — topics are namespace-scoped too
+// (RFC-0027, mirroring the same-namespace rule R6), the field name predating the
+// topic kind.
+type Destination struct {
+	FunctionNamespace string `json:"fnNs,omitempty"`
+	FunctionName      string `json:"fn,omitempty"`
+	Topic             string `json:"topic,omitempty"`
+	MQType            string `json:"mqType,omitempty"`
+	// Alias and Version pin a function destination to a FunctionAlias or a
+	// direct FunctionVersion (RFC-0025), mirroring fv1.FunctionReference's
+	// Alias/Version on the DestinationRef this Destination is stamped from.
+	// At most one is set (mutually exclusive, like FunctionReference); Version
+	// takes precedence if a hand-crafted destination somehow carries both.
+	//
+	// The two pins are NOT handled symmetrically when a destination fires
+	// (dispatcher.go fireDestination): an alias never gets GC'd -- it
+	// repoints -- so Alias is baked directly into the fired envelope's
+	// Function as a `:<alias>` suffix (functionRouteName), same grammar as
+	// the router's internal `:<alias>` route, no fallback needed. A specific
+	// FunctionVersion CAN be GC'd by ordinary retain-N cleanup at ANY time
+	// (retain-N tracks a function's own recent versions, not who references
+	// them -- a destination pin is invisible to it), so baking `:<version>`
+	// into Function the same way would mean every fire 404s forever once
+	// that GC runs, dead-lettering permanently with no recovery. Version is
+	// instead carried on the fired envelope's own FunctionVersion field
+	// (Envelope.FunctionVersion) exactly like a primary invocation's
+	// resolved-through-an-alias pin, so it inherits the SAME 404-fallback/
+	// metric/log machinery the deliverer already has for that case, for
+	// free -- see fireDestination and Envelope.FunctionVersion's doc.
+	Alias   string `json:"alias,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+// IsFunction reports whether the destination targets a function.
+func (d Destination) IsFunction() bool { return d.FunctionName != "" }
+
+// functionRouteName returns the function name to deliver a function
+// destination at, suffixed `:<alias>` when the destination pins one via
+// Alias -- the same `name:tag` grammar the router's internal `:<alias>`
+// route registers at (routeshape.go internalRouteExactURLs). A Version pin
+// is deliberately NOT suffixed here (see the Destination.Version doc comment
+// for why): when Version is set it takes precedence and the plain
+// FunctionName is returned, unsuffixed, so the caller can carry Version on
+// Envelope.FunctionVersion instead and get 404-fallback for free.
+func (d Destination) functionRouteName() string {
+	if d.Version == "" && d.Alias != "" {
+		return d.FunctionName + ":" + d.Alias
+	}
+	return d.FunctionName
+}
+
+// IsTopic reports whether the destination targets a topic.
+func (d Destination) IsTopic() bool { return d.Topic != "" }
+
+// Encode marshals the envelope for a statestore Queue message body. Non-default
+// options, all load-bearing for the RFC-0024 queue-durable wire format (json/v2
+// migration, see jsonwire_compat_test.go): FormatDurationAsNano is required
+// because v2 has no default representation for time.Duration (Policy's fields);
+// OmitEmptyWithLegacySemantics and EscapeForHTML keep v1's field emission
+// (v2's omitempty only drops null/""/{}/[], not a false bool or zero int,
+// and v2 does not HTML-escape by default) and Deterministic keeps v1's sorted
+// map keys, so an already-queued message's bytes are unaffected by a rolling
+// upgrade; AllowInvalidUTF8 keeps a raw
+// replayed HTTP header value from turning an otherwise-valid async request
+// into a marshal error (v1 silently substituted U+FFFD instead).
+func (e Envelope) Encode() ([]byte, error) {
+	return json.Marshal(e,
+		jsonv1.FormatDurationAsNano(true),
+		jsonv1.OmitEmptyWithLegacySemantics(true),
+		jsontext.EscapeForHTML(true),
+		jsontext.AllowInvalidUTF8(true),
+		// v1 sorted map keys; without this, Headers order varies per call
+		// and the byte-pinning compat fixture would flake.
+		json.Deterministic(true),
+	)
+}
+
+// Decode parses an envelope from a leased statestore Queue message body. A
+// leased message can be weeks old and enqueued by a previous release, so this
+// is deliberately lenient: AllowDuplicateNames and AllowInvalidUTF8 preserve
+// v1's decode leniency (last-key-wins on a duplicate name, U+FFFD substitution
+// for invalid UTF-8) rather than rejecting a message v1 would have decoded
+// fine — pinned by TestDLQProbeCompat_DuplicateKeys / _InvalidUTF8 and the
+// asyncinvoke jsonwire_compat_test.go round trips. FormatDurationAsNano
+// mirrors Encode (v2 has no default Duration decode either).
+func Decode(data []byte) (Envelope, error) {
+	var e Envelope
+	err := json.Unmarshal(data, &e,
+		jsonv1.FormatDurationAsNano(true),
+		jsontext.AllowDuplicateNames(true),
+		jsontext.AllowInvalidUTF8(true),
+	)
+	return e, err
+}
+
+// Destination result conditions — the requestContext.condition values.
+const (
+	ConditionSuccess          = "Success"
+	ConditionRetriesExhausted = "RetriesExhausted"
+	ConditionEventAgeExceeded = "EventAgeExceeded"
+	ConditionHTTP4xx          = "Http4xx"
+)
+
+// MaxPayloadBytes caps the payloads embedded in the result envelope (Lambda-parity
+// 64KiB): the request body is omitted when larger, the response body truncated.
+const MaxPayloadBytes = 64 << 10
+
+// ResultEnvelope is the Lambda-shaped record delivered to a destination after an
+// async invocation settles. The payloads are opaque bytes (base64 on the wire) —
+// the original request body (omitted when >MaxPayloadBytes) and the function's
+// response body (truncated at MaxPayloadBytes) — not guaranteed to be JSON.
+type ResultEnvelope struct {
+	Version        string         `json:"version"`
+	RequestContext RequestContext `json:"requestContext"`
+	RequestPayload []byte         `json:"requestPayload,omitempty"`
+	// RequestPayloadOmitted is true when the original request body was dropped for
+	// exceeding MaxPayloadBytes, so a destination can tell "elided" from "empty".
+	RequestPayloadOmitted bool            `json:"requestPayloadOmitted,omitempty"`
+	ResponseContext       ResponseContext `json:"responseContext"`
+	ResponsePayload       []byte          `json:"responsePayload,omitempty"`
+}
+
+// RequestContext identifies the settled invocation the result envelope describes.
+type RequestContext struct {
+	InvocationID string `json:"invocationId"`
+	FunctionRef  string `json:"functionRef"` // "<namespace>/<name>"
+	Condition    string `json:"condition"`
+	Attempts     int    `json:"attempts"`
+	// Depth is the source invocation's destination-chain depth. Stamped now so a
+	// future consumer that resumes the chain asynchronously (an RFC-0027 P2+
+	// design choice) can enforce the A6 cap across the topic hop without a wire
+	// migration of already-persisted events. The P2 statestore MQ trigger
+	// delivers synchronously, which fires no destinations — so no loop exists
+	// today; this field is the insurance that keeps it that way if that changes.
+	Depth int `json:"depth"`
+}
+
+// ResponseContext carries the function's delivery response status.
+type ResponseContext struct {
+	StatusCode int `json:"statusCode"`
+	// Truncated is true when the response body was cut at MaxPayloadBytes or a
+	// mid-stream read left it incomplete, so a destination knows responsePayload
+	// may be partial.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// Encode marshals the result envelope for a destination invocation body. Also
+// a queue-durable payload (see Envelope.Encode): OmitEmptyWithLegacySemantics
+// keeps RequestPayloadOmitted/Truncated omitted when false, matching v1 (v2's
+// default omitempty does not omit a false bool), pinned by
+// TestJSONWireCompat_ResultEnvelope. AllowInvalidUTF8 keeps an odd response
+// byte from turning a settled invocation's destination fire into a marshal
+// error.
+func (r ResultEnvelope) Encode() ([]byte, error) {
+	return json.Marshal(r,
+		jsonv1.OmitEmptyWithLegacySemantics(true),
+		jsontext.AllowInvalidUTF8(true),
+	)
+}
+
+// allowedHeaders returns the subset of request headers to replay on async
+// delivery. It is an allowlist, not a denylist: Content-Type and Accept (so the
+// function can parse the body), plus caller-set X-* headers EXCEPT internal
+// X-Fission-* control headers (which the dispatcher sets itself). Host,
+// Content-Length, hop-by-hop, Cookie, and Authorization are intentionally dropped
+// — an async invocation is decoupled from the caller's session. Multi-valued
+// headers are comma-joined (the HTTP-canonical single-line form).
+func allowedHeaders(h http.Header) map[string]string {
+	out := map[string]string{}
+	for name, vals := range h {
+		if len(vals) == 0 {
+			continue
+		}
+		canon := http.CanonicalHeaderKey(name)
+		if !replayableHeader(canon) {
+			continue
+		}
+		out[canon] = strings.Join(vals, ",")
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func replayableHeader(canonicalName string) bool {
+	switch canonicalName {
+	case "Content-Type", "Accept":
+		return true
+	}
+	if strings.HasPrefix(canonicalName, "X-Fission-") {
+		return false
+	}
+	return strings.HasPrefix(canonicalName, "X-")
+}

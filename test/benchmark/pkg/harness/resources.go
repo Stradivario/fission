@@ -26,9 +26,9 @@ type EnvOptions struct {
 	Version  int    // env contract version; default 2
 	Poolsize int    // poolmgr warm pool; default 3
 
-	MinCPU, MaxCPU       int // millicores; 0 omits
-	MinMemory, MaxMemory int // MiB; 0 omits
-	GracePeriod          int64
+	MinCPU, MaxCPU       int   // millicores; 0 omits
+	MinMemory, MaxMemory int   // MiB; 0 omits
+	GracePeriod          int64 // seconds; 0 omits (CRD default applies), it does NOT request an explicit zero-second drain
 }
 
 // CreateEnv creates an Environment and registers its cleanup.
@@ -43,12 +43,17 @@ func (s *Scope) CreateEnv(ctx context.Context, o EnvOptions) error {
 	env := &fv1.Environment{
 		ObjectMeta: metav1.ObjectMeta{Name: o.Name, Namespace: ns},
 		Spec: fv1.EnvironmentSpec{
-			Version:                o.Version,
-			Runtime:                fv1.Runtime{Image: o.Image},
-			Poolsize:               o.Poolsize,
-			Resources:              resourceRequirements(o.MinCPU, o.MaxCPU, o.MinMemory, o.MaxMemory),
-			TerminationGracePeriod: o.GracePeriod,
+			Version:   o.Version,
+			Runtime:   fv1.Runtime{Image: o.Image},
+			Poolsize:  o.Poolsize,
+			Resources: resourceRequirements(o.MinCPU, o.MaxCPU, o.MinMemory, o.MaxMemory),
 		},
+	}
+	// On the pointer field an unconditional &o.GracePeriod would turn the
+	// zero value of an unset option into an EXPLICIT zero-second (instant
+	// kill) drain window; leave nil so the CRD default (90) applies.
+	if o.GracePeriod > 0 {
+		env.Spec.TerminationGracePeriod = new(o.GracePeriod)
 	}
 	if o.Builder != "" {
 		// Command must mirror the CLI default ("build", resolved on the builder
@@ -73,13 +78,14 @@ type FunctionOptions struct {
 	Entrypoint   string // FunctionName in the package ref (e.g. "main")
 	ExecutorType fv1.ExecutorType
 
-	MinScale, MaxScale   int // newdeploy/container only
-	TargetCPUPercent     int // newdeploy HPA target; 0 omits
-	Concurrency          int // default 500
-	RequestsPerPod       int // default 1
-	FunctionTimeout      int // seconds; default 60
-	MinCPU, MaxCPU       int
-	MinMemory, MaxMemory int
+	MinScale, MaxScale     int // newdeploy/container only
+	TargetCPUPercent       int // newdeploy HPA target; 0 omits
+	Concurrency            int // default 500
+	RequestsPerPod         int // default 1
+	FunctionTimeout        int // seconds; default 60
+	MinCPU, MaxCPU         int
+	MinMemory, MaxMemory   int
+	ProvisionedConcurrency int // when >0, sets Spec.ProvisionedConcurrency.Target (poolmgr only RFC-0026)
 
 	// Secrets/ConfigMaps name objects (in the function namespace) the function
 	// references; the caller is responsible for creating them (see
@@ -160,6 +166,9 @@ func (s *Scope) CreateCodeFunction(ctx context.Context, o FunctionOptions) error
 			Concurrency:     o.Concurrency,
 			RequestsPerPod:  o.RequestsPerPod,
 		},
+	}
+	if o.ProvisionedConcurrency > 0 {
+		fn.Spec.ProvisionedConcurrency = &fv1.ProvisionedConcurrencyConfig{Target: o.ProvisionedConcurrency}
 	}
 	for _, name := range o.Secrets {
 		fn.Spec.Secrets = append(fn.Spec.Secrets, fv1.SecretReference{Namespace: ns, Name: name})

@@ -7,20 +7,19 @@ package fetcher
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/net/context/ctxhttp"
 	corev1 "k8s.io/api/core/v1"
@@ -42,7 +41,9 @@ import (
 	storageSvcClient "github.com/fission/fission/pkg/storagesvc/client"
 	"github.com/fission/fission/pkg/svcinfo"
 	"github.com/fission/fission/pkg/utils"
+	"github.com/fission/fission/pkg/utils/httpx"
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
+	"github.com/fission/fission/pkg/utils/uuid"
 )
 
 type (
@@ -62,6 +63,12 @@ type (
 		// boundary and would otherwise reject the extra headers (or be
 		// confused by the body buffering that signing requires).
 		storageHTTPClient *http.Client
+		// podServiceAccount is the pod's actual ServiceAccount name
+		// (downward API via POD_SERVICE_ACCOUNT), used for OCI keychain
+		// resolution — a builder-pod sidecar runs as fission-builder,
+		// not fission-fetcher. Empty on pods created before the env var
+		// existed (upgrade skew); keychainServiceAccount falls back.
+		podServiceAccount string
 		Info              PodInfo
 	}
 	PodInfo struct {
@@ -140,6 +147,10 @@ func MakeFetcher(logger logr.Logger, clientGen crd.ClientGeneratorInterface, sha
 	}
 
 	hc := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}
+	// POD_SERVICE_ACCOUNT is set by AddFetcherToPodSpec via the downward
+	// API: the OCI keychain must resolve the ACTUAL pod identity — in a
+	// builder pod this sidecar runs as fission-builder, not fission-fetcher.
+	podServiceAccount := os.Getenv("POD_SERVICE_ACCOUNT")
 	// storageHTTPClient signs requests to storagesvc with the HMAC
 	// scheme described in docs/internal-auth/00-design.md when the
 	// chart's internal-auth master secret is mounted. The signer uses
@@ -161,6 +172,7 @@ func MakeFetcher(logger logr.Logger, clientGen crd.ClientGeneratorInterface, sha
 		},
 		httpClient:        hc,
 		storageHTTPClient: storageHC,
+		podServiceAccount: podServiceAccount,
 	}, nil
 }
 
@@ -183,11 +195,7 @@ func MakeFetcher(logger logr.Logger, clientGen crd.ClientGeneratorInterface, sha
 // exfiltration via headers); failing the download with a clearer error
 // from the inner transport is fine.
 func (fetcher *Fetcher) httpClientForURL(rawURL string) *http.Client {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fetcher.httpClient
-	}
-	if strings.HasPrefix(parsed.Path, "/v1/archive") {
+	if fv1.IsStorageServiceURL(rawURL) {
 		return fetcher.storageHTTPClient
 	}
 	return fetcher.httpClient
@@ -203,7 +211,20 @@ func verifyChecksum(fileChecksum, checksum *fv1.Checksum) error {
 	return nil
 }
 
-func writeSecretOrConfigMap(dataMap map[string][]byte, dirPath string) error {
+// writeSecretOrConfigMap writes one object's data keys into dirPath.
+//
+// written records every path this specialization pass has already created, and
+// a second object claiming one of them is REFUSED rather than allowed to
+// truncate it. That is the runtime half of RFC-0030 §4's shadowing rule: two
+// references may share a directory in ways admission cannot see, because the
+// filenames are the objects' DATA KEYS and keys are mutable after the Function
+// was admitted. Without this, whichever object is written second silently wins
+// and the function reads one object's value under the other's name.
+//
+// Refusing is the safe direction. A collision means the delivered file set is
+// ambiguous, and failing specialization surfaces that as a visible error
+// instead of credentials that are quietly wrong.
+func writeSecretOrConfigMap(dataMap map[string][]byte, dirPath string, written map[string]string, objectID string) error {
 	// Open the os.Root once and write every key through it: os.Root confines
 	// each write to dirPath (the keys are Secret/ConfigMap data keys), and
 	// reusing one root avoids an openat per key.
@@ -212,10 +233,25 @@ func writeSecretOrConfigMap(dataMap map[string][]byte, dirPath string) error {
 		return fmt.Errorf("failed to open directory %s: %w", dirPath, err)
 	}
 	defer root.Close()
-	for key, val := range dataMap {
-		if err := root.WriteFile(key, val, 0750); err != nil {
+
+	// Sort so a collision is reported deterministically rather than depending
+	// on map iteration order.
+	keys := make([]string, 0, len(dataMap))
+	for key := range dataMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		full := filepath.Join(dirPath, key)
+		if owner, taken := written[full]; taken && owner != objectID {
+			return fmt.Errorf("refusing to overwrite %s: already written by %s in this specialization pass; "+
+				"two references resolve to the same directory and share the data key %q", full, owner, key)
+		}
+		if err := root.WriteFile(key, dataMap[key], 0750); err != nil {
 			return fmt.Errorf("failed to write file %s in %s: %w", key, dirPath, err)
 		}
+		written[full] = objectID
 	}
 	return nil
 }
@@ -356,7 +392,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 		// fetch the file and save it to the tmp path. FETCH_URL targets
 		// are user-supplied — pick the unsigned client unless the URL
 		// happens to point at our own storagesvc.
-		err := utils.DownloadUrlToRoot(ctx, fetcher.httpClientForURL(req.URL), req.URL, fetcher.sharedVolumePath, tmpPath)
+		err := fetcher.downloadToRoot(ctx, logger, fetcher.httpClientForURL(req.URL), req.URL, tmpPath)
 		if err != nil {
 			e := "failed to download url from fetch request"
 			logger.Error(err, e, "url", req.URL)
@@ -410,8 +446,15 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 			})...)
 			// archive.URL may resolve to storagesvc (/v1/archive?id=...)
 			// or an external storage backend (S3, GCS, etc.). Sign only
-			// when the URL targets storagesvc.
-			err := utils.DownloadUrlToRoot(ctx, fetcher.httpClientForURL(archive.URL), archive.URL, fetcher.sharedVolumePath, tmpPath)
+			// when the URL targets storagesvc; a SecretRef archive gets a
+			// per-fetch client with origin-bound credentials (RFC-0031).
+			client, code, err := fetcher.clientForArchive(ctx, archive)
+			if err != nil {
+				e := "failed to prepare archive download client"
+				logger.Error(err, e, "url", archive.URL)
+				return code, fmt.Errorf("%s %s: %w", e, archive.URL, err)
+			}
+			err = fetcher.downloadToRoot(ctx, logger, client, archive.URL, tmpPath)
 			if err != nil {
 				e := "failed to download url from archive"
 				logger.Error(err, e, "url", req.URL)
@@ -466,6 +509,11 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, pkg *fv1.Package, req Functio
 // FetchSecretsAndCfgMaps fetches secrets and configmaps specified by user
 // It returns the HTTP code and error if any
 func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv1.SecretReference, cfgmaps []fv1.ConfigMapReference) (int, error) {
+	// Files written during THIS pass, so a second object cannot silently
+	// truncate a file the first one wrote. Scoped per call: a later
+	// specialization legitimately rewrites the same paths with fresh values.
+	writtenFiles := map[string]string{}
+
 	logger := otelUtils.LoggerWithTraceID(ctx, fetcher.logger)
 
 	if len(secrets) > 0 {
@@ -486,9 +534,14 @@ func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv
 				return httpCode, errors.New(e)
 			}
 
-			secretDir, err := utils.RootJoin(fetcher.sharedSecretPath, filepath.Join(secret.Namespace, secret.Name))
+			subPath, err := fv1.ObjectSubPath(secret.MountPath, secret.Namespace, secret.Name)
 			if err != nil {
-				logger.Error(err, "directory", secretDir, "secret_name", secret.Name, "secret_namespace", secret.Namespace)
+				logger.Error(err, "invalid mountPath for secret", "secret_name", secret.Name, "secret_namespace", secret.Namespace)
+				return http.StatusBadRequest, err
+			}
+			secretDir, err := utils.RootJoin(fetcher.sharedSecretPath, subPath)
+			if err != nil {
+				logger.Error(err, "failed to resolve secret directory", "directory", secretDir, "secret_name", secret.Name, "secret_namespace", secret.Namespace)
 				return http.StatusBadRequest, fmt.Errorf("%w, request: %v", err, secret)
 			}
 
@@ -500,7 +553,7 @@ func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv
 					"secret_namespace", secret.Namespace)
 				return http.StatusInternalServerError, fmt.Errorf("%s: %s: %w", e, secretDir, err)
 			}
-			err = writeSecretOrConfigMap(data.Data, secretDir)
+			err = writeSecretOrConfigMap(data.Data, secretDir, writtenFiles, fmt.Sprintf("secret %s/%s", secret.Namespace, secret.Name))
 			if err != nil {
 				logger.Error(err, "failed to write secret to file location", "location", secretDir,
 					"secret_name", secret.Name,
@@ -532,9 +585,14 @@ func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv
 				return httpCode, errors.New(e)
 			}
 
-			configDir, err := utils.RootJoin(fetcher.sharedConfigPath, filepath.Join(config.Namespace, config.Name))
+			subPath, err := fv1.ObjectSubPath(config.MountPath, config.Namespace, config.Name)
 			if err != nil {
-				logger.Error(err, "directory", configDir, "config_map_name", config.Name, "config_map_namespace", config.Namespace)
+				logger.Error(err, "invalid mountPath for configmap", "config_map_name", config.Name, "config_map_namespace", config.Namespace)
+				return http.StatusBadRequest, err
+			}
+			configDir, err := utils.RootJoin(fetcher.sharedConfigPath, subPath)
+			if err != nil {
+				logger.Error(err, "failed to resolve configmap directory", "directory", configDir, "config_map_name", config.Name, "config_map_namespace", config.Namespace)
 				return http.StatusBadRequest, fmt.Errorf("%w, request: %v", err,
 					config)
 			}
@@ -551,7 +609,7 @@ func (fetcher *Fetcher) FetchSecretsAndCfgMaps(ctx context.Context, secrets []fv
 			for key, val := range data.Data {
 				configMap[key] = []byte(val)
 			}
-			err = writeSecretOrConfigMap(configMap, configDir)
+			err = writeSecretOrConfigMap(configMap, configDir, writtenFiles, fmt.Sprintf("configmap %s/%s", config.Namespace, config.Name))
 			if err != nil {
 				logger.Error(err, "failed to write configmap to file location", "location", configDir,
 					"config_map_name", config.Name,
@@ -727,17 +785,14 @@ func (fetcher *Fetcher) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 // writeUploadResponse marshals and writes an upload response.
 func writeUploadResponse(logger logr.Logger, w http.ResponseWriter, resp *ArchiveUploadResponse) {
-	rBody, err := json.Marshal(resp)
-	if err != nil {
+	// WriteJSON marshals before committing the status, so an ErrEncode failure
+	// still leaves the 500 reachable; anything else is already on the wire.
+	if err := httpx.WriteJSON(w, http.StatusOK, resp); err != nil {
 		e := "error encoding upload response"
 		logger.Error(err, e)
-		http.Error(w, fmt.Sprintf("%s: %v", e, err), http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(rBody); err != nil {
-		logger.Error(err, "error writing response")
+		if errors.Is(err, httpx.ErrEncode) {
+			http.Error(w, fmt.Sprintf("%s: %v", e, err), http.StatusInternalServerError)
+		}
 	}
 }
 
@@ -811,13 +866,27 @@ func (fetcher *Fetcher) SpecializePod(ctx context.Context, fetchReq FunctionFetc
 		return code, fmt.Errorf("error fetching secrets/configs: %w", err)
 	}
 
+	// RFC-0023: materialize the scoped state token BEFORE specializing, so
+	// the SDK can read it the moment user code starts. Derived pod-locally
+	// from the fetcher's own master secret — the secret and the token never
+	// ride the (pod-visible) specialize request.
+	if loadReq.StateKeyspace != "" {
+		if err := fetcher.writeStateTokenFile(loadReq); err != nil {
+			return http.StatusInternalServerError, fmt.Errorf("error writing state token file: %w", err)
+		}
+	}
+
 	// Specialize the pod
 
 	var contentType string
 	var specializeURL string
 	var reader *bytes.Reader
 
-	loadPayload, err := json.Marshal(loadReq)
+	// This POST goes straight to the env runtime container (a per-language
+	// server, possibly an old env image, non-Go) — same non-Go-reader
+	// contract as run.go's local /v2/specialize call, so pin exact v1
+	// emission.
+	loadPayload, err := json.Marshal(loadReq, jsonv1.DefaultOptionsV1())
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("error encoding load request: %w", err)
 	}
@@ -876,6 +945,20 @@ func (fetcher *Fetcher) SpecializePod(ctx context.Context, fetchReq FunctionFetc
 		}
 		return statusCode, fmt.Errorf("error specializing function pod: %w", err)
 	}
+}
+
+// downloadToRoot downloads targetURL to tmpPath under the shared volume with
+// client, retrying transient failures (archiveDownloadRetrySchedule). Callers
+// pick the client: httpClientForURL (signed only for storagesvc) or, for a
+// SecretRef archive, clientForArchive's credentialed one.
+func (fetcher *Fetcher) downloadToRoot(ctx context.Context, logger logr.Logger, client *http.Client, targetURL, tmpPath string) error {
+	return downloadWithRetry(ctx, archiveDownloadRetrySchedule,
+		func(attempt int, err error) {
+			logger.Info("transient error downloading archive, retrying", "url", targetURL, "attempt", attempt, "error", err.Error())
+		},
+		func() error {
+			return utils.DownloadUrlToRoot(ctx, client, targetURL, fetcher.sharedVolumePath, tmpPath)
+		})
 }
 
 // WsStartHandler is used to generate websocket events in Kubernetes

@@ -35,6 +35,41 @@ check: test-run build-fission-cli clean
 code-checks: verify-gomod
 	golangci-lint run
 
+# Gate the tree with the antislop analyzers (low-evidence Go patterns: any in
+# signatures, narrowing out of any, reflect, structural names, untyped
+# decoding) against hack/antislop-baseline.txt. Runs in CI (lint.yaml); the
+# analyzer is pinned by the tool directive in go.mod.
+#
+# The baseline is a ratchet: a file/analyzer pair that is missing or grows
+# fails the gate, one that shrinks passes and can be re-recorded with
+# `make antislop-update`. Everything in it today is pkg/workflow, and it is
+# one claim — the workflow engine addresses ARBITRARY USER JSON with JSONPath
+# (RFC-0022, Step Functions parity), so there is no named type to decode into.
+# Wrapping the document tree was designed and rejected: a json.RawMessage
+# Document re-decodes per Choice condition, and a generic Value[any] launders
+# the empty interface through a type parameter without adding evidence. The
+# engine-owned shapes that DO have a fixed schema are typed — see catchError
+# and branchErrorCause in pkg/workflow/fold.go.
+#
+# ANTISLOP_FLAGS records the one scoping decision: "route shape" is RFC-0013
+# vocabulary, exposed as the metric label value shape_changed and in
+# HTTPTrigger condition messages, so nostructuralnames is exempted for
+# pkg/router rather than turned off for the whole module.
+#
+# `go tool antislop ./...` on its own lists every finding, baselined or not.
+ANTISLOP_FLAGS ?= -nostructuralnames.exclude 'pkg/router/...'
+ANTISLOP_BASELINE ?= hack/antislop-baseline.txt
+
+.PHONY: antislop
+antislop:
+	go tool antislop $(ANTISLOP_FLAGS) -baseline $(ANTISLOP_BASELINE) ./...
+
+# Re-record the accepted set. Every new line is a design claim; justify it in
+# review rather than regenerating to make the gate quiet.
+.PHONY: antislop-update
+antislop-update:
+	go tool antislop $(ANTISLOP_FLAGS) -baseline $(ANTISLOP_BASELINE) -update ./...
+
 # Fail if go.mod does not keep direct and indirect requirements in separate
 # blocks. `go mod tidy` does not enforce this layout, so this guard does.
 # Convention: .claude/resources/go-mod-conventions.md
@@ -76,8 +111,15 @@ build-fission-cli:
 	@GOOS=$(GOOS) GOARCH=$(GOARCH) GOAMD64=$(GOAMD64) GORELEASER_CURRENT_TAG=$(VERSION) goreleaser build --snapshot --clean --single-target --id fission-cli
 
 install-fission-cli:
-	# TODO: Fix this hack, replace v1 with GOAMD64
-	mv dist/fission-cli_$(GOOS)_$(GOARCH)_v1/fission$(FISSION-CLI-SUFFIX) /usr/local/bin/fission
+	# goreleaser suffixes the dist dir with the arch microarchitecture level
+	# (GOAMD64 for amd64 e.g. _v1, GOARM64 for arm64 e.g. _v8.0, GOARM for arm),
+	# which varies per machine -- resolve the dir by glob instead of hardcoding it.
+	@dir="$$(ls -d dist/fission-cli_$(GOOS)_$(GOARCH)*/ 2>/dev/null | head -n1)"; \
+	if [ -z "$$dir" ]; then \
+		echo "install-fission-cli: no dist/fission-cli_$(GOOS)_$(GOARCH)* directory found; run 'make build-fission-cli' first" >&2; \
+		exit 1; \
+	fi; \
+	mv "$$dir/fission$(FISSION-CLI-SUFFIX)" /usr/local/bin/fission
 
 ### Codegen
 codegen:

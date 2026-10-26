@@ -34,7 +34,15 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&CanaryConfig{},
 		&CanaryConfigList{},
 		&FissionTenant{},
-		&FissionTenantList{})
+		&FissionTenantList{},
+		&Workflow{},
+		&WorkflowList{},
+		&WorkflowRun{},
+		&WorkflowRunList{},
+		&FunctionVersion{},
+		&FunctionVersionList{},
+		&FunctionAlias{},
+		&FunctionAliasList{})
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
 }

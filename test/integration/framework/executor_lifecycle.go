@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
@@ -166,6 +165,53 @@ func executorEnvValue(dep *appsv1.Deployment, key string) (string, bool) {
 	return "", false
 }
 
+// ExecutorEnvEnabled reports whether the named environment variable on the
+// executor container is set to "true". Use for feature gates that the
+// Helm chart controls via executor env vars (e.g.
+// EXECUTOR_PROVISIONED_CONCURRENCY_ENABLED, ENABLE_FUNCTION_SERVICES).
+func (f *Framework) ExecutorEnvEnabled(t *testing.T, ctx context.Context, name string) bool {
+	t.Helper()
+	dep, err := f.kubeClient.AppsV1().Deployments(f.FissionNamespace()).Get(ctx, executorDeploymentName, metav1.GetOptions{})
+	require.NoErrorf(t, err, "ExecutorEnvEnabled: get executor Deployment %s/%s", f.FissionNamespace(), executorDeploymentName)
+	v, _ := executorEnvValue(dep, name)
+	return v == "true"
+}
+
+// WaitForExecutorSettled blocks until the executor Deployment's status has
+// caught up with its spec and every replica is available — regardless of
+// which generation that is. Use it from a t.Cleanup registered BEFORE
+// SetExecutorEnv's restores (cleanups run LIFO, so it executes AFTER them):
+// the restores deliberately do not await their rollouts, and without this a
+// test's un-awaited restore lands in whichever serial test runs next.
+func (f *Framework) WaitForExecutorSettled(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	// The test's own ctx may already be done during cleanup.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	ns := f.FissionNamespace()
+	deadline := time.Now().Add(timeout)
+	for {
+		dep, err := f.kubeClient.AppsV1().Deployments(ns).Get(ctx, executorDeploymentName, metav1.GetOptions{})
+		if err == nil {
+			replicas := int32(1)
+			if dep.Spec.Replicas != nil {
+				replicas = *dep.Spec.Replicas
+			}
+			if dep.Status.ObservedGeneration >= dep.Generation &&
+				dep.Status.UpdatedReplicas >= replicas &&
+				dep.Status.AvailableReplicas >= replicas &&
+				dep.Status.UnavailableReplicas == 0 {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Logf("WaitForExecutorSettled: executor not settled after %s (continuing; next test may see a rolling executor)", timeout)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // WaitForExecutorRollout blocks until the executor Deployment has fully rolled
 // out at generation atLeast or newer: the controller has observed the new
 // generation, every replica is updated and available, and no old pods remain.
@@ -175,22 +221,5 @@ func executorEnvValue(dep *appsv1.Deployment, key string) (string, bool) {
 // see pkg/executor), so a completed rollout means the adopt pass has run.
 func (f *Framework) WaitForExecutorRollout(t *testing.T, ctx context.Context, atLeast int64, timeout time.Duration) {
 	t.Helper()
-	ns := f.FissionNamespace()
-	require.EventuallyWithT(t, func(c *assert.CollectT) {
-		dep, err := f.kubeClient.AppsV1().Deployments(ns).Get(ctx, executorDeploymentName, metav1.GetOptions{})
-		if !assert.NoErrorf(c, err, "get executor Deployment") {
-			return
-		}
-		want := int32(1)
-		if dep.Spec.Replicas != nil {
-			want = *dep.Spec.Replicas
-		}
-		st := dep.Status
-		assert.GreaterOrEqualf(c, st.ObservedGeneration, atLeast,
-			"executor rollout not yet observed (observed %d, want >= %d)", st.ObservedGeneration, atLeast)
-		assert.Equalf(c, want, st.UpdatedReplicas, "executor updated replicas (rollout in progress?)")
-		assert.Equalf(c, want, st.AvailableReplicas, "executor available replicas")
-		assert.Equalf(c, want, st.Replicas, "executor total replicas (old pod still terminating?)")
-		assert.Zerof(c, st.UnavailableReplicas, "executor unavailable replicas")
-	}, timeout, 2*time.Second)
+	f.WaitForDeploymentRollout(t, ctx, executorDeploymentName, atLeast, timeout)
 }

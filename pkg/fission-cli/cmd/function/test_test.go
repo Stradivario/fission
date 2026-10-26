@@ -6,9 +6,22 @@ package function
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/fission-cli/cliwrapper/driver/dummy"
+	"github.com/fission/fission/pkg/fission-cli/cmd"
+	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
+	fissionfake "github.com/fission/fission/pkg/generated/clientset/versioned/fake"
+	"github.com/fission/fission/pkg/router/asyncinvoke"
+	"github.com/fission/fission/pkg/utils"
 )
 
 func TestRenderInvocationFailure(t *testing.T) {
@@ -65,4 +78,451 @@ func TestRenderInvocationFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDoSyncUnauthorized guards the sync `fission fn test` path's 401/403
+// handling (issue #3588): a router rejection must surface a clear
+// FISSION_INTERNAL_AUTH_SECRET hint instead of falling through to the
+// generic failure renderer + pod-log lookup, which produces the original
+// bug's misleading "no active pods found" output.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoSyncUnauthorized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{
+		Name: "fn", Namespace: "default",
+	}
+	fc := fissionfake.NewSimpleClientset(fn) //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+
+	err := (&TestSubCommand{}).do(in)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "FISSION_INTERNAL_AUTH_SECRET")
+}
+
+// TestDoAsyncDispatch guards the --async wiring end-to-end: do() must send
+// the async invoke-mode header and hand the response to handleAsyncResponse
+// rather than falling through to the sync status-handling code (which would
+// silently print the raw 202 body instead of the invocation id — this is
+// exactly what broke, unnoticed by unit tests, partway through refactoring
+// do() to share combinedHTTPRequest with the sync path).
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoAsyncDispatch(t *testing.T) {
+	var gotInvokeMode string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotInvokeMode = r.Header.Get(asyncinvoke.HeaderInvokeMode)
+		w.Header().Set(asyncinvoke.HeaderInvocationID, "asyncinv/42")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{
+		Name: "fn", Namespace: "default",
+	}
+	fc := fissionfake.NewSimpleClientset(fn) //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+	in.SetBool(flagkey.FnTestAsync, true)
+
+	err := (&TestSubCommand{}).do(in)
+	require.NoError(t, err)
+	assert.Equal(t, asyncinvoke.InvokeModeAsync, gotInvokeMode, "do() must set the async invoke-mode header")
+}
+
+// TestDoSyncGenericFailure guards the non-401/403 failure branch: a router
+// error must render the RFC-0015 failure attribution, attempt the pod-log
+// fallback (and its own log-database fallback, both errors here since the
+// fake clientsets have no matching pods and no log db configured), and
+// return the generic failure — not the 401/403 FISSION_INTERNAL_AUTH_SECRET
+// hint, which is unique to TestDoSyncUnauthorized.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoSyncGenericFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{
+		Name: "fn", Namespace: "default",
+	}
+	fc := fissionfake.NewClientset(fn)
+	kc := k8sfake.NewClientset()
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, KubernetesClient: kc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+
+	err := (&TestSubCommand{}).do(in)
+	require.Error(t, err)
+	assert.Equal(t, "error getting function response", err.Error())
+	assert.NotContains(t, err.Error(), "FISSION_INTERNAL_AUTH_SECRET")
+}
+
+// TestDoSubPathHandling guards both branches of the --subpath handling: a
+// leading slash on the user-supplied subpath must not be doubled, and a
+// missing one must be inserted — both must land on the identical final path.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoSubPathHandling(t *testing.T) {
+	cases := []struct {
+		name    string
+		subPath string
+	}{
+		{"without leading slash", "extra/path"},
+		{"with leading slash", "/extra/path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+			fn := &fv1.Function{
+				Name: "fn", Namespace: "default",
+			}
+			fc := fissionfake.NewClientset(fn)
+			cmd.ResetClientsetForTest()
+			cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+			in := dummy.TestFlagSet()
+			in.SetString(flagkey.FnName, "fn")
+			in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+			in.SetString(flagkey.FnSubPath, tc.subPath)
+
+			err := (&TestSubCommand{}).do(in)
+			require.NoError(t, err)
+			assert.Equal(t, "/fission-function/fn/extra/path", gotPath)
+		})
+	}
+}
+
+// TestDoSyncSmallerTestTimeoutGoverns guards the --timeout selection branch:
+// when --timeout is set and smaller than the function's own FunctionTimeout,
+// the smaller one must bound the request context. The function's spec
+// timeout is set to 60s and --timeout to 1ns — if do() picked the 60s spec
+// timeout instead, this fast local httptest server would answer well within
+// it and the call would succeed; a 1ns budget instead expires before the
+// request can complete, which is what proves the smaller value governs. This
+// uses a deliberately tiny (not zero) deadline rather than a real sleep, so
+// the test is instant and can't flake under CI load — see
+// .claude/resources/test-writing-guidelines.md on avoiding sleeps for
+// time-dependent behavior.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoSyncSmallerTestTimeoutGoverns(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{
+		Name: "fn", Namespace: "default",
+		Spec: fv1.FunctionSpec{FunctionTimeout: 60},
+	}
+	fc := fissionfake.NewClientset(fn)
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+	in.SetDuration(flagkey.FnTestTimeout, 1*time.Nanosecond)
+
+	err := (&TestSubCommand{}).do(in)
+	require.Error(t, err, "a 1ns --timeout must govern over the 60s function spec timeout")
+	// net/http surfaces context.WithTimeoutCause's custom message (Go 1.21+),
+	// so the error names the 1ns budget that was actually applied rather than
+	// the 60s function spec timeout.
+	assert.Contains(t, err.Error(), "function request timeout (1ns) exceeded")
+}
+
+// TestResolveTestRefSuffixMutuallyExclusive guards the RFC-0025 --alias/
+// --version preflight in resolveTestRefSuffix: passing both must error before
+// either object is even looked up (no fake objects are registered, so a Get
+// call would itself fail and could be mistaken for this error).
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestResolveTestRefSuffixMutuallyExclusive(t *testing.T) {
+	fc := fissionfake.NewSimpleClientset() //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnTestAlias, "prod")
+	in.SetString(flagkey.FnTestVersion, "fn-v3")
+
+	_, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mutually exclusive")
+}
+
+// TestResolveTestRefSuffixAliasPreflight guards the --alias preflight: a
+// missing alias must error clearly (not just bubble up the raw client-go
+// "not found"), and an alias that resolves but targets a different function
+// must be rejected rather than silently testing against the wrong lineage.
+// A found, matching alias resolves to its own name as the router suffix.
+//
+// Not run in parallel (including subtests): cmd.SetClientset installs a
+// package-level client shared by every test in this package.
+func TestResolveTestRefSuffixAliasPreflight(t *testing.T) {
+	t.Run("missing alias", func(t *testing.T) {
+		fc := fissionfake.NewSimpleClientset() //nolint:staticcheck
+		cmd.ResetClientsetForTest()
+		cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+		in := dummy.TestFlagSet()
+		in.SetString(flagkey.FnTestAlias, "prod")
+
+		_, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `alias "prod" not found for function "fn"`)
+	})
+
+	t.Run("alias targets a different function", func(t *testing.T) {
+		alias := &fv1.FunctionAlias{
+			Name: "prod", Namespace: "default",
+			Spec: fv1.FunctionAliasSpec{FunctionName: "other-fn", Version: "other-fn-v1"},
+		}
+		fc := fissionfake.NewSimpleClientset(alias) //nolint:staticcheck
+		cmd.ResetClientsetForTest()
+		cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+		in := dummy.TestFlagSet()
+		in.SetString(flagkey.FnTestAlias, "prod")
+
+		_, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `targets function "other-fn", not "fn"`)
+	})
+
+	t.Run("matching alias resolves to its own name", func(t *testing.T) {
+		alias := &fv1.FunctionAlias{
+			Name: "prod", Namespace: "default",
+			Spec: fv1.FunctionAliasSpec{FunctionName: "fn", Version: "fn-v1"},
+		}
+		fc := fissionfake.NewSimpleClientset(alias) //nolint:staticcheck
+		cmd.ResetClientsetForTest()
+		cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+		in := dummy.TestFlagSet()
+		in.SetString(flagkey.FnTestAlias, "prod")
+
+		suffix, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+		require.NoError(t, err)
+		assert.Equal(t, "prod", suffix)
+	})
+}
+
+// TestResolveTestRefSuffixVersionPreflight mirrors
+// TestResolveTestRefSuffixAliasPreflight for --version.
+//
+// Not run in parallel (including subtests): cmd.SetClientset installs a
+// package-level client shared by every test in this package.
+func TestResolveTestRefSuffixVersionPreflight(t *testing.T) {
+	t.Run("missing version", func(t *testing.T) {
+		fc := fissionfake.NewSimpleClientset() //nolint:staticcheck
+		cmd.ResetClientsetForTest()
+		cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+		in := dummy.TestFlagSet()
+		in.SetString(flagkey.FnTestVersion, "fn-v3")
+
+		_, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `version "fn-v3" not found for function "fn"`)
+	})
+
+	t.Run("version targets a different function", func(t *testing.T) {
+		version := &fv1.FunctionVersion{
+			Name: "fn-v3", Namespace: "default",
+			Spec: fv1.FunctionVersionSpec{FunctionName: "other-fn"},
+		}
+		fc := fissionfake.NewSimpleClientset(version) //nolint:staticcheck
+		cmd.ResetClientsetForTest()
+		cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+		in := dummy.TestFlagSet()
+		in.SetString(flagkey.FnTestVersion, "fn-v3")
+
+		_, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `targets function "other-fn", not "fn"`)
+	})
+
+	t.Run("matching version resolves to its own name", func(t *testing.T) {
+		version := &fv1.FunctionVersion{
+			Name: "fn-v3", Namespace: "default",
+			Spec: fv1.FunctionVersionSpec{FunctionName: "fn"},
+		}
+		fc := fissionfake.NewSimpleClientset(version) //nolint:staticcheck
+		cmd.ResetClientsetForTest()
+		cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+		in := dummy.TestFlagSet()
+		in.SetString(flagkey.FnTestVersion, "fn-v3")
+
+		suffix, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+		require.NoError(t, err)
+		assert.Equal(t, "fn-v3", suffix)
+	})
+}
+
+// TestResolveTestRefSuffixNeitherSet guards the common (no --alias/--version)
+// path: an empty suffix, no API calls, no error -- this is what every
+// existing `fn test` invocation without the new flags must keep getting.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestResolveTestRefSuffixNeitherSet(t *testing.T) {
+	fc := fissionfake.NewSimpleClientset() //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+
+	suffix, err := (&TestSubCommand{}).resolveTestRefSuffix(in, "fn", "default")
+	require.NoError(t, err)
+	assert.Empty(t, suffix)
+}
+
+// TestDoAliasSuffixReachesRequestURL guards the end-to-end wiring: --alias
+// must both preflight-check the FunctionAlias and land the router suffix
+// (":<alias>") on the actual outgoing request path, not just on some
+// intermediate value that never makes it into the URL.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoAliasSuffixReachesRequestURL(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{Name: "fn", Namespace: "default"}
+	alias := &fv1.FunctionAlias{
+		Name: "prod", Namespace: "default",
+		Spec: fv1.FunctionAliasSpec{FunctionName: "fn", Version: "fn-v1"},
+	}
+	fc := fissionfake.NewSimpleClientset(fn, alias) //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+	in.SetString(flagkey.FnTestAlias, "prod")
+
+	err := (&TestSubCommand{}).do(in)
+	require.NoError(t, err)
+	assert.Equal(t, "/fission-function/fn:prod", gotPath, "the alias suffix must reach the outgoing request path")
+}
+
+// TestDoSyncSuffixedRouteNotFound guards the RFC-0025 404 upgrade: a router
+// route-miss 404 — carrying the utils.HeaderRouteMiss marker the internal
+// listener's own not-found handler stamps, which is what an unmaterialized
+// alias/version route returns — on a suffixed request must surface the
+// alias/version hint instead of the generic "error getting function
+// response". (A plain 404 without the marker is the function's own response
+// and keeps the generic handling.)
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoSyncSuffixedRouteNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(utils.HeaderRouteMiss, "1") // the router's own route-miss 404
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{Name: "fn", Namespace: "default"}
+	alias := &fv1.FunctionAlias{
+		Name: "prod", Namespace: "default",
+		Spec: fv1.FunctionAliasSpec{FunctionName: "fn", Version: "fn-v1"},
+	}
+	fc := fissionfake.NewSimpleClientset(fn, alias) //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+	in.SetString(flagkey.FnTestAlias, "prod")
+
+	err := (&TestSubCommand{}).do(in)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "alias/version route not found")
+	assert.Contains(t, err.Error(), `"prod"`)
+}
+
+// TestDoAsyncSuffixedRouteNotFound mirrors
+// TestDoSyncSuffixedRouteNotFound for the --async path, guarding item 3 of
+// the RFC-0025 plumbing: --async goes through the same suffixed URL, so it
+// must get the same helpful 404 instead of the generic
+// "async invocation failed" message.
+//
+// Not run in parallel: cmd.SetClientset installs a package-level client
+// shared by every test in this package.
+func TestDoAsyncSuffixedRouteNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(utils.HeaderRouteMiss, "1") // the router's own route-miss 404
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", srv.URL)
+
+	fn := &fv1.Function{Name: "fn", Namespace: "default"}
+	version := &fv1.FunctionVersion{
+		Name: "fn-v3", Namespace: "default",
+		Spec: fv1.FunctionVersionSpec{FunctionName: "fn"},
+	}
+	fc := fissionfake.NewSimpleClientset(fn, version) //nolint:staticcheck
+	cmd.ResetClientsetForTest()
+	cmd.SetClientset(cmd.Client{FissionClientSet: fc, Namespace: "default"})
+
+	in := dummy.TestFlagSet()
+	in.SetString(flagkey.FnName, "fn")
+	in.SetStringSlice(flagkey.HtMethod, []string{http.MethodGet})
+	in.SetString(flagkey.FnTestVersion, "fn-v3")
+	in.SetBool(flagkey.FnTestAsync, true)
+
+	err := (&TestSubCommand{}).do(in)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "alias/version route not found")
+	assert.Contains(t, err.Error(), `"fn-v3"`)
 }

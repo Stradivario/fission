@@ -46,7 +46,26 @@ type EnvironmentSpecApplyConfiguration struct {
 	// The initial pool size for environment
 	Poolsize *int `json:"poolsize,omitempty"`
 	// The grace time for pod to perform connection draining before termination. The unit is in seconds.
-	// (Optional) defaults to 360 seconds
+	// A terminating function pod keeps serving for the WHOLE grace window
+	// (the preStop hook sleeps through it, then the kubelet kills the pod),
+	// so this value is exactly how long every teardown — idle reap, env
+	// update roll, upgrade, node drain — takes per pod. 90s covers endpoint
+	// propagation (seconds) plus the 60s default function timeout with
+	// margin, mirroring the router's own 75s-drain/90s-grace posture; set
+	// it per environment for functions with longer request timeouts.
+	//
+	// The CRD default below is what makes the documented default true for
+	// API-created Environments: nil means "use the default" and the
+	// apiserver fills an absent field with 90 at serving time.
+	//
+	// The *pointer* is what makes an EXPLICIT 0 ("no drain window, kill
+	// instantly") expressible from typed Go clients: on the previous
+	// int64 field, omitempty marshalled 0 as absent and the apiserver
+	// served it back as 90, so raw YAML was the only way to say 0.
+	// In-process readers must use EffectiveTerminationGracePeriod()
+	// (env_validation.go), which mirrors the CRD default for objects
+	// that never crossed the apiserver.
+	// (Optional) defaults to 90 seconds
 	TerminationGracePeriod *int64 `json:"terminationGracePeriod,omitempty"`
 	// KeepArchive is used by fetcher to determine if the extracted archive
 	// or unarchived file should be placed, which is then used by specialize handler.
@@ -55,6 +74,27 @@ type EnvironmentSpecApplyConfiguration struct {
 	// ImagePullSecret is the secret for Kubernetes to pull an image from a
 	// private registry.
 	ImagePullSecret *string `json:"imagepullsecret,omitempty"`
+	// (Optional) RuntimeClassName opts this environment's pods into a
+	// syscall-isolating RuntimeClass — for example gVisor's "gvisor" or
+	// Kata Containers' "kata" — instead of the node's default
+	// (typically runc) container runtime. It applies to BOTH this
+	// environment's runtime (warm pool / specialized) pods AND its
+	// builder pods: an author opting into isolation means "this env's
+	// workloads," and builder pods run user build commands, arguably
+	// more arbitrary-code-shaped than the runtime pods.
+	//
+	// This is fill-if-nil only: a RuntimeClassName set directly on
+	// Runtime.PodSpec (or Builder.PodSpec) is the documented full
+	// override escape hatch and always takes precedence over this
+	// field when both are set.
+	//
+	// NOT applied to container-executor functions (Tier C) — there is
+	// no Environment in scope on that path today, consistent with how
+	// Runtime.PodSpec/Builder.PodSpec are already handled.
+	//
+	// The referenced RuntimeClass object is not required to exist at
+	// admission time; an absent one fails at pod scheduling, not here.
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 }
 
 // EnvironmentSpecApplyConfiguration constructs a declarative configuration of the EnvironmentSpec type for use with
@@ -140,5 +180,13 @@ func (b *EnvironmentSpecApplyConfiguration) WithKeepArchive(value bool) *Environ
 // If called multiple times, the ImagePullSecret field is set to the value of the last call.
 func (b *EnvironmentSpecApplyConfiguration) WithImagePullSecret(value string) *EnvironmentSpecApplyConfiguration {
 	b.ImagePullSecret = &value
+	return b
+}
+
+// WithRuntimeClassName sets the RuntimeClassName field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RuntimeClassName field is set to the value of the last call.
+func (b *EnvironmentSpecApplyConfiguration) WithRuntimeClassName(value string) *EnvironmentSpecApplyConfiguration {
+	b.RuntimeClassName = &value
 	return b
 }

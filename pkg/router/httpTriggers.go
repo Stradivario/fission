@@ -19,10 +19,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/conditions"
+	"github.com/fission/fission/pkg/crd"
 	ferror "github.com/fission/fission/pkg/error"
 	eclient "github.com/fission/fission/pkg/executor/client"
 	config "github.com/fission/fission/pkg/featureconfig"
@@ -68,11 +70,20 @@ type HTTPTriggerSet struct {
 	structuredErrors           bool
 	accessLog                  bool
 	useEncodedPath             bool
-	syncDebouncer              func(func())
+	// callerNSGuard, when non-nil, enforces same-namespace invocation on the
+	// internal listener (ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION). nil = disabled.
+	callerNSGuard *sameNamespaceGuard
+	syncDebouncer func(func())
 	// ready flips true after the first successful mux build; routerReadinessHandler
 	// gates /readyz on it so a starting/rolling pod stays out of the
 	// Service endpoints until its mux is populated.
 	ready atomic.Bool
+	// endpointsSynced reports whether the RFC-0002 endpoint index has received
+	// its informer's initial replay. nil when the slice-fed data plane is off.
+	// Readiness gates on it as well as on `ready`: a replica whose mux is built
+	// but whose index is still filling serves warm traffic through the executor
+	// fallback — correct, but a latency cliff during a rolling upgrade.
+	endpointsSynced cache.InformerSynced
 
 	// Incremental route updates (RFC-0013) are the only production path: the
 	// reconcilers feed per-event diffs into routeTable and the materializer
@@ -95,6 +106,11 @@ type HTTPTriggerSet struct {
 	// featureConfigFn is the materializer's feature-config source —
 	// injectable so tests can exercise the materialize failure path.
 	featureConfigFn func(logr.Logger) (*config.FeatureConfig, error)
+
+	// asyncInvoker enqueues RFC-0024 async invocations. Set by Start after
+	// makeHTTPTriggerSet (like addressResolver) when ASYNC_INVOCATION_ENABLED, and
+	// copied into public function handlers by buildTriggerHandler. nil = feature off.
+	asyncInvoker *asyncInvoker
 }
 
 // initIncrementalRoutes wires the route table and feature-config source for the
@@ -197,6 +213,14 @@ func (ts *HTTPTriggerSet) routerReadinessHandler(w http.ResponseWriter, r *http.
 		http.Error(w, "router mux not yet built", http.StatusServiceUnavailable)
 		return
 	}
+	// With the slice-fed data plane on, also wait for the endpoint index to
+	// have seen its informer's initial replay: a mux-ready replica whose index
+	// is still filling would serve warm traffic through the executor fallback
+	// instead of the fast path (RFC-0028 §2).
+	if ts.endpointsSynced != nil && !ts.endpointsSynced() {
+		http.Error(w, "endpoint index not yet synced", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -272,23 +296,27 @@ func versionHandler(w http.ResponseWriter, r *http.Request) {
 // precomputePolicies resolves the proxy policy for every backend function of
 // a route at mux-build time (RFC-0014): resolveProxyPolicy is a pure function
 // of (fn, timeout, idle-default), and the canary path selects the backend per
-// request, so the map is keyed by function UID.
-func precomputePolicies(fns map[string]*fv1.Function, fnTimeoutMap map[types.UID]int, streamIdleDefault time.Duration) map[types.UID]proxyPolicy {
-	policies := make(map[types.UID]proxyPolicy, len(fns))
+// request, so the map is keyed by crd.CacheKeyUG (UID, Generation) rather
+// than UID alone — two resolved snapshots of the same versioned function
+// (e.g. a weighted alias's primary and secondary target) share a UID but
+// differ in Generation, and each must get its own policy.
+func precomputePolicies(fns map[string]*fv1.Function, fnTimeoutMap map[crd.CacheKeyUG]int, streamIdleDefault time.Duration) map[crd.CacheKeyUG]proxyPolicy {
+	policies := make(map[crd.CacheKeyUG]proxyPolicy, len(fns))
 	for _, fn := range fns {
 		if fn == nil {
 			continue
 		}
-		fnTimeout := fnTimeoutMap[fn.GetUID()]
+		key := crd.CacheKeyUGFromMeta(&fn.ObjectMeta)
+		fnTimeout := fnTimeoutMap[key]
 		if fnTimeout == 0 {
 			fnTimeout = fv1.DEFAULT_FUNCTION_TIMEOUT
 		}
-		policies[fn.GetUID()] = resolveProxyPolicy(fn, time.Duration(fnTimeout)*time.Second, streamIdleDefault)
+		policies[key] = resolveProxyPolicy(fn, time.Duration(fnTimeout)*time.Second, streamIdleDefault)
 	}
 	return policies
 }
 
-func (ts *HTTPTriggerSet) buildMuxes(ctx context.Context, fnTimeoutMap map[types.UID]int) (public, internal *httpmux.Mux, err error) {
+func (ts *HTTPTriggerSet) buildMuxes(ctx context.Context, fnTimeoutMap map[crd.CacheKeyUG]int) (public, internal *httpmux.Mux, err error) {
 	featureConfig, err := config.GetFeatureConfig(ts.logger)
 	if err != nil {
 		return nil, nil, err
@@ -321,7 +349,7 @@ func (ts *HTTPTriggerSet) buildMuxes(ctx context.Context, fnTimeoutMap map[types
 			continue
 		}
 
-		if rr.resolveResultType != resolveResultSingleFunction && rr.resolveResultType != resolveResultMultipleFunctions {
+		if !rr.resolveResultType.routable() {
 			// Unsupported resolve result type. Skip the route (let it 404)
 			// instead of crashing the whole router process and dropping every
 			// other trigger with it.
@@ -347,12 +375,14 @@ func (ts *HTTPTriggerSet) buildMuxes(ctx context.Context, fnTimeoutMap map[types
 	for i := range ts.functions {
 		fn := ts.functions[i]
 		handler := ts.buildInternalFunctionHandler(&fn, fnTimeoutMap)
-		key := types.NamespacedName{Namespace: fn.Namespace, Name: fn.Name}
+		key := routetable.InternalKey{Namespace: fn.Namespace, Name: fn.Name}
 		registerInternalRoute(internalMux, key, handler)
 		ts.logger.V(1).Info("add internal handler and prefix route for function", "function", fn.Name)
 	}
 
 	ts.registerRouterOwnedRoutes(publicMux, featureConfig, homeHandled)
+	ts.registerAsyncDLQRoutes(internalMux)
+	ts.registerTopicRoutes(internalMux)
 
 	return publicMux, internalMux, nil
 }

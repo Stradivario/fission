@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
 	asv2 "k8s.io/api/autoscaling/v2"
 	apiv1 "k8s.io/api/core/v1"
@@ -44,6 +47,110 @@ func Create(input cli.Input) error {
 	return (&CreateSubCommand{}).do(input)
 }
 
+// getProvisionedConcurrencyConfig builds a ProvisionedConcurrencyConfig from
+// the --provisioned-concurrency flag, or nil when the flag is not set (the
+// classic on-demand cold-start path).
+func getProvisionedConcurrencyConfig(input cli.Input) (*fv1.ProvisionedConcurrencyConfig, error) {
+	if !input.IsSet(flagkey.FnProvisionedConcurrency) {
+		if input.IsSet(flagkey.FnProvisionedSchedule) {
+			return nil, fmt.Errorf("provisioned concurrency window is set but provisioned concurrency is not")
+		}
+		return nil, nil
+	}
+	target := input.Int(flagkey.FnProvisionedConcurrency)
+	if target <= 0 {
+		// 0 or negative = off switch (update path clears the config)
+		if input.IsSet(flagkey.FnProvisionedSchedule) {
+			return nil, fmt.Errorf("--%s requires --%s >= 1, got %d", flagkey.FnProvisionedSchedule, flagkey.FnProvisionedConcurrency, target)
+		}
+		return nil, nil
+	}
+	var windows []fv1.ProvisionedWindow
+	seen := make(map[string]bool)
+	if input.IsSet(flagkey.FnProvisionedSchedule) {
+		for _, window := range input.StringSlice(flagkey.FnProvisionedSchedule) {
+			w, err := getProvisioinedWindow(window)
+			if err != nil {
+				return nil, err
+			}
+			if seen[w.Name] {
+				return nil, fmt.Errorf("duplicate provisioned window: %s", w.Name)
+			}
+			windows = append(windows, w)
+			seen[w.Name] = true
+		}
+	}
+	cfg := &fv1.ProvisionedConcurrencyConfig{Target: target, Windows: windows}
+	return cfg, nil
+}
+
+// getProvisioinedWindow parses a provisioned window string into a ProvisionedWindow, or returns an error.
+func getProvisioinedWindow(window string) (fv1.ProvisionedWindow, error) {
+	var w fv1.ProvisionedWindow
+
+	if len(window) == 0 {
+		return w, fmt.Errorf("window details are empty")
+	}
+
+	requiredKeys := []string{"name", "duration", "start", "target"}
+
+	pairs := strings.Split(window, ";")
+	m := make(map[string]string, len(pairs))
+	for _, pair := range pairs {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			return w, fmt.Errorf("invalid window definition: %s, format is key=value", pair)
+		}
+		m[key] = value
+	}
+
+	var errs []error
+
+	// all required keys must be present
+	required := make(map[string]bool, len(requiredKeys))
+	for _, key := range requiredKeys {
+		required[key] = true
+		if _, ok := m[key]; !ok {
+			errs = append(errs, fmt.Errorf("missing required window key: %s", key))
+		}
+	}
+
+	// no extra/unknown keys allowed
+	for key := range m {
+		if !required[key] {
+			errs = append(errs, fmt.Errorf("invalid window definition: %s is not a valid key", key))
+		}
+	}
+
+	if len(errs) > 0 {
+		return w, errors.Join(errs...)
+	}
+	target, err := strconv.Atoi(m["target"])
+	if err != nil {
+		return w, fmt.Errorf("invalid target: %w", err)
+	}
+	if target < 0 {
+		return w, fmt.Errorf("target is negative")
+	}
+	duration, err := time.ParseDuration(m["duration"])
+	if err != nil {
+		return w, fmt.Errorf("invalid duration: %w", err)
+	}
+	if duration <= 0 {
+		return w, fmt.Errorf("duration is zero or negative")
+	}
+	if err := fv1.IsValidCronSpec(m["start"]); err != nil {
+		return w, fmt.Errorf("invalid start: %w", err)
+	}
+	w = fv1.ProvisionedWindow{
+		Name:     m["name"],
+		Duration: m["duration"],
+		Start:    m["start"],
+		Target:   target,
+	}
+	return w, nil
+}
+
 // getStreamingConfig builds a StreamingConfig from the --streaming* flags, or
 // nil when --streaming is not set (the classic, non-streaming proxy path).
 func getStreamingConfig(input cli.Input) *fv1.StreamingConfig {
@@ -55,6 +162,44 @@ func getStreamingConfig(input cli.Input) *fv1.StreamingConfig {
 		IdleTimeoutSeconds: input.Int(flagkey.FnStreamingIdleTimeout),
 		MaxDurationSeconds: input.Int(flagkey.FnStreamingMaxDuration),
 	}
+}
+
+// getStateConfig builds the RFC-0023 StateConfig from the --state* flags,
+// merging onto existing (the function's current config, or nil on create) so
+// an `fn update --state` that sets only one field keeps the rest. nil when
+// --state is not set. Bounds/charset are validated server-side.
+func getStateConfig(input cli.Input, existing *fv1.StateConfig) *fv1.StateConfig {
+	if !input.Bool(flagkey.FnState) {
+		return nil
+	}
+	sc := &fv1.StateConfig{}
+	if existing != nil {
+		sc = existing.DeepCopy()
+	}
+	if input.IsSet(flagkey.FnStateKeyspace) {
+		sc.Keyspace = input.String(flagkey.FnStateKeyspace)
+	}
+	if input.IsSet(flagkey.FnStateMaxKeys) {
+		sc.MaxKeys = int64(input.Int(flagkey.FnStateMaxKeys))
+	}
+	if input.IsSet(flagkey.FnStateMaxValueBytes) {
+		sc.MaxValueBytes = int64(input.Int(flagkey.FnStateMaxValueBytes))
+	}
+	if input.IsSet(flagkey.FnStateTTL) {
+		sc.DefaultTTL = &metav1.Duration{Duration: input.Duration(flagkey.FnStateTTL)}
+	}
+	if input.IsSet(flagkey.FnStateStickySource) || input.IsSet(flagkey.FnStateStickyName) {
+		if sc.Sticky == nil {
+			sc.Sticky = &fv1.StickyConfig{}
+		}
+		if input.IsSet(flagkey.FnStateStickySource) {
+			sc.Sticky.Source = fv1.StickySource(input.String(flagkey.FnStateStickySource))
+		}
+		if input.IsSet(flagkey.FnStateStickyName) {
+			sc.Sticky.Name = input.String(flagkey.FnStateStickyName)
+		}
+	}
+	return sc
 }
 
 // getToolConfig builds a ToolConfig from the --expose-as-mcp / --tool-* flags,
@@ -87,6 +232,117 @@ func getToolConfig(input cli.Input, existing *fv1.ToolConfig) (*fv1.ToolConfig, 
 		tc.InputSchema = &apiextensionsv1.JSON{Raw: raw}
 	}
 	return tc, nil
+}
+
+// getInvocationConfig builds the RFC-0024 async InvocationConfig from the
+// --async-* flags, merging onto existing (the function's current config, or nil on
+// create) so an `fn update` that sets only one field keeps the rest. It returns nil
+// when nothing is configured. An empty --async-on-success/--async-on-failure (or
+// their -topic variants) clears that destination. Field bounds and the destination
+// shape are validated server-side by the Function admission webhook, so the CLI
+// stays thin.
+func getInvocationConfig(input cli.Input, existing *fv1.InvocationConfig) (*fv1.InvocationConfig, error) {
+	set := input.IsSet(flagkey.FnAsyncMaxAttempts) || input.IsSet(flagkey.FnAsyncMaxAge) ||
+		input.IsSet(flagkey.FnAsyncOnSuccess) || input.IsSet(flagkey.FnAsyncOnFailure) ||
+		input.IsSet(flagkey.FnAsyncOnSuccessTopic) || input.IsSet(flagkey.FnAsyncOnFailureTopic)
+	if !set {
+		return existing, nil
+	}
+	ic := &fv1.InvocationConfig{}
+	if existing != nil {
+		ic = existing.DeepCopy()
+	}
+	if input.IsSet(flagkey.FnAsyncMaxAttempts) {
+		ic.Retry.MaxAttempts = new(input.Int(flagkey.FnAsyncMaxAttempts))
+	}
+	if input.IsSet(flagkey.FnAsyncMaxAge) {
+		ic.MaxAge = &metav1.Duration{Duration: input.Duration(flagkey.FnAsyncMaxAge)}
+	}
+	var err error
+	if ic.OnSuccess, err = destinationFromFlags(input, flagkey.FnAsyncOnSuccess, flagkey.FnAsyncOnSuccessTopic, ic.OnSuccess); err != nil {
+		return nil, err
+	}
+	if ic.OnFailure, err = destinationFromFlags(input, flagkey.FnAsyncOnFailure, flagkey.FnAsyncOnFailureTopic, ic.OnFailure); err != nil {
+		return nil, err
+	}
+	return ic, nil
+}
+
+// destinationFromFlags resolves one destination condition from its flag pair —
+// a same-namespace function (fnKey) or a statestore topic (topicKey). A
+// DestinationRef holds exactly one kind, so setting both non-empty is an
+// error; setting either to "" clears the destination; setting neither keeps
+// current.
+func destinationFromFlags(input cli.Input, fnKey, topicKey string, current *fv1.DestinationRef) (*fv1.DestinationRef, error) {
+	if !input.IsSet(fnKey) && !input.IsSet(topicKey) {
+		return current, nil
+	}
+	fnName, topic := input.String(fnKey), input.String(topicKey)
+	if fnName != "" && topic != "" {
+		return nil, fmt.Errorf("--%s and --%s are mutually exclusive (a destination is a function OR a topic)", fnKey, topicKey)
+	}
+	switch {
+	case fnName != "":
+		return &fv1.DestinationRef{
+			Function: &fv1.FunctionReference{Type: fv1.FunctionReferenceTypeFunctionName, Name: fnName},
+		}, nil
+	case topic != "":
+		return &fv1.DestinationRef{
+			Topic: &fv1.TopicRef{MessageQueueType: fv1.MessageQueueTypeStatestore, Topic: topic},
+		}, nil
+	default:
+		return nil, nil // explicit empty clears the destination
+	}
+}
+
+// getVersioningConfig builds the RFC-0025 VersioningConfig from the
+// --versioning/--retain-versions flags, merging onto existing (the function's
+// current config, or nil on create) so an update that sets only
+// --retain-versions keeps the mode, and one that sets only --versioning keeps
+// a prior Retain. Neither flag set returns existing untouched (nil on
+// create). --versioning off clears the config (on create it's a no-op, since
+// existing is already nil). --retain-versions requires versioning to already
+// be enabled -- either --versioning auto|manual in the same call, or an
+// existing config -- since Retain only means something alongside a Mode.
+func getVersioningConfig(input cli.Input, existing *fv1.VersioningConfig) (*fv1.VersioningConfig, error) {
+	versioningSet := input.IsSet(flagkey.FnVersioning)
+	retainSet := input.IsSet(flagkey.FnRetainVersions)
+	if !versioningSet && !retainSet {
+		return existing, nil
+	}
+
+	var vc *fv1.VersioningConfig
+	if versioningSet {
+		switch mode := input.String(flagkey.FnVersioning); mode {
+		case "auto", "manual":
+			vc = &fv1.VersioningConfig{Mode: fv1.VersioningMode(mode)}
+			if existing != nil {
+				vc.Retain = existing.Retain
+			}
+		case "off":
+			if retainSet {
+				return nil, fmt.Errorf("use --%s auto|manual with --%s", flagkey.FnVersioning, flagkey.FnRetainVersions)
+			}
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("--%s must be one of auto, manual, off", flagkey.FnVersioning)
+		}
+	} else {
+		if existing == nil {
+			return nil, fmt.Errorf("use --%s auto|manual with --%s", flagkey.FnVersioning, flagkey.FnRetainVersions)
+		}
+		vc = existing.DeepCopy()
+	}
+
+	if retainSet {
+		retain := input.Int(flagkey.FnRetainVersions)
+		if retain < 1 {
+			return nil, fmt.Errorf("--%s must be >= 1", flagkey.FnRetainVersions)
+		}
+		vc.Retain = new(retain)
+	}
+
+	return vc, nil
 }
 
 func (opts *CreateSubCommand) do(input cli.Input) error {
@@ -153,6 +409,11 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 	secretNames := input.StringSlice(flagkey.FnSecret)
 	cfgMapNames := input.StringSlice(flagkey.FnCfgMap)
 
+	fnEnv, fnEnvFrom, err := parseFunctionEnvFlags(input)
+	if err != nil {
+		return err
+	}
+
 	if input.String(flagkey.FnExecutorType) == string(fv1.ExecutorTypeContainer) {
 		return fmt.Errorf("this command does not support creating function of executor type container. Check `fission function run-container --help`")
 	}
@@ -179,17 +440,15 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 				return fmt.Errorf("error reading spec in '%s': %w", specDir, err)
 			}
 
-			obj := fr.SpecExists(&fv1.Package{ // In case of spec I might or might not have the `fnNamespace`, how will I get pkg objectMeta here.
+			pkg = fr.PackageInSpecs(&fv1.Package{ // In case of spec I might or might not have the `fnNamespace`, how will I get pkg objectMeta here.
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      pkgName,
 					Namespace: userProvidedNS,
 				},
 			}, true, false)
-			if obj == nil {
+			if pkg == nil {
 				return fmt.Errorf("please create package %s spec file with namespace %s before referencing it", pkgName, userProvidedNS)
 			}
-
-			pkg = obj.(*fv1.Package)
 			pkgMetadata = &pkg.ObjectMeta
 		} else {
 			// use existing package
@@ -217,7 +476,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 			if err != nil {
 				return fmt.Errorf("error reading spec in '%s': %w", specDir, err)
 			}
-			exists, err := fr.ExistsInSpecs(fv1.Environment{
+			exists, err := fr.ExistsInSpecs(&fv1.Environment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      envName,
 					Namespace: userProvidedNS,
@@ -252,7 +511,9 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 			deployArchiveFiles = append(deployArchiveFiles, input.String(flagkey.PkgCode))
 			noZip = true
 		}
-		if err := _package.ValidateArchiveSources(code, srcArchiveFiles, deployArchiveFiles, ociImage); err != nil {
+		// fn create has no --srcoci; source OCI packages are created via
+		// `fission package create --srcoci` and referenced with --pkg.
+		if err := _package.ValidateArchiveSources(code, srcArchiveFiles, deployArchiveFiles, ociImage, ""); err != nil {
 			return err
 		}
 
@@ -288,24 +549,45 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 		return err
 	}
 
+	invocation, err := getInvocationConfig(input, nil)
+	if err != nil {
+		return err
+	}
+
+	versioningConfig, err := getVersioningConfig(input, nil)
+	if err != nil {
+		return err
+	}
+
+	provisionedConcurrency, err := getProvisionedConcurrencyConfig(input)
+	if err != nil {
+		return err
+	}
+
 	opts.function = &fv1.Function{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fnName,
 			Namespace: fnNamespace,
 		},
 		Spec: fv1.FunctionSpec{
-			Secrets:         secrets,
-			ConfigMaps:      cfgmaps,
-			Resources:       *resourceReq,
-			InvokeStrategy:  *invokeStrategy,
-			FunctionTimeout: fnTimeout,
-			IdleTimeout:     &fnIdleTimeout,
-			Streaming:       getStreamingConfig(input),
-			Tool:            toolConfig,
-			Concurrency:     fnConcurrency,
-			RequestsPerPod:  requestsPerPod,
-			RetainPods:      retainPods,
-			OnceOnly:        fnOnceOnly,
+			Secrets:                secrets,
+			ConfigMaps:             cfgmaps,
+			Env:                    fnEnv,
+			EnvFrom:                fnEnvFrom,
+			Resources:              *resourceReq,
+			InvokeStrategy:         *invokeStrategy,
+			FunctionTimeout:        fnTimeout,
+			IdleTimeout:            &fnIdleTimeout,
+			Streaming:              getStreamingConfig(input),
+			Tool:                   toolConfig,
+			State:                  getStateConfig(input, nil),
+			Invocation:             invocation,
+			Versioning:             versioningConfig,
+			ProvisionedConcurrency: provisionedConcurrency,
+			Concurrency:            fnConcurrency,
+			RequestsPerPod:         requestsPerPod,
+			RetainPods:             retainPods,
+			OnceOnly:               fnOnceOnly,
 		},
 	}
 
@@ -355,8 +637,12 @@ func generatePackageName(fnName string, id string) string {
 // run write the resource to a spec file or create a fission CRD with remote fission server.
 // It also prints warning/error if necessary.
 func (opts *CreateSubCommand) run(input cli.Input) error {
+	if err := _package.ValidateWatchNotSpecMode(input); err != nil {
+		return err
+	}
+
 	// if we're writing a spec, don't create the function; save/print and return.
-	if handled, err := spec.SaveOrDry(input, *opts.function, opts.specFile); handled {
+	if handled, err := spec.SaveOrDry(input, opts.function, opts.specFile); handled {
 		return err
 	}
 
@@ -371,7 +657,7 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 	triggerUrl := input.String(flagkey.HtUrl)
 	prefix := input.String(flagkey.HtPrefix)
 	if len(triggerUrl) == 0 && len(prefix) == 0 {
-		return nil
+		return opts.watchBuildIfRequested(input)
 	}
 	if len(prefix) != 0 && len(triggerUrl) > 0 {
 		console.Warn("Prefix will take precedence over URL/RelativeURL")
@@ -411,7 +697,37 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 	}
 
 	fmt.Printf("route created: %s %s -> %s\n", methods, triggerUrl, opts.function.Name)
-	return nil
+	return opts.watchBuildIfRequested(input)
+}
+
+// watchBuildIfRequested follows the referenced package's build to completion
+// when --watch was given — `fn create --src` is the most common way users
+// trigger a build (issue #3676). It runs after function/trigger creation so a
+// failed build never blocks those; the non-nil error on a failed build only
+// sets the exit code.
+//
+// For a package THIS command created (no --pkg given), any state — including
+// an already terminal one — is this command's own build outcome, so the watch
+// always runs. For `--pkg <existing>`, fn create triggers no build: only a
+// build already in flight is worth attaching to, and a terminal status is
+// stale history that must not be replayed as if it were this command's
+// result.
+func (opts *CreateSubCommand) watchBuildIfRequested(input cli.Input) error {
+	if !input.Bool(flagkey.PkgWatch) {
+		return nil
+	}
+	ref := opts.function.Spec.Package.PackageRef
+	if usedExistingPackage := len(input.String(flagkey.FnPackageName)) > 0; usedExistingPackage {
+		pkg, err := opts.Client().FissionClientSet.CoreV1().Packages(ref.Namespace).Get(input.Context(), ref.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("error getting package for --%v: %w", flagkey.PkgWatch, err)
+		}
+		if !_package.IsBuildInFlight(pkg.Status.BuildStatus) {
+			fmt.Fprintf(input.Stdout(), "Package '%v' already exists and no build was triggered; nothing to watch\n", ref.Name)
+			return nil
+		}
+	}
+	return _package.WatchPackageBuild(input, opts.Client(), ref.Namespace, ref.Name)
 }
 
 func getInvokeStrategy(input cli.Input, existingInvokeStrategy *fv1.InvokeStrategy) (strategy *fv1.InvokeStrategy, err error) {

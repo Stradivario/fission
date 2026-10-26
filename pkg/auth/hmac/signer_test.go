@@ -5,6 +5,7 @@
 package hmac
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -61,6 +62,175 @@ func TestSignerHandlesNilBody(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = resp.Body.Close() })
 	assert.Equal(t, 200, resp.StatusCode)
+}
+
+// TestSignerRepopulatesGetBody pins the retry contract: the signer buffers
+// and replaces the request body, so it must also repopulate GetBody — the
+// hook net/http and pkg/utils/httpretry use to rewind a request per
+// attempt (both refuse to retry when it is nil, and a naive re-submission
+// of the same *http.Request would re-sign the consumed — empty — reader,
+// which the verifier accepts).
+func TestSignerRepopulatesGetBody(t *testing.T) {
+	secret := []byte("test-secret-must-be-32-bytes-min")
+
+	var gotBodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		ts, err := strconv.ParseInt(r.Header.Get(HeaderTimestamp), 10, 64)
+		require.NoError(t, err)
+		require.True(t, Verify(secret, r.Method, r.URL.Path, body, ts, r.Header.Get(HeaderSignature)),
+			"every attempt must carry a signature valid for the body it sent")
+		gotBodies = append(gotBodies, string(body))
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+
+	signer := NewSigner(secret, http.DefaultTransport, time.Now)
+
+	// Build a request whose GetBody is nil, like a caller handing the
+	// transport a bare reader net/http cannot rewind on its own.
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/archive", nil)
+	require.NoError(t, err)
+	req.Body = io.NopCloser(strings.NewReader("payload"))
+	require.Nil(t, req.GetBody, "precondition: the raw request must not be rewindable")
+
+	resp, err := signer.RoundTrip(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	// The signer consumed the original reader, so it must have left a
+	// rewind hook behind for any retry layer above it.
+	require.NotNil(t, req.GetBody, "signer must repopulate GetBody after buffering the body")
+
+	// Simulate a retry the way httpretry does: rewind Body via GetBody,
+	// then run the same request through the signer again. The second
+	// attempt must carry the full payload, freshly signed — not an empty
+	// body from the consumed reader.
+	req.Body, err = req.GetBody()
+	require.NoError(t, err)
+	resp, err = signer.RoundTrip(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, []string{"payload", "payload"}, gotBodies,
+		"the retried attempt must re-send (and re-sign) the original body, never an empty one")
+}
+
+// TestSignerStreamsHashViaGetBody pins the no-buffer contract: when a
+// request is rewindable (GetBody set — net/http populates it for requests
+// built from bytes/strings readers, which covers every JSON client and the
+// storagesvc archive upload), the signer must stream the body hash from a
+// fresh GetBody reader and leave Body/GetBody untouched, rather than
+// buffering a second full copy of the body just to hash it.
+func TestSignerStreamsHashViaGetBody(t *testing.T) {
+	secret := []byte("test-secret-must-be-32-bytes-min")
+
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		ts, err := strconv.ParseInt(r.Header.Get(HeaderTimestamp), 10, 64)
+		require.NoError(t, err)
+		require.True(t, Verify(secret, r.Method, r.URL.Path, body, ts, r.Header.Get(HeaderSignature)),
+			"the streamed hash must sign the exact bytes on the wire")
+		gotBody = string(body)
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/archive", strings.NewReader("payload"))
+	require.NoError(t, err)
+	require.NotNil(t, req.GetBody, "precondition: net/http must have made the request rewindable")
+
+	// Count GetBody calls and remember the original hooks so we can assert
+	// the signer read a fresh reader once and replaced nothing.
+	origBody := req.Body
+	origGetBody := req.GetBody
+	getBodyCalls := 0
+	req.GetBody = func() (io.ReadCloser, error) {
+		getBodyCalls++
+		return origGetBody()
+	}
+
+	signer := NewSigner(secret, http.DefaultTransport, time.Now)
+	resp, err := signer.RoundTrip(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, "payload", gotBody, "the transport must still stream the original body")
+	assert.Equal(t, 1, getBodyCalls, "the hash must be streamed from exactly one fresh GetBody reader")
+	assert.True(t, req.Body == origBody, "the signer must not replace a rewindable request's Body")
+}
+
+// closeTrackingBody counts Close calls, for pinning the close-exactly-once
+// contract on the signer's error paths (io.Closer declares behavior after
+// the first Close undefined, so a double-close is as much a bug as a leak).
+type closeTrackingBody struct {
+	io.Reader
+	closes *int
+}
+
+func (b *closeTrackingBody) Close() error {
+	*b.closes++
+	return nil
+}
+
+// errReader fails every Read, to force the buffering fallback's error path.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// roundTripperFunc adapts a func to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestSignerClosesBodyOnHashError pins the RoundTripper contract on the
+// streaming branch's error path: when GetBody fails, the inner transport
+// never runs, so the signer itself must close the request body — otherwise
+// a retry loop against a failing GetBody leaks one fd per attempt. Exactly
+// one Close: a second would be undefined for non-idempotent closers.
+func TestSignerClosesBodyOnHashError(t *testing.T) {
+	secret := []byte("test-secret-must-be-32-bytes-min")
+
+	closes := 0
+	req, err := http.NewRequest(http.MethodPost, "http://router.invalid/fission-function/f", nil)
+	require.NoError(t, err)
+	req.Body = &closeTrackingBody{Reader: strings.NewReader("payload"), closes: &closes}
+	req.GetBody = func() (io.ReadCloser, error) {
+		return nil, errors.New("getbody failed")
+	}
+
+	signer := NewSigner(secret, roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("the inner transport must not run when hashing fails")
+		return nil, nil
+	}), time.Now)
+
+	_, err = signer.RoundTrip(req)
+	require.Error(t, err)
+	assert.Equal(t, 1, closes, "the signer must close the body exactly once when it errors before the transport runs")
+}
+
+// TestSignerClosesBodyExactlyOnceOnReadError pins the same contract on the
+// buffering fallback: draining a failing body already closes the original,
+// and no layer above may close it a second time.
+func TestSignerClosesBodyExactlyOnceOnReadError(t *testing.T) {
+	secret := []byte("test-secret-must-be-32-bytes-min")
+
+	closes := 0
+	req, err := http.NewRequest(http.MethodPost, "http://router.invalid/fission-function/f", nil)
+	require.NoError(t, err)
+	req.Body = &closeTrackingBody{Reader: errReader{err: errors.New("read failed")}, closes: &closes}
+	require.Nil(t, req.GetBody, "precondition: the buffering fallback must be exercised")
+
+	signer := NewSigner(secret, roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("the inner transport must not run when draining fails")
+		return nil, nil
+	}), time.Now)
+
+	_, err = signer.RoundTrip(req)
+	require.Error(t, err)
+	assert.Equal(t, 1, closes, "a failed drain must close the original body exactly once, never twice")
 }
 
 // TestSignerBindsQueryParameter pins the security-critical contract from
