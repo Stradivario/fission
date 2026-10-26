@@ -865,6 +865,20 @@ func (es ExecutionStrategy) Validate() error {
 // alias/version actually exists is not checked here (aliases are eventually
 // consistent, and existence-at-admission would break apply-before-publish
 // ordering); router-side resolution enforces existence at request time.
+// ValidateTriggerTarget is Validate for the triggers that may also target a
+// workflow (HTTPTrigger, TimeTrigger): type "workflow" needs a kube name and
+// takes no alias / version.
+func (ref FunctionReference) ValidateTriggerTarget() error {
+	if ref.Type != FunctionReferenceTypeWorkflow {
+		return ref.Validate()
+	}
+	errs := ValidateKubeName("FunctionReference.Name", ref.Name)
+	if ref.Alias != "" || ref.Version != "" {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionReference", "", "alias and version are not valid for a workflow target"))
+	}
+	return errs
+}
+
 func (ref FunctionReference) Validate() error {
 	var errs error
 
@@ -982,7 +996,7 @@ func (spec HTTPTriggerSpec) Validate() error {
 		errs = checkMethod(spec.Method, errs)
 	}
 
-	errs = errors.Join(errs, spec.FunctionReference.Validate())
+	errs = errors.Join(errs, spec.FunctionReference.ValidateTriggerTarget())
 
 	if len(spec.Host) > 0 {
 		e := validation.IsDNS1123Subdomain(spec.Host)
@@ -1295,7 +1309,7 @@ func (spec TimeTriggerSpec) Validate() error {
 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "TimeTriggerSpec.Cron", spec.Cron, "not a valid cron spec"))
 	}
 
-	errs = errors.Join(errs, spec.FunctionReference.Validate())
+	errs = errors.Join(errs, spec.FunctionReference.ValidateTriggerTarget())
 
 	return errs
 }

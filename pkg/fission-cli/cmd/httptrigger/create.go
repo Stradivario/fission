@@ -46,20 +46,31 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 	fnAlias := input.String(flagkey.HtFnAlias)
 	fnVersion := input.String(flagkey.HtFnVersion)
 
-	if len(functionList) == 0 {
-		return errors.New("need a function name to create a trigger, use --function")
-	}
+	workflow := input.String(flagkey.TriggerWorkflow)
 
-	if err := validateFnRefTagFlags(fnAlias, fnVersion, functionList); err != nil {
-		return err
-	}
+	var functionRef *fv1.FunctionReference
+	if workflow != "" {
+		if len(functionList) > 0 || len(functionWeightsList) > 0 || fnAlias != "" || fnVersion != "" {
+			return errors.New("use either --workflow or --function (with its --weight/--alias/--version), not both")
+		}
+		functionRef = &fv1.FunctionReference{Type: fv1.FunctionReferenceTypeWorkflow, Name: workflow}
+	} else {
+		if len(functionList) == 0 {
+			return errors.New("need a function name to create a trigger, use --function (or --workflow)")
+		}
 
-	functionRef, err := setHtFunctionRef(functionList, functionWeightsList)
-	if err != nil {
-		return err
+		if err := validateFnRefTagFlags(fnAlias, fnVersion, functionList); err != nil {
+			return err
+		}
+
+		ref, err := setHtFunctionRef(functionList, functionWeightsList)
+		if err != nil {
+			return err
+		}
+		functionRef = ref
+		functionRef.Alias = fnAlias
+		functionRef.Version = fnVersion
 	}
-	functionRef.Alias = fnAlias
-	functionRef.Version = fnVersion
 
 	triggerName := input.String(flagkey.HtName)
 	// just name triggers by uuid.

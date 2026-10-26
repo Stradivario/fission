@@ -349,7 +349,7 @@ func (ts *HTTPTriggerSet) buildMuxes(ctx context.Context, fnTimeoutMap map[crd.C
 			continue
 		}
 
-		if rr.resolveResultType != resolveResultSingleFunction && rr.resolveResultType != resolveResultMultipleFunctions {
+		if !rr.resolveResultType.routable() {
 			// Unsupported resolve result type. Skip the route (let it 404)
 			// instead of crashing the whole router process and dropping every
 			// other trigger with it.

@@ -100,7 +100,16 @@ type (
 const (
 	resolveResultSingleFunction = iota
 	resolveResultMultipleFunctions
+	// resolveResultWorkflow: the trigger targets a Workflow
+	// (functionref.type "workflow"); no function is resolved - the route
+	// starts a WorkflowRun (workflowtrigger.go).
+	resolveResultWorkflow
 )
+
+// routable reports whether a result type has a handler builder.
+func (t resolveResultType) routable() bool {
+	return t == resolveResultSingleFunction || t == resolveResultMultipleFunctions || t == resolveResultWorkflow
+}
 
 func makeFunctionReferenceResolver(logger logr.Logger, reader client.Reader) *functionReferenceResolver {
 	return &functionReferenceResolver{
@@ -120,6 +129,10 @@ func (frr *functionReferenceResolver) resolve(ctx context.Context, trigger fv1.H
 		return frr.resolveByName(ctx, trigger.Namespace, trigger.Spec.FunctionReference)
 	case fv1.FunctionReferenceTypeFunctionWeights:
 		return frr.resolveByFunctionWeights(ctx, trigger.Namespace, &trigger.Spec.FunctionReference)
+	case fv1.FunctionReferenceTypeWorkflow:
+		// Nothing to resolve: whether the Workflow exists is answered per
+		// request by the WorkflowRun create (a missing one is a 404 there).
+		return &resolveResult{resolveResultType: resolveResultWorkflow, functionMap: map[string]*fv1.Function{}}, nil
 	default:
 		return nil, fmt.Errorf("unrecognized function reference type %v", trigger.Spec.FunctionReference.Type)
 	}

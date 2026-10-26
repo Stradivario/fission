@@ -48,8 +48,16 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 	}
 
 	fnName := input.String(flagkey.TtFnName)
-	if len(fnName) == 0 {
-		return errors.New("need a function name to create a trigger, use --function")
+	workflow := input.String(flagkey.TriggerWorkflow)
+	switch {
+	case workflow != "" && fnName != "":
+		return errors.New("use either --workflow or --function, not both")
+	case workflow == "" && fnName == "":
+		return errors.New("need a function name to create a trigger, use --function (or --workflow)")
+	}
+	workflowInput, err := readWorkflowInput(input)
+	if err != nil {
+		return err
 	}
 
 	userProvidedNS, fnNamespace, err := opts.GetResourceNamespace(input)
@@ -62,7 +70,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 		return errors.New("need a cron spec like '30 * * * *', '@every 1h30m', or '@hourly'; use --cron")
 	}
 
-	if input.Bool(flagkey.SpecSave) {
+	if input.Bool(flagkey.SpecSave) && workflow == "" {
 		specDir := util.GetSpecDir(input)
 		specIgnore := util.GetSpecIgnore(input)
 		fr, err := spec.ReadSpecs(specDir, specIgnore, false)
@@ -108,6 +116,13 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 			Method:  input.String(flagkey.TtMethod),
 			Subpath: input.String(flagkey.FnSubPath),
 		},
+	}
+	if workflow != "" {
+		opts.trigger.Spec.FunctionReference = fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeWorkflow,
+			Name: workflow,
+		}
+		opts.trigger.Spec.WorkflowInput = workflowInput
 	}
 
 	return nil

@@ -320,6 +320,10 @@ var (
 	WfIO       = Flag{Type: Bool, Name: flagkey.WfIO, Usage: "Include step input/output payloads (dereferences spilled documents)"}
 	WfOpen     = Flag{Type: Bool, Name: flagkey.WfOpen, Usage: "Render the diagram in a browser (served locally; the graph never leaves your machine)"}
 
+	HtWorkflow      = Flag{Type: String, Name: flagkey.TriggerWorkflow, Usage: "Start a run of this workflow on every request instead of calling a function (the JSON body is the run input; answers 202 with the run name)"}
+	TtWorkflow      = Flag{Type: String, Name: flagkey.TriggerWorkflow, Usage: "Start a run of this workflow on every tick instead of calling a function"}
+	TtWorkflowInput = Flag{Type: String, Name: flagkey.TriggerWorkflowInput, Usage: "Input of every run a --workflow time trigger starts: inline JSON, or @path/to/file.json (default {})"}
+
 	TtName   = Flag{Type: String, Name: flagkey.TtName, Usage: "Time Trigger name"}
 	TtCron   = Flag{Type: String, Name: flagkey.TtCron, Usage: "Time trigger cron spec with each asterisk representing respectively second, minute, hour, the day of the month, month and day of the week. Also supports readable formats like '@every 5m', '@hourly'"}
 	TtFnName = Flag{Type: String, Name: flagkey.TtFnName, Usage: "Function name"}

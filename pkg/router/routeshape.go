@@ -234,6 +234,13 @@ func (ts *HTTPTriggerSet) newFunctionHandlerBase(routeName string, functionMap m
 // map (one-shot buildMuxes) or a per-trigger map derived from the resolved
 // functions (incremental path) — the handler only ever looks up its own backends.
 func (ts *HTTPTriggerSet) buildTriggerHandler(trigger *fv1.HTTPTrigger, rr *resolveResult, fnTimeoutMap map[crd.CacheKeyUG]int) http.Handler {
+	if rr.resolveResultType == resolveResultWorkflow {
+		var handler http.Handler = ts.workflowTriggerHandler(trigger)
+		if trigger.Spec.CorsConfig != nil {
+			handler = httpsecurity.CORSAllowlist(toAllowlistConfig(trigger.Spec.CorsConfig, triggerMethods(trigger)))(handler)
+		}
+		return handler
+	}
 	fh := ts.newFunctionHandlerBase(trigger.Name, rr.functionMap, rr.functionWtDistributionList, fnTimeoutMap, rr.stickySource)
 	fh.httpTrigger = trigger
 

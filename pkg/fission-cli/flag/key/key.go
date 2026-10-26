@@ -182,6 +182,11 @@ const (
 	TokPassword = "password"
 	TokAuthURI  = "authuri"
 
+	// TriggerWorkflow targets a Workflow instead of a function (HTTP and
+	// time triggers); TriggerWorkflowInput is a time trigger's run input.
+	TriggerWorkflow      = "workflow"
+	TriggerWorkflowInput = "workflow-input"
+
 	TtName   = resourceName
 	TtCron   = "cron"
 	TtFnName = "function"

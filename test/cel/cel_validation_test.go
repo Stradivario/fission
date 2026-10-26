@@ -34,6 +34,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apitypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -606,4 +607,55 @@ func TestCELToolConfigAlias(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
+}
+
+// TestCELWorkflowTriggerTarget: functionref.type "workflow" (start a
+// WorkflowRun instead of calling a function) is admitted on HTTP and time
+// triggers with a DNS-1123 workflow name, and refused on the triggers that
+// can only call functions (message queue, kubewatcher).
+func TestCELWorkflowTriggerTarget(t *testing.T) {
+	fc := client(t)
+	wf := func(name string) fv1.FunctionReference {
+		return fv1.FunctionReference{Type: fv1.FunctionReferenceTypeWorkflow, Name: name}
+	}
+
+	t.Run("http trigger accepted", func(t *testing.T) {
+		_, err := fc.CoreV1().HTTPTriggers(ns).Create(t.Context(), &fv1.HTTPTrigger{
+			Name: "wf-http", Namespace: ns,
+			Spec: fv1.HTTPTriggerSpec{RelativeURL: "/wf-http", Methods: []string{"POST"}, FunctionReference: wf("order-flow")},
+		}, metav1.CreateOptions{})
+		assert.NoError(t, err)
+	})
+	t.Run("http trigger with a bad workflow name rejected", func(t *testing.T) {
+		_, err := fc.CoreV1().HTTPTriggers(ns).Create(t.Context(), &fv1.HTTPTrigger{
+			Name: "wf-http-bad", Namespace: ns,
+			Spec: fv1.HTTPTriggerSpec{RelativeURL: "/wf-http-bad", Methods: []string{"POST"}, FunctionReference: wf("Bad_Name")},
+		}, metav1.CreateOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a valid DNS1123 label")
+	})
+	t.Run("time trigger with workflowInput accepted", func(t *testing.T) {
+		tt := &fv1.TimeTrigger{Name: "wf-tt", Namespace: ns}
+		tt.Spec.Cron = "@hourly"
+		tt.Spec.FunctionReference = wf("report")
+		tt.Spec.WorkflowInput = &apiextensionsv1.JSON{Raw: []byte(`{"day":"mon"}`)}
+		_, err := fc.CoreV1().TimeTriggers(ns).Create(t.Context(), tt, metav1.CreateOptions{})
+		assert.NoError(t, err)
+	})
+	t.Run("message queue trigger rejected", func(t *testing.T) {
+		_, err := fc.CoreV1().MessageQueueTriggers(ns).Create(t.Context(), &fv1.MessageQueueTrigger{
+			Name: "wf-mqt", Namespace: ns,
+			Spec: fv1.MessageQueueTriggerSpec{FunctionReference: wf("order-flow"), MessageQueueType: "kafka", Topic: "orders"},
+		}, metav1.CreateOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot target a workflow")
+	})
+	t.Run("kubewatcher rejected", func(t *testing.T) {
+		_, err := fc.CoreV1().KubernetesWatchTriggers(ns).Create(t.Context(), &fv1.KubernetesWatchTrigger{
+			Name: "wf-kwt", Namespace: ns,
+			Spec: fv1.KubernetesWatchTriggerSpec{Namespace: "default", Type: "POD", FunctionReference: wf("order-flow")},
+		}, metav1.CreateOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot target a workflow")
+	})
 }

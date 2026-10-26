@@ -62,7 +62,25 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 		if err != nil {
 			console.Warn(err.Error())
 		}
-		tt.Spec.Name = fnName
+		tt.Spec.FunctionReference = fv1.FunctionReference{Type: fv1.FunctionReferenceTypeFunctionName, Name: fnName}
+		tt.Spec.WorkflowInput = nil
+		updated = true
+	}
+
+	if workflow := input.String(flagkey.TriggerWorkflow); workflow != "" {
+		if fnName != "" {
+			return errors.New("use either --workflow or --function, not both")
+		}
+		tt.Spec.FunctionReference = fv1.FunctionReference{Type: fv1.FunctionReferenceTypeWorkflow, Name: workflow}
+		updated = true
+	}
+
+	if input.IsSet(flagkey.TriggerWorkflowInput) {
+		workflowInput, err := readWorkflowInput(input)
+		if err != nil {
+			return err
+		}
+		tt.Spec.WorkflowInput = workflowInput
 		updated = true
 	}
 
@@ -77,7 +95,7 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 	}
 
 	if !updated {
-		return errors.New("nothing to update. Use --cron or --function or --method or --subpath")
+		return errors.New("nothing to update. Use --cron, --function, --workflow, --workflow-input, --method or --subpath")
 	}
 
 	opts.trigger = tt

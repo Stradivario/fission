@@ -91,9 +91,12 @@ spec:
                       Available value:
                       - name
                       - function-weights
+                      - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and
+                        firing the trigger starts a WorkflowRun)
                     enum:
                     - name
                     - function-weights
+                    - workflow
                     type: string
                   version:
                     description: |-
@@ -111,8 +114,9 @@ spec:
                 x-kubernetes-validations:
                 - message: functionref.name must be a valid DNS1123 label (lowercase
                     alphanumeric or '-', start/end alphanumeric, max 63 chars) when
-                    type is 'name'
-                  rule: self.type != 'name' || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))
+                    type is 'name' or 'workflow'
+                  rule: '!(self.type in [''name'', ''workflow'']) || (self.name.size()
+                    <= 63 && self.name.matches(''^[a-z0-9]([-a-z0-9]*[a-z0-9])?$''))'
                 - message: functionref.alias and functionref.version are mutually
                     exclusive
                   rule: '!((has(self.alias) && self.alias != '''') && (has(self.version)
@@ -140,6 +144,12 @@ spec:
                   Subpath to trigger a specific route if function
                   internally supports routing, (default: "/")
                 type: string
+              workflowInput:
+                description: |-
+                  WorkflowInput is the input of every run a workflow-targeting
+                  trigger (functionref.type "workflow") starts. Any JSON value; empty
+                  means {}. Ignored for function targets.
+                x-kubernetes-preserve-unknown-fields: true
             required:
             - cron
             - functionref

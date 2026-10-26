@@ -16,6 +16,7 @@ import (
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/publisher"
 	"github.com/fission/fission/pkg/utils"
+	"github.com/fission/fission/pkg/workflowtrigger"
 )
 
 type (
@@ -23,6 +24,10 @@ type (
 		logger    logr.Logger
 		triggers  map[types.NamespacedName]*timerTriggerWithCron
 		routerUrl string
+		// createRun creates the WorkflowRun a workflow-targeting trigger
+		// (functionref.type "workflow") starts; set by Start to the manager
+		// client's Create. nil: such triggers only log.
+		createRun func(ctx context.Context, run *fv1.WorkflowRun) error
 	}
 
 	timerTriggerWithCron struct {
@@ -168,6 +173,31 @@ func scheduleFor(t fv1.TimeTrigger) (cron.Schedule, error) {
 	return anchoredSchedule{interval: delay.Delay, anchor: t.CreationTimestamp.Time}, nil
 }
 
+// startWorkflowRun is a workflow-targeting trigger's firing: one
+// WorkflowRun of the named Workflow with spec.workflowInput as its input.
+func (timer *Timer) startWorkflowRun(t fv1.TimeTrigger) {
+	logger := timer.logger.WithValues("trigger_name", t.Name, "trigger_namespace", t.Namespace, "workflow", t.Spec.Name)
+	if timer.createRun == nil {
+		logger.Error(nil, "time trigger targets a workflow but the timer cannot create runs")
+		return
+	}
+	var raw []byte
+	if t.Spec.WorkflowInput != nil {
+		raw = t.Spec.WorkflowInput.Raw
+	}
+	input, err := workflowtrigger.Input(raw)
+	if err != nil {
+		logger.Error(err, "invalid workflowInput; no run started")
+		return
+	}
+	run := workflowtrigger.NewRun(t.Namespace, t.Spec.Name, input, workflowtrigger.KindTimeTrigger, t.Name)
+	if err := timer.createRun(context.Background(), run); err != nil {
+		logger.Error(err, "starting workflow run")
+		return
+	}
+	logger.V(1).Info("started workflow run", "run", run.Name)
+}
+
 func (timer *Timer) newCron(t fv1.TimeTrigger, routerUrl string) (*cron.Cron, error) {
 	target := functionTargetURL(t)
 
@@ -191,6 +221,10 @@ func (timer *Timer) newCron(t fv1.TimeTrigger, routerUrl string) (*cron.Cron, er
 	}
 
 	c.Schedule(schedule, cron.FuncJob(func() {
+		if workflowtrigger.IsWorkflowTarget(t.Spec.FunctionReference) {
+			timer.startWorkflowRun(t)
+			return
+		}
 		headers := map[string]string{
 			"X-Fission-Timer-Name": t.Name,
 		}

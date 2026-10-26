@@ -16,8 +16,7 @@ func Commands() *cobra.Command {
 		Use:   "create",
 		Short: "Create an HTTP trigger",
 	}, Create, flag.FlagSet{
-		Required: []flag.Flag{flag.HtFnName},
-		Optional: []flag.Flag{flag.HtUrl, flag.HtName, flag.HtMethod, flag.HtIngress,
+		Optional: []flag.Flag{flag.HtFnName, flag.HtWorkflow, flag.HtUrl, flag.HtName, flag.HtMethod, flag.HtIngress,
 			flag.HtIngressRule, flag.HtIngressAnnotation, flag.HtIngressTLS,
 			flag.HtRouteProvider, flag.HtRouteHost, flag.HtRoutePath, flag.HtRouteAnnotation,
 			flag.HtRouteTLS, flag.HtGateway,

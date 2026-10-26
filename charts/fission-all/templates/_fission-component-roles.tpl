@@ -372,6 +372,14 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - fission.io
+  # An HTTPTrigger / TimeTrigger with functionref.type "workflow" starts a
+  # WorkflowRun when it fires (pkg/workflowtrigger). Create only.
+  resources:
+  - workflowruns
+  verbs:
+  - create
 {{- end }}
 {{- define "storagesvc-rules" }}
 rules:
@@ -408,6 +416,14 @@ rules:
   - get
   - update
   - patch
+- apiGroups:
+  - fission.io
+  # An HTTPTrigger / TimeTrigger with functionref.type "workflow" starts a
+  # WorkflowRun when it fires (pkg/workflowtrigger). Create only.
+  resources:
+  - workflowruns
+  verbs:
+  - create
 {{- end }}
 {{- define "canaryconfig-rules" }}
 rules:

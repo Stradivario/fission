@@ -518,6 +518,24 @@ func TestTimeTriggerSpecValidate(t *testing.T) {
 	}.Validate(), "alias/version XOR must propagate through TimeTriggerSpec.Validate")
 }
 
+// A workflow target (functionref.type "workflow") is accepted by the
+// triggers that can start runs - HTTP and time - and nowhere else.
+func TestWorkflowTriggerTargetValidate(t *testing.T) {
+	t.Parallel()
+	wf := FunctionReference{Type: FunctionReferenceTypeWorkflow, Name: "order-flow"}
+	require.NoError(t, TimeTriggerSpec{Cron: "@hourly", FunctionReference: wf}.Validate())
+	require.NoError(t, HTTPTriggerSpec{RelativeURL: "/orders", Method: "POST", FunctionReference: wf}.Validate())
+	require.Error(t, TimeTriggerSpec{
+		Cron:              "@hourly",
+		FunctionReference: FunctionReference{Type: FunctionReferenceTypeWorkflow, Name: "Not_A_Name"},
+	}.Validate(), "the workflow name must be a kube name")
+	require.Error(t, TimeTriggerSpec{
+		Cron:              "@hourly",
+		FunctionReference: FunctionReference{Type: FunctionReferenceTypeWorkflow, Name: "order-flow", Alias: "prod"},
+	}.Validate(), "alias is meaningless for a workflow target")
+	require.Error(t, wf.Validate(), "plain FunctionReference.Validate (MQ, kubewatcher, destinations) refuses a workflow")
+}
+
 func TestMessageQueueTriggerSpecValidate(t *testing.T) {
 	t.Parallel()
 	validator.Register("test-classic-mq-fnref", func(topic string) bool { return !strings.Contains(topic, "/") })

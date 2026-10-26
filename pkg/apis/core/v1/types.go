@@ -1703,7 +1703,7 @@ type (
 	FunctionReferenceType string
 
 	// FunctionReference refers to a function
-	// +kubebuilder:validation:XValidation:rule="self.type != 'name' || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))",message="functionref.name must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars) when type is 'name'"
+	// +kubebuilder:validation:XValidation:rule="!(self.type in ['name', 'workflow']) || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))",message="functionref.name must be a valid DNS1123 label (lowercase alphanumeric or '-', start/end alphanumeric, max 63 chars) when type is 'name' or 'workflow'"
 	// +kubebuilder:validation:XValidation:rule="!((has(self.alias) && self.alias != '') && (has(self.version) && self.version != ''))",message="functionref.alias and functionref.version are mutually exclusive"
 	// +kubebuilder:validation:XValidation:rule="!(has(self.alias) && self.alias != '') || self.type == 'name'",message="functionref.alias is only valid when type is 'name'"
 	// +kubebuilder:validation:XValidation:rule="!(has(self.version) && self.version != '') || self.type == 'name'",message="functionref.version is only valid when type is 'name'"
@@ -1718,7 +1718,9 @@ type (
 		// Available value:
 		// - name
 		// - function-weights
-		// +kubebuilder:validation:Enum=name;function-weights
+		// - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and
+		//   firing the trigger starts a WorkflowRun)
+		// +kubebuilder:validation:Enum=name;function-weights;workflow
 		Type FunctionReferenceType `json:"type"`
 
 		// Name of the function. Bounded to a DNS-1123 label length: the CEL
@@ -2039,7 +2041,10 @@ type (
 		// +kubebuilder:validation:Enum="";async
 		InvocationMode string `json:"invocationMode,omitempty"`
 
-		// FunctionReference is a reference to the target function.
+		// FunctionReference is a reference to the target function. With type
+		// "workflow" it names a Workflow instead: a request starts a
+		// WorkflowRun with the JSON body as its input and gets 202
+		// {"run": ..., "workflow": ...} back (nothing waits for the run).
 		FunctionReference FunctionReference `json:"functionref"`
 
 		// If CreateIngress is true, router will create an ingress definition.
@@ -2234,6 +2239,7 @@ type (
 	}
 
 	// KubernetesWatchTriggerSpec defines spec of KuberenetesWatchTrigger
+	// +kubebuilder:validation:XValidation:rule="self.functionref.type != 'workflow'",message="a kubernetes watch trigger cannot target a workflow"
 	KubernetesWatchTriggerSpec struct {
 		// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 		// +kubebuilder:validation:MaxLength=63
@@ -2257,6 +2263,7 @@ type (
 
 	// MessageQueueTriggerSpec defines a binding from a topic in a
 	// message queue to a function.
+	// +kubebuilder:validation:XValidation:rule="self.functionref.type != 'workflow'",message="a message queue trigger cannot target a workflow"
 	MessageQueueTriggerSpec struct {
 		// The reference to a function for message queue trigger to invoke with
 		// when receiving messages from subscribed topic.
@@ -2349,6 +2356,12 @@ type (
 		// +kubebuilder:default:="/"
 		// +optional
 		Subpath string `json:"subpath,omitempty"`
+
+		// WorkflowInput is the input of every run a workflow-targeting
+		// trigger (functionref.type "workflow") starts. Any JSON value; empty
+		// means {}. Ignored for function targets.
+		// +optional
+		WorkflowInput *apiextensionsv1.JSON `json:"workflowInput,omitempty"`
 	}
 	// FailureType refers to the type of failure
 	FailureType string

@@ -45,11 +45,13 @@ func (AuthLogin) SwaggerDoc() map[string]string {
 }
 
 var map_Builder = map[string]string{
-	"":          "Builder is the setting for environment builder. Bounded podspec / container safety rules — see the matching Runtime block above.",
-	"image":     "Image for containing the language compilation environment.",
-	"command":   "(Optional) Default build command to run for this build environment.",
-	"container": "(Optional) Container allows the modification of the deployed builder container using the Kubernetes Container spec. Fission overrides the following fields: - Name - Image; set to the Builder.Image - Command; set to the Builder.Command - TerminationMessagePath - ImagePullPolicy - ReadinessProbe",
-	"podspec":   "PodSpec will store the spec of the pod that will be applied to the pod created for the builder",
+	"":            "Builder is the setting for environment builder. Bounded podspec / container safety rules — see the matching Runtime block above.",
+	"image":       "Image for containing the language compilation environment.",
+	"command":     "(Optional) Default build command to run for this build environment.",
+	"container":   "(Optional) Container allows the modification of the deployed builder container using the Kubernetes Container spec. Fission overrides the following fields: - Name - Image; set to the Builder.Image - Command; set to the Builder.Command - TerminationMessagePath - ImagePullPolicy - ReadinessProbe",
+	"podspec":     "PodSpec will store the spec of the pod that will be applied to the pod created for the builder",
+	"idleTimeout": "IdleTimeout specifies the length of time (in seconds) that a builder is idle before it is eligible for scaling to zero. If no builds are triggered within the idle timeout, the builder deployment will be scaled to zero to release resources. Defaults to 600 seconds (10 minutes) if not set.",
+	"poolsize":    "PoolSize is the MAXIMUM number of builder pods for this environment. Builder pods are provisioned on demand — one dedicated pod per concurrent package build — and scaled up to this cap as concurrent builds arrive, then scaled back to zero by the idle reaper once builds stop. It is a ceiling, not a fixed replica count: building a single package always uses a single pod regardless of this value. Each pod is an independent isolation domain, so an OOM in one build does not affect the others. Defaults to 1 if not set or less than 1.",
 }
 
 func (Builder) SwaggerDoc() map[string]string {
@@ -292,7 +294,7 @@ func (FunctionPackageRef) SwaggerDoc() map[string]string {
 
 var map_FunctionReference = map[string]string{
 	"":                "FunctionReference refers to a function",
-	"type":            "Type indicates whether this function reference is by name or selector. For now, the only supported reference type is by \"name\".  Future reference types:\n  * Function by label or annotation\n  * Branch or tag of a versioned function\n  * A \"rolling upgrade\" from one version of a function to another\nAvailable value: - name - function-weights",
+	"type":            "Type indicates whether this function reference is by name or selector. For now, the only supported reference type is by \"name\".  Future reference types:\n  * Function by label or annotation\n  * Branch or tag of a versioned function\n  * A \"rolling upgrade\" from one version of a function to another\nAvailable value: - name - function-weights - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and\n  firing the trigger starts a WorkflowRun)",
 	"name":            "Name of the function. Bounded to a DNS-1123 label length: the CEL rule on this type needs the schema bound so the apiserver's cost estimator can price the regex — without it, embedding the type under a map (WorkflowSpec.States) blows the per-CRD cost budget.",
 	"alias":           "Alias, when set, targets a FunctionAlias by name instead of the live Function directly (RFC-0025): the alias is a movable pointer that the router resolves at request time to whatever FunctionVersion it currently points at, so repointing the alias (e.g. for a canary rollout or a rollback) redirects traffic without touching this reference. Valid only when Type is \"name\"; mutually exclusive with Version. Empty (the default) preserves today's behavior: route straight to the live Function.",
 	"version":         "Version, when set, pins this reference to one FunctionVersion CR by name (RFC-0025) — an immutable published snapshot that never moves, unlike Alias. Valid only when Type is \"name\"; mutually exclusive with Alias. Empty (the default) preserves today's behavior: route straight to the live Function.",
@@ -433,7 +435,7 @@ var map_HTTPTriggerSpec = map[string]string{
 	"method":         "Use Methods instead of Method. This field is going to be deprecated in a future release HTTP method to access a function.",
 	"methods":        "HTTP methods to access a function",
 	"invocationMode": "InvocationMode, when \"async\", forces every request to this trigger into RFC-0024 asynchronous invocation even without the X-Fission-Invoke-Mode header (webhooks from third parties cannot set headers). \"\" (the default) leaves the per-request header in control.",
-	"functionref":    "FunctionReference is a reference to the target function.",
+	"functionref":    "FunctionReference is a reference to the target function. With type \"workflow\" it names a Workflow instead: a request starts a WorkflowRun with the JSON body as its input and gets 202 {\"run\": ..., \"workflow\": ...} back (nothing waits for the run).",
 	"createingress":  "If CreateIngress is true, router will create an ingress definition. Deprecated: the Kubernetes Ingress API is frozen. Use RouteConfig (with Provider \"gateway\") to expose functions through the Gateway API instead. CreateIngress + IngressConfig keep working for the deprecation window but will be removed in a future release.",
 	"ingressconfig":  "IngressConfig for router to set up Ingress. Deprecated: superseded by RouteConfig. See CreateIngress.",
 	"routeConfig":    "RouteConfig declares how the router exposes this trigger through an external route provider (Ingress or the Gateway API). It is the provider-neutral successor to CreateIngress + IngressConfig: when set it takes precedence over those fields. Leave nil to expose the function only through the router's own URL.",
@@ -760,11 +762,12 @@ func (TimeTriggerList) SwaggerDoc() map[string]string {
 }
 
 var map_TimeTriggerSpec = map[string]string{
-	"":            "TimeTriggerSpec invokes the specific function at a time or times specified by a cron string.",
-	"cron":        "Cron schedule",
-	"functionref": "The reference to function. Alias is read from the embedded FunctionReference.Alias (RFC-0025) — TimeTriggerSpec has no field of its own for it, so there is exactly one JSON path (spec.functionref.alias) and one Go path (spec.Alias, promoted) for the concept, never two competing ones. The timer publisher (a later RFC-0025 task) reads it the same way timer.go:80 already reads the promoted spec.Name today.",
-	"method":      "HTTP Method for trigger, ex : GET, POST, PUT, DELETE, HEAD (default: \"POST\")",
-	"subpath":     "Subpath to trigger a specific route if function internally supports routing, (default: \"/\")",
+	"":              "TimeTriggerSpec invokes the specific function at a time or times specified by a cron string.",
+	"cron":          "Cron schedule",
+	"functionref":   "The reference to function. Alias is read from the embedded FunctionReference.Alias (RFC-0025) — TimeTriggerSpec has no field of its own for it, so there is exactly one JSON path (spec.functionref.alias) and one Go path (spec.Alias, promoted) for the concept, never two competing ones. The timer publisher (a later RFC-0025 task) reads it the same way timer.go:80 already reads the promoted spec.Name today.",
+	"method":        "HTTP Method for trigger, ex : GET, POST, PUT, DELETE, HEAD (default: \"POST\")",
+	"subpath":       "Subpath to trigger a specific route if function internally supports routing, (default: \"/\")",
+	"workflowInput": "WorkflowInput is the input of every run a workflow-targeting trigger (functionref.type \"workflow\") starts. Any JSON value; empty means {}. Ignored for function targets.",
 }
 
 func (TimeTriggerSpec) SwaggerDoc() map[string]string {

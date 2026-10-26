@@ -8,6 +8,7 @@ package v1
 
 import (
 	corev1 "github.com/fission/fission/pkg/apis/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 // TimeTriggerSpecApplyConfiguration represents a declarative configuration of the TimeTriggerSpec type for use
@@ -30,6 +31,10 @@ type TimeTriggerSpecApplyConfiguration struct {
 	// Subpath to trigger a specific route if function
 	// internally supports routing, (default: "/")
 	Subpath *string `json:"subpath,omitempty"`
+	// WorkflowInput is the input of every run a workflow-targeting
+	// trigger (functionref.type "workflow") starts. Any JSON value; empty
+	// means {}. Ignored for function targets.
+	WorkflowInput *apiextensionsv1.JSON `json:"workflowInput,omitempty"`
 }
 
 // TimeTriggerSpecApplyConfiguration constructs a declarative configuration of the TimeTriggerSpec type for use with
@@ -116,5 +121,13 @@ func (b *TimeTriggerSpecApplyConfiguration) WithMethod(value string) *TimeTrigge
 // If called multiple times, the Subpath field is set to the value of the last call.
 func (b *TimeTriggerSpecApplyConfiguration) WithSubpath(value string) *TimeTriggerSpecApplyConfiguration {
 	b.Subpath = &value
+	return b
+}
+
+// WithWorkflowInput sets the WorkflowInput field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the WorkflowInput field is set to the value of the last call.
+func (b *TimeTriggerSpecApplyConfiguration) WithWorkflowInput(value apiextensionsv1.JSON) *TimeTriggerSpecApplyConfiguration {
+	b.WorkflowInput = &value
 	return b
 }

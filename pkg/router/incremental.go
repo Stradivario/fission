@@ -69,6 +69,8 @@ func fnTimeoutMap(fns map[string]*fv1.Function) map[crd.CacheKeyUG]int {
 func referencedFunctions(trigger *fv1.HTTPTrigger) []types.NamespacedName {
 	ref := trigger.Spec.FunctionReference
 	switch ref.Type {
+	case fv1.FunctionReferenceTypeWorkflow:
+		return nil // a workflow target references no function
 	case fv1.FunctionReferenceTypeFunctionWeights:
 		out := make([]types.NamespacedName, 0, len(ref.FunctionWeights))
 		for name := range ref.FunctionWeights {
@@ -142,7 +144,7 @@ func (ts *HTTPTriggerSet) applyTriggerIncremental(ctx context.Context, trigger *
 		// last-known-good route.
 		return routetable.NoChange, err
 	}
-	if rr.resolveResultType != resolveResultSingleFunction && rr.resolveResultType != resolveResultMultipleFunctions {
+	if !rr.resolveResultType.routable() {
 		ts.logger.Error(nil, "resolve result type not implemented", "type", rr.resolveResultType)
 		res := ts.routeTable.DeleteTriggerByName(key)
 		routeTableApplies.Add(ctx, 1, metric.WithAttributes(attribute.String("result", "rejected")))

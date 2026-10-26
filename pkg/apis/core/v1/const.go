@@ -229,6 +229,12 @@ const (
 
 	FunctionReferenceTypeFunctionWeights = "function-weights"
 
+	// FunctionReferenceTypeWorkflow targets a Workflow (same namespace) by
+	// name instead of a function: an HTTPTrigger or TimeTrigger firing it
+	// creates a WorkflowRun (the request body / the trigger's workflowInput
+	// is the run input). Only HTTP and time triggers accept it.
+	FunctionReferenceTypeWorkflow = "workflow"
+
 	// Other function reference types we'd like to support:
 	//   Versioned function, latest version
 	//   Versioned function. by semver "latest compatible"

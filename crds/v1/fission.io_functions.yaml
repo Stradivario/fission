@@ -1070,9 +1070,12 @@ spec:
                               Available value:
                               - name
                               - function-weights
+                              - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and
+                                firing the trigger starts a WorkflowRun)
                             enum:
                             - name
                             - function-weights
+                            - workflow
                             type: string
                           version:
                             description: |-
@@ -1090,9 +1093,9 @@ spec:
                         x-kubernetes-validations:
                         - message: functionref.name must be a valid DNS1123 label
                             (lowercase alphanumeric or '-', start/end alphanumeric,
-                            max 63 chars) when type is 'name'
-                          rule: self.type != 'name' || (self.name.size() <= 63 &&
-                            self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))
+                            max 63 chars) when type is 'name' or 'workflow'
+                          rule: '!(self.type in [''name'', ''workflow'']) || (self.name.size()
+                            <= 63 && self.name.matches(''^[a-z0-9]([-a-z0-9]*[a-z0-9])?$''))'
                         - message: functionref.alias and functionref.version are mutually
                             exclusive
                           rule: '!((has(self.alias) && self.alias != '''') && (has(self.version)
@@ -1182,9 +1185,12 @@ spec:
                               Available value:
                               - name
                               - function-weights
+                              - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and
+                                firing the trigger starts a WorkflowRun)
                             enum:
                             - name
                             - function-weights
+                            - workflow
                             type: string
                           version:
                             description: |-
@@ -1202,9 +1208,9 @@ spec:
                         x-kubernetes-validations:
                         - message: functionref.name must be a valid DNS1123 label
                             (lowercase alphanumeric or '-', start/end alphanumeric,
-                            max 63 chars) when type is 'name'
-                          rule: self.type != 'name' || (self.name.size() <= 63 &&
-                            self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))
+                            max 63 chars) when type is 'name' or 'workflow'
+                          rule: '!(self.type in [''name'', ''workflow'']) || (self.name.size()
+                            <= 63 && self.name.matches(''^[a-z0-9]([-a-z0-9]*[a-z0-9])?$''))'
                         - message: functionref.alias and functionref.version are mutually
                             exclusive
                           rule: '!((has(self.alias) && self.alias != '''') && (has(self.version)
