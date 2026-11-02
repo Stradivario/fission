@@ -288,23 +288,37 @@ func TestScaleDownStrategy_Reap(t *testing.T) {
 		})
 	}
 
-	t.Run("scales an idle deployment down to MinScale", func(t *testing.T) {
+	t.Run("scales an idle scale-to-zero deployment down to zero", func(t *testing.T) {
 		kc := k8sfake.NewSimpleClientset(deployWithReplicas(3))
+		var scaled int32 = -1
+		captureScale(kc, &scaled)
+		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
+			fissionfake.NewClientset(makeFn(0)), fscache.MakeFunctionServiceCache(logr.Discard()), kc, 2*time.Minute, 5*time.Second, true)
+
+		require.NoError(t, s.Reap(t.Context(), makeFsvc()))
+		assert.Equal(t, int32(0), scaled, "deployment scaled to MinScale 0")
+	})
+
+	t.Run("leaves replicas above a non-zero MinScale to the HPA", func(t *testing.T) {
+		// The HPA scaled up on load while the function saw no router traffic:
+		// scaling it back to MinScale here is the fight that recreated a pod
+		// every HPA sync. The HPA scales down on its own.
+		kc := k8sfake.NewSimpleClientset(deployWithReplicas(2))
 		var scaled int32 = -1
 		captureScale(kc, &scaled)
 		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
 			fissionfake.NewClientset(makeFn(1)), fscache.MakeFunctionServiceCache(logr.Discard()), kc, 2*time.Minute, 5*time.Second, true)
 
 		require.NoError(t, s.Reap(t.Context(), makeFsvc()))
-		assert.Equal(t, int32(1), scaled, "deployment scaled to MinScale")
+		assert.Equal(t, int32(-1), scaled, "no scale issued for an HPA-owned replica count")
 	})
 
-	t.Run("no scale when already at or below MinScale", func(t *testing.T) {
-		kc := k8sfake.NewSimpleClientset(deployWithReplicas(1))
+	t.Run("no scale when already at MinScale", func(t *testing.T) {
+		kc := k8sfake.NewSimpleClientset(deployWithReplicas(0))
 		var scaled int32 = -1
 		captureScale(kc, &scaled)
 		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
-			fissionfake.NewClientset(makeFn(1)), fscache.MakeFunctionServiceCache(logr.Discard()), kc, 2*time.Minute, 5*time.Second, true)
+			fissionfake.NewClientset(makeFn(0)), fscache.MakeFunctionServiceCache(logr.Discard()), kc, 2*time.Minute, 5*time.Second, true)
 
 		require.NoError(t, s.Reap(t.Context(), makeFsvc()))
 		assert.Equal(t, int32(-1), scaled, "no scale issued when already at MinScale")
@@ -392,8 +406,9 @@ func TestReaperMetrics(t *testing.T) {
 	newdeploy := map[string]string{"executor_type": "newdeploy"}
 
 	const ns, deplName, fnName = "default", "fn-depl", "fn"
+	// MinScale 0: only scale-to-zero functions are reaped (above zero the HPA
+	// owns the replica count).
 	fn := &fv1.Function{Name: fnName, Namespace: ns}
-	fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale = 1
 	newFsvc := func() *fscache.FuncSvc {
 		return &fscache.FuncSvc{
 			Name: "p", Executor: fv1.ExecutorTypeNewdeploy,
@@ -416,14 +431,14 @@ func TestReaperMetrics(t *testing.T) {
 
 	t.Run("a real reap records one lag sample", func(t *testing.T) {
 		before := sampleCount(lag, newdeploy)
-		require.NoError(t, newScaleDown(k8sfake.NewSimpleClientset(newDeploy(3))).Reap(t.Context(), newFsvc()))
+		require.NoError(t, newScaleDown(k8sfake.NewSimpleClientset(newDeploy(1))).Reap(t.Context(), newFsvc()))
 		assert.InDelta(t, before+1, sampleCount(lag, newdeploy), 0.001, "scaling down to MinScale is a reap")
 	})
 
 	t.Run("a skip records nothing", func(t *testing.T) {
 		before := sampleCount(lag, newdeploy)
 		// Already at MinScale: nothing is released, so it is not a reap.
-		require.NoError(t, newScaleDown(k8sfake.NewSimpleClientset(newDeploy(1))).Reap(t.Context(), newFsvc()))
+		require.NoError(t, newScaleDown(k8sfake.NewSimpleClientset(newDeploy(0))).Reap(t.Context(), newFsvc()))
 		assert.InDelta(t, before, sampleCount(lag, newdeploy), 0.001, "an at-MinScale deployment must not count as reaped")
 	})
 

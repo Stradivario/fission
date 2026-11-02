@@ -435,8 +435,9 @@ func (s *PoolDeleteStrategy) drainThenDelete(ctx context.Context, fsvc *fscache.
 	})
 }
 
-// ScaleDownStrategy reaps newdeploy/container function services by scaling
-// their deployment down to the function's MinScale. checkEnv mirrors the
+// ScaleDownStrategy reaps idle scale-to-zero (MinScale 0) newdeploy/container
+// function services by scaling their deployment to zero; above a non-zero
+// MinScale the function's HPA owns the replica count. checkEnv mirrors the
 // newdeploy behaviour of logging (and gating the tick on) the environment list;
 // the container executor leaves it false.
 type ScaleDownStrategy struct {
@@ -502,6 +503,18 @@ func (s *ScaleDownStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) err
 		}
 	}
 
+	// With MinScale > 0 the function's HPA (minReplicas = MinScale) owns every
+	// replica above the floor and scales back down on its own. Forcing
+	// MinScale here fought the HPA: it scaled up on CPU, this reaper undid it
+	// within one tick (idleness is router traffic, not load), and the HPA's
+	// scale-down stabilization re-asserted the higher count every sync — a pod
+	// created and killed ~every 15s. Only scale-to-zero, which an HPA cannot
+	// do, is left to the reaper.
+	minScale := int32(fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale)
+	if minScale > 0 {
+		return nil
+	}
+
 	threshold := idleThreshold(fn, s.reapTime)
 	idleFor := time.Since(fsvc.Atime)
 	if idleFor < threshold {
@@ -516,7 +529,6 @@ func (s *ScaleDownStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) err
 	if err != nil {
 		return err
 	}
-	minScale := int32(fn.Spec.InvokeStrategy.ExecutionStrategy.MinScale)
 	// Do nothing if the current replica count is already at or below MinScale.
 	// Not a reap: nothing was released, so it stays out of the metrics.
 	if currentDeploy.Spec.Replicas != nil && *currentDeploy.Spec.Replicas <= minScale {
