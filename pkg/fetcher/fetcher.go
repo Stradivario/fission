@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -70,6 +71,11 @@ type (
 		// existed (upgrade skew); keychainServiceAccount falls back.
 		podServiceAccount string
 		Info              PodInfo
+
+		// runtime watchdog (runtime_watchdog.go)
+		watchdogCtx     context.Context
+		setReady        func(bool)
+		watchdogStarted atomic.Bool
 	}
 	PodInfo struct {
 		Name      string
@@ -352,6 +358,7 @@ func (fetcher *Fetcher) SpecializeHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), code)
 		return
 	}
+	fetcher.WatchRuntime(req.FetchReq, req.LoadReq)
 
 	// all done
 	w.WriteHeader(http.StatusOK)
