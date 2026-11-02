@@ -25,6 +25,12 @@ jobs:
           git config user.name "$GITHUB_ACTOR"
           git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
+      # chart-releaser publishes the charts changed since the latest tag. An
+      # image tag (vX.Y.Z-watch-all-namespaces) pushed with the release commit
+      # would hide the bump, so only chart tags count.
+      - name: Keep only chart tags
+        run: git tag -l | grep -v '^fission-all-' | xargs -r git tag -d > /dev/null
+
       - name: Run chart-releaser
         uses: helm/chart-releaser-action@v1.5.0
         env:
