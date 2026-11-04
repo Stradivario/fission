@@ -35,6 +35,10 @@ const (
 	EventPackageBuildFailed    = "package.build.failed"
 	EventFunctionDeployReady   = "function.deploy.ready"
 	EventFunctionDeployFailed  = "function.deploy.failed"
+	// EventFunctionDeployRolledBack: the new package's rollout failed and
+	// the executor moved the function back to its last ready package
+	// (newdeploy rollout guard, pkg/executor/executortype/newdeploy/rollback.go).
+	EventFunctionDeployRolledBack = "function.deploy.rolledback"
 )
 
 // Event is the JSON payload POSTed to the configured target. Fields are
@@ -55,6 +59,11 @@ type Event struct {
 	// of its own (see the "gap" this closes in newdeploymgr.go).
 	Function             string `json:"function,omitempty"`
 	DeploymentGeneration string `json:"deploymentGeneration,omitempty"`
+
+	// function.deploy.rolledback: Package is the package that failed,
+	// RollbackPackage the last ready one it went back to, Reason why.
+	RollbackPackage string `json:"rollbackPackage,omitempty"`
+	Reason          string `json:"reason,omitempty"`
 
 	Timestamp string `json:"timestamp"`
 }

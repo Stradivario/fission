@@ -86,6 +86,11 @@ type (
 
 		deployEventHook *eventhook.Dispatcher
 
+		// rolloutGuard: automatic rollback of a failed package rollout
+		// (rollback.go); rootCtx outlives a reconcile so the guard can.
+		rolloutGuard rolloutGuardConfig
+		rootCtx      context.Context
+
 		// imageVolumeOK is the once-evaluated RFC-0001 Path B gate:
 		// ENABLE_OCI_IMAGE_VOLUME opted in AND the cluster supports
 		// KEP-4639 image volumes (>= 1.33).
@@ -141,6 +146,9 @@ func MakeNewDeploy(
 		enableOwnerReferences: utils.IsOwnerReferencesEnabled(),
 
 		deployEventHook: eventhook.NewFunctionDeployDispatcher(logger),
+
+		rolloutGuard: rolloutGuardConfigFromEnv(logger),
+		rootCtx:      ctx,
 	}
 
 	// The Function and Environment watches are controller-runtime reconcilers now
@@ -790,7 +798,14 @@ func (deploy *NewDeploy) updateFunction(ctx context.Context, oldFn *fv1.Function
 			deploy.updateStatus(oldFn, err, "failed to get environment while updating function")
 			return err
 		}
-		return deploy.updateFuncDeployment(ctx, newFn, env)
+		// The package it ran before: a valid rollback target when the
+		// update moves it to a new one (rollback.go).
+		var previous *fv1.PackageRef
+		if oldFn.Spec.Package.PackageRef != newFn.Spec.Package.PackageRef {
+			p := oldFn.Spec.Package.PackageRef
+			previous = &p
+		}
+		return deploy.updateFuncDeploymentFrom(ctx, newFn, env, previous)
 	}
 
 	return nil
@@ -836,6 +851,12 @@ func (deploy *NewDeploy) reconcileDeploymentSpec(ctx context.Context, fn *fv1.Fu
 }
 
 func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment) error {
+	return deploy.updateFuncDeploymentFrom(ctx, fn, env, nil)
+}
+
+// updateFuncDeploymentFrom is updateFuncDeployment knowing the package the
+// function ran before (nil = unknown), for the rollout guard.
+func (deploy *NewDeploy) updateFuncDeploymentFrom(ctx context.Context, fn *fv1.Function, env *fv1.Environment, previous *fv1.PackageRef) error {
 	// When the update points the function at a freshly created package (e.g. a new
 	// revision), wait for that package to finish building before rolling the
 	// deployment, so the new pod does not crash-loop fetching an unbuilt archive.
@@ -906,6 +927,13 @@ func (deploy *NewDeploy) updateFuncDeployment(ctx context.Context, fn *fv1.Funct
 		deploy.updateStatus(fn, err, "failed to update deployment while updating function")
 		return err
 	}
+	// Automatic rollback (rollback.go): watch the new package's pods and go
+	// back to the last ready package if they cannot start.
+	replicas := int32(1)
+	if newDeployment.Spec.Replicas != nil {
+		replicas = *newDeployment.Spec.Replicas
+	}
+	deploy.startRolloutGuard(fn, previous, existingDepl.Status.AvailableReplicas > 0, ns, fnObjName, replicas)
 	// The live Deployment now runs fn's new spec: move its cache entry to the
 	// new Generation, or a FunctionVersion pinning the old Generation would be
 	// served by this (updated) Deployment instead of its own -v<seq> objects.

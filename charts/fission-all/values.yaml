@@ -366,6 +366,14 @@ executor:
   ## This is applicable to Pool Manager executor type only.
   ##
   podReadyTimeout: 300s
+  ## autoRollback: a newdeploy function whose new package cannot start
+  ## (crash loop, image / container errors, or not available within
+  ## graceSeconds - at least twice its specializationTimeout) is moved back
+  ## to its last ready package automatically and fires
+  ## function.deploy.rolledback. See docs/features/auto-rollback.md.
+  autoRollback:
+    enabled: true
+    graceSeconds: 180
 
   ## Pod resources as:
   ##  resources:

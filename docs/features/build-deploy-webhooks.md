@@ -137,6 +137,15 @@ needed by the graphql-server-lambdas use case.)
 
 ### Function deploy events (both executor types)
 
+The `url` escape hatch posts to the URL exactly as configured - until
+2026-11-04 the publisher appended a `/` (`.../webhooks/x/`), which a
+strict receiver answered with 404 (`pkg/publisher/webhookPublisher.go`,
+TestPublisherEmptyTargetPostsToBaseURL).
+
+newdeploy also fires `function.deploy.rolledback` when its rollout guard
+moved a function back to its last ready package (`package` = the failed
+one, `rollbackPackage`, `reason`) - see [auto-rollback](auto-rollback.md).
+
 Both `newdeploy` and `poolmgr` fire the same two events —
 `function.deploy.ready` / `function.deploy.failed` — with the same JSON shape,
 but at genuinely different moments, because the two executors have

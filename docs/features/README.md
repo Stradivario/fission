@@ -17,3 +17,4 @@ Custom features and fixes for this Fission fork (`ghcr.io/stradivario` builds), 
 | [workflow-triggers](workflow-triggers.md) | Active — HTTP and time triggers can start a WorkflowRun (`functionref.type: workflow`); RFC-0022 phase-5 adapter; not in a published image yet |
 | [idle-reaper-hpa-fight](idle-reaper-hpa-fight.md) | Active — idle reaper no longer scales `MinScale >= 1` newdeploy/container functions back down against their HPA (pod create/kill every ~15s); not in a published image yet |
 | [runtime-restart-respecialize](runtime-restart-respecialize.md) | Active — the fetcher re-specializes a runtime container the kubelet restarted (OOM/crash) and retries a failed startup specialization; not in a published image yet |
+| [auto-rollback](auto-rollback.md) | Active — a newdeploy function whose new package cannot start goes back to its last ready package and fires `function.deploy.rolledback`; not in a published image yet |
