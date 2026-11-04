@@ -158,7 +158,13 @@ var WebhookHttpClient = &http.Client{
 }
 
 func (p *WebhookPublisher) makeHTTPRequest(r *publishRequest) {
-	url := p.baseURL + "/" + strings.TrimPrefix(r.target, "/")
+	// An empty target posts to the base URL itself (eventhook's url mode):
+	// appending "/" anyway turned .../webhooks/x into .../webhooks/x/, which a
+	// strict router answers with 404.
+	url := p.baseURL
+	if target := strings.TrimPrefix(r.target, "/"); target != "" {
+		url = p.baseURL + "/" + target
+	}
 
 	msg := fmt.Sprintf("making HTTP %s request", r.method)
 	msgType := "error"

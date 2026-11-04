@@ -61,6 +61,27 @@ func TestPublisherSubpath(t *testing.T) {
 	time.Sleep(time.Second * 1)
 }
 
+// TestPublisherEmptyTargetPostsToBaseURL: eventhook's url mode publishes
+// with no target; the request must hit the configured URL exactly, not the
+// URL with a trailing slash (a strict router returns 404 for that - seen
+// with graphql-server-lambdas' /webhooks/fission-events, 2026-11-04).
+func TestPublisherEmptyTargetPostsToBaseURL(t *testing.T) {
+	paths := make(chan string, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+	}))
+	defer s.Close()
+
+	wp := MakeWebhookPublisher(logr.Discard(), s.URL+"/webhooks/fission-events")
+	wp.Publish(t.Context(), "{}", nil, http.MethodPost, "")
+	select {
+	case got := <-paths:
+		require.Equal(t, "/webhooks/fission-events", got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the publisher never called the receiver")
+	}
+}
+
 // countingSink is a logr.LogSink that counts error-level log calls; all
 // other LogSink behavior is no-op. Used to assert that retried 404s do not
 // flood the error log (they log at V(1) until the final give-up).
