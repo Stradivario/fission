@@ -23,10 +23,11 @@ context - the reconcile is not held):
 - all replicas updated and available -> the package is recorded on the
   Function as `fission.io/last-ready-package` (JSON PackageRef) and the
   guard ends;
-- a new pod's container waits with `CrashLoopBackOff`, `ErrImagePull`,
-  `ImagePullBackOff`, `InvalidImageName`, `CreateContainerConfigError`,
-  `CreateContainerError` or `RunContainerError`, or restarted 3 times, or
-  the rollout is still not available after the grace period
+- a new pod's container waits with `CrashLoopBackOff` or
+  `InvalidImageName`, or restarted 3 times, or waits with an error the
+  kubelet retries itself (`ErrImagePull`, `ImagePullBackOff`,
+  `CreateContainerConfigError`, `CreateContainerError`,
+  `RunContainerError`) for `confirmSeconds` in a row, or the rollout is still not available after the grace period
   (`max(graceSeconds, 2 x specializationTimeout)`) -> the guard merge-patches
   `spec.package.packageref` back to the last ready package, stamps
   `fission.io/rolled-back-from` / `-reason` / `-at`, and fires
@@ -88,6 +89,13 @@ graphql-server-lambdas:
 |---|---|---|
 | `executor.autoRollback.enabled` | `AUTO_ROLLBACK_ENABLED` | `true` |
 | `executor.autoRollback.graceSeconds` | `AUTO_ROLLBACK_GRACE_SECONDS` | `180` |
+| `executor.autoRollback.confirmSeconds` | `AUTO_ROLLBACK_CONFIRM_SECONDS` | `60` |
+
+Why the confirm window (prod, 2026-11-04): a good graphql-server-lambdas
+package was rolled back 3 s after its pod landed on a node Karpenter had just
+added - the kubelet's first try said `CreateContainerConfigError: failed to
+sync secret cache: timed out waiting for the condition`, which it fixes on
+its own next try. One look at a retryable error is not a failure.
 
 ## Test
 

@@ -59,13 +59,17 @@ type rolloutGuardConfig struct {
 	// (raised to twice the function's specialization timeout when that is
 	// longer - a slow cold start or a node being added is not a failure).
 	grace time.Duration
-	poll  time.Duration
+	// confirm is how long a retryable container error (retryableReasons)
+	// must last before it fails the rollout.
+	confirm time.Duration
+	poll    time.Duration
 }
 
 // rolloutGuardConfigFromEnv: AUTO_ROLLBACK_ENABLED (default true),
-// AUTO_ROLLBACK_GRACE_SECONDS (default 180).
+// AUTO_ROLLBACK_GRACE_SECONDS (default 180), AUTO_ROLLBACK_CONFIRM_SECONDS
+// (default 60).
 func rolloutGuardConfigFromEnv(logger logr.Logger) rolloutGuardConfig {
-	cfg := rolloutGuardConfig{enabled: true, grace: 180 * time.Second, poll: 5 * time.Second}
+	cfg := rolloutGuardConfig{enabled: true, grace: 180 * time.Second, confirm: 60 * time.Second, poll: 5 * time.Second}
 	if v := os.Getenv("AUTO_ROLLBACK_ENABLED"); v != "" {
 		on, err := strconv.ParseBool(v)
 		if err != nil {
@@ -80,6 +84,14 @@ func rolloutGuardConfigFromEnv(logger logr.Logger) rolloutGuardConfig {
 			logger.Error(err, "failed to parse AUTO_ROLLBACK_GRACE_SECONDS, keeping the default", "value", v)
 		} else {
 			cfg.grace = time.Duration(s) * time.Second
+		}
+	}
+	if v := os.Getenv("AUTO_ROLLBACK_CONFIRM_SECONDS"); v != "" {
+		s, err := strconv.Atoi(v)
+		if err != nil || s < 0 {
+			logger.Error(err, "failed to parse AUTO_ROLLBACK_CONFIRM_SECONDS, keeping the default", "value", v)
+		} else {
+			cfg.confirm = time.Duration(s) * time.Second
 		}
 	}
 	return cfg
@@ -147,14 +159,26 @@ const (
 	rolloutPending rolloutVerdict = iota
 	rolloutReady
 	rolloutFailed
+	// rolloutFailing: a retryable container error right now - it fails the
+	// rollout only when it lasts rolloutGuardConfig.confirm.
+	rolloutFailing
 )
 
 // containerFailureReasons can never fix themselves without a new spec.
 var containerFailureReasons = map[string]bool{
-	"CrashLoopBackOff":           true,
+	"CrashLoopBackOff": true,
+	"InvalidImageName": true,
+}
+
+// retryableReasons are errors the kubelet retries on its own and that often
+// clear: on a node that was just added the kubelet's secret / configmap cache
+// is not synced yet ("failed to sync secret cache: timed out waiting for the
+// condition" = CreateContainerConfigError), a registry hiccup is ErrImagePull.
+// Prod 2026-11-04: a good graphql-server-lambdas package was rolled back on
+// the FIRST such look, 3 s after its pod reached a new Karpenter node.
+var retryableReasons = map[string]bool{
 	"ErrImagePull":               true,
 	"ImagePullBackOff":           true,
-	"InvalidImageName":           true,
 	"CreateContainerConfigError": true,
 	"CreateContainerError":       true,
 	"RunContainerError":          true,
@@ -178,6 +202,7 @@ func assessRollout(depl *appsv1.Deployment, newPods []apiv1.Pod) (rolloutVerdict
 		st.Replicas == st.UpdatedReplicas {
 		return rolloutReady, ""
 	}
+	failing := ""
 	for i := range newPods {
 		pod := &newPods[i]
 		statuses := append(append([]apiv1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...)
@@ -188,7 +213,16 @@ func assessRollout(depl *appsv1.Deployment, newPods []apiv1.Pod) (rolloutVerdict
 			if cs.RestartCount >= crashRestarts {
 				return rolloutFailed, fmt.Sprintf("pod %s container %s restarted %d times", pod.Name, cs.Name, cs.RestartCount)
 			}
+			if w := cs.State.Waiting; w != nil && retryableReasons[w.Reason] && failing == "" {
+				failing = fmt.Sprintf("pod %s container %s: %s", pod.Name, cs.Name, w.Reason)
+				if w.Message != "" {
+					failing += " (" + w.Message + ")"
+				}
+			}
 		}
+	}
+	if failing != "" {
+		return rolloutFailing, failing
 	}
 	return rolloutPending, ""
 }
@@ -256,6 +290,7 @@ func (deploy *NewDeploy) guardRollout(ctx context.Context, fnNs, fnName string, 
 	deplNs, deplName string, grace time.Duration) {
 	logger := deploy.logger.WithValues("function", fnName, "namespace", fnNs, "package", guarded.Name)
 	deadline := time.Now().Add(grace)
+	var failingSince time.Time // first look of the current retryable error
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -290,6 +325,18 @@ func (deploy *NewDeploy) guardRollout(ctx context.Context, fnNs, fnName string, 
 			logger.Error(err, "rollout guard: listing the new pods failed")
 		}
 		verdict, reason := assessRollout(depl, pods)
+		if verdict == rolloutFailing {
+			if failingSince.IsZero() {
+				failingSince = time.Now()
+			}
+			if lasted := time.Since(failingSince); lasted >= deploy.rolloutGuard.confirm {
+				verdict, reason = rolloutFailed, fmt.Sprintf("%s for %s", reason, lasted.Round(time.Second))
+			} else {
+				verdict = rolloutPending
+			}
+		} else {
+			failingSince = time.Time{}
+		}
 		if verdict == rolloutPending && time.Now().After(deadline) {
 			verdict, reason = rolloutFailed, fmt.Sprintf("not available after %s", grace)
 		}

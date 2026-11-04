@@ -73,6 +73,8 @@ spec:
           value: {{ .Values.executor.autoRollback.enabled | default false | quote }}
         - name: AUTO_ROLLBACK_GRACE_SECONDS
           value: {{ .Values.executor.autoRollback.graceSeconds | default 180 | quote }}
+        - name: AUTO_ROLLBACK_CONFIRM_SECONDS
+          value: {{ .Values.executor.autoRollback.confirmSeconds | default 60 | quote }}
         - name: ENABLE_ISTIO
           value: "{{ .Values.enableIstio }}"
         {{- if .Values.functionState.enabled }}

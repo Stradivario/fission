@@ -5,6 +5,7 @@
 package newdeploy
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -110,8 +111,15 @@ func TestAssessRollout(t *testing.T) {
 		{"crash loop", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
 			Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
 		})}, rolloutFailed},
-		{"image cannot be pulled", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
+		{"image cannot be pulled (retried by the kubelet)", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
 			Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "ImagePullBackOff"}},
+		})}, rolloutFailing},
+		{"secret cache of a new node not synced yet", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
+			Name: "fetcher", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{
+				Reason: "CreateContainerConfigError", Message: "failed to sync secret cache: timed out waiting for the condition"}},
+		})}, rolloutFailing},
+		{"invalid image name", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
+			Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "InvalidImageName"}},
 		})}, rolloutFailed},
 		{"restarting over and over", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{Name: "api", RestartCount: crashRestarts})}, rolloutFailed},
 	}
@@ -140,7 +148,7 @@ func guardFixture(t *testing.T, fn *fv1.Function, pod apiv1.Pod, status appsv1.D
 		logger:           testr.New(t),
 		fissionClient:    fission,
 		kubernetesClient: kube,
-		rolloutGuard:     rolloutGuardConfig{enabled: true, grace: time.Minute, poll: time.Millisecond},
+		rolloutGuard:     rolloutGuardConfig{enabled: true, grace: time.Minute, confirm: time.Hour, poll: time.Millisecond},
 	}, fission
 }
 
@@ -207,4 +215,47 @@ func TestGuardRollsBackAfterTheGracePeriod(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, old, got.Spec.Package.PackageRef)
 	assert.Contains(t, got.Annotations[AnnotationRolledBackReason], "not available after")
+}
+
+func configErrorPod() apiv1.Pod {
+	return podWith(apiv1.ContainerStatus{
+		Name: "fetcher", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{
+			Reason: "CreateContainerConfigError", Message: "failed to sync secret cache: timed out waiting for the condition"}},
+	})
+}
+
+// Prod 2026-11-04: one look at a new node's unsynced secret cache rolled a
+// good package back. A retryable error is waited out for the confirm window.
+func TestGuardWaitsOutARetryableError(t *testing.T) {
+	t.Parallel()
+	old, good := pkgRef("api-aaaaaa"), pkgRef("api-ffffff")
+	fn := function(good, &old)
+	deploy, fission := guardFixture(t, fn, configErrorPod(),
+		appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 3, UpdatedReplicas: 1, AvailableReplicas: 2})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	deploy.guardRollout(ctx, ns, fnName, good, &old, ns, deplName, time.Hour)
+
+	got, err := fission.CoreV1().Functions(ns).Get(t.Context(), fnName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, good, got.Spec.Package.PackageRef, "not rolled back inside the confirm window")
+	assert.Empty(t, got.Annotations[AnnotationRolledBackFrom])
+}
+
+func TestGuardRollsBackARetryableErrorThatLasts(t *testing.T) {
+	t.Parallel()
+	old, broken := pkgRef("api-aaaaaa"), pkgRef("api-gggggg")
+	fn := function(broken, &old)
+	deploy, fission := guardFixture(t, fn, configErrorPod(),
+		appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 3, UpdatedReplicas: 1, AvailableReplicas: 2})
+	deploy.rolloutGuard.confirm = 20 * time.Millisecond
+
+	deploy.guardRollout(t.Context(), ns, fnName, broken, &old, ns, deplName, time.Hour)
+
+	got, err := fission.CoreV1().Functions(ns).Get(t.Context(), fnName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, old, got.Spec.Package.PackageRef)
+	assert.Contains(t, got.Annotations[AnnotationRolledBackReason], "CreateContainerConfigError")
+	assert.Contains(t, got.Annotations[AnnotationRolledBackReason], "failed to sync secret cache")
 }

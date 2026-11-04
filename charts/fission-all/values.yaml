@@ -371,9 +371,13 @@ executor:
   ## graceSeconds - at least twice its specializationTimeout) is moved back
   ## to its last ready package automatically and fires
   ## function.deploy.rolledback. See docs/features/auto-rollback.md.
+  ## Errors the kubelet retries itself (CreateContainerConfigError such as a
+  ## new node's unsynced secret cache, ErrImagePull, ...) must last
+  ## confirmSeconds before they count.
   autoRollback:
     enabled: true
     graceSeconds: 180
+    confirmSeconds: 60
 
   ## Pod resources as:
   ##  resources:
