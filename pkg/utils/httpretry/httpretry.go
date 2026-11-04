@@ -49,6 +49,14 @@ type Options struct {
 	// RetryWaitMin and RetryWaitMax bound the exponential backoff.
 	RetryWaitMin time.Duration
 	RetryWaitMax time.Duration
+	// NoRetryOn429 skips the default 429 (Too Many Requests) retry. Callers
+	// whose 429 is deliberate back-pressure (e.g. the executor client: the
+	// per-function concurrency limit and the per-environment pod cap) want it
+	// to propagate immediately rather than being retried ~4x/~15s and then
+	// surfaced as a generic "giving up after N attempts" error that erases the
+	// original 429. Defaults false (unchanged behavior) so every existing
+	// caller keeps retrying 429 unless it opts in.
+	NoRetryOn429 bool
 }
 
 // DefaultOptions returns the retryablehttp-equivalent defaults.
@@ -108,7 +116,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err = rt.base.RoundTrip(attemptReq)
 
-		if attempt >= rt.opts.RetryMax || !retryable(resp, err) {
+		if attempt >= rt.opts.RetryMax || !retryable(resp, err, rt.opts) {
 			return resp, err
 		}
 
@@ -128,9 +136,9 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // retryable reports whether the result of an attempt warrants a retry: a
-// non-context transport error, HTTP 429, or 5xx other than 501 Not Implemented
-// (matching retryablehttp's DefaultRetryPolicy).
-func retryable(resp *http.Response, err error) bool {
+// non-context transport error, HTTP 429 (unless opts.NoRetryOn429), or 5xx
+// other than 501 Not Implemented (matching retryablehttp's DefaultRetryPolicy).
+func retryable(resp *http.Response, err error, opts Options) bool {
 	if err != nil {
 		return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 	}
@@ -138,7 +146,7 @@ func retryable(resp *http.Response, err error) bool {
 		return false
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return true
+		return !opts.NoRetryOn429
 	}
 	return resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/cmd/check"
 	"github.com/fission/fission/pkg/fission-cli/cmd/environment"
 	"github.com/fission/fission/pkg/fission-cli/cmd/function"
+	"github.com/fission/fission/pkg/fission-cli/cmd/functionalias"
 	"github.com/fission/fission/pkg/fission-cli/cmd/httptrigger"
 	"github.com/fission/fission/pkg/fission-cli/cmd/kubewatch"
 	"github.com/fission/fission/pkg/fission-cli/cmd/mqtrigger"
@@ -26,11 +27,14 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/cmd/tenant"
 	"github.com/fission/fission/pkg/fission-cli/cmd/timetrigger"
 	"github.com/fission/fission/pkg/fission-cli/cmd/token"
+	"github.com/fission/fission/pkg/fission-cli/cmd/topic"
 	"github.com/fission/fission/pkg/fission-cli/cmd/version"
+	"github.com/fission/fission/pkg/fission-cli/cmd/workflow"
 	"github.com/fission/fission/pkg/fission-cli/console"
 	"github.com/fission/fission/pkg/fission-cli/flag"
 	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
 	_ "github.com/fission/fission/pkg/mqtrigger/messageQueue/kafka"
+	_ "github.com/fission/fission/pkg/mqtrigger/messageQueue/statestore"
 )
 
 const (
@@ -85,8 +89,9 @@ func App(clientOptions cmd.ClientOptions) *cobra.Command {
 
 	groups := helptemplate.CommandGroups{}
 	groups = append(groups, helptemplate.CreateCmdGroup("Auth Commands(Note: Authentication should be enabled to use a command in this group.)", token.Commands()))
-	groups = append(groups, helptemplate.CreateCmdGroup("Basic Commands", environment.Commands(), _package.Commands(), function.Commands(), archive.Commands()))
-	groups = append(groups, helptemplate.CreateCmdGroup("Trigger Commands", httptrigger.Commands(), mqtrigger.Commands(), timetrigger.Commands(), kubewatch.Commands()))
+	groups = append(groups, helptemplate.CreateCmdGroup("Basic Commands", environment.Commands(), _package.Commands(), function.Commands(), archive.Commands(), functionalias.Commands()))
+	groups = append(groups, helptemplate.CreateCmdGroup("Trigger Commands", httptrigger.Commands(), mqtrigger.Commands(), timetrigger.Commands(), kubewatch.Commands(), topic.Commands()))
+	groups = append(groups, helptemplate.CreateCmdGroup("Workflow Commands", workflow.Commands()))
 	groups = append(groups, helptemplate.CreateCmdGroup("Deploy Strategies Commands", canaryconfig.Commands()))
 	groups = append(groups, helptemplate.CreateCmdGroup("Declarative Application Commands", spec.Commands()))
 	groups = append(groups, helptemplate.CreateCmdGroup("Administration Commands", tenant.Commands()))

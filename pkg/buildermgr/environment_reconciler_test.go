@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -52,10 +53,8 @@ func newTestEnvironmentWatcher(t *testing.T) *EnvironmentReconciler {
 
 func newTestBuilderEnv() *fv1.Environment {
 	return &fv1.Environment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "py",
-			Namespace: "default",
-		},
+		Name:      "py",
+		Namespace: "default",
 		Spec: fv1.EnvironmentSpec{
 			Version: 2,
 			Runtime: fv1.Runtime{
@@ -221,6 +220,56 @@ func TestBuilderEnvBuilderPodSpecCannotIntroduceDuplicateSATokenMount(t *testing
 		"the sole mount at the SA-token path must be the projected volume, not the user-supplied one")
 }
 
+// TestBuilderDeploymentRuntimeClassFieldOnly asserts that
+// env.Spec.RuntimeClassName reaches the builder pod template's
+// RuntimeClassName when NO env.Spec.Builder.PodSpec is set at all — the
+// common case, and the one that would silently pass if ApplyEnvRuntimeClass
+// were wired inside the "if env.Spec.Builder.PodSpec != nil" block instead of
+// unconditionally.
+func TestBuilderDeploymentRuntimeClassFieldOnly(t *testing.T) {
+	envw := newTestEnvironmentWatcher(t)
+	env := newTestBuilderEnv()
+	env.Spec.RuntimeClassName = new("gvisor")
+	require.Nil(t, env.Spec.Builder.PodSpec, "this test must exercise the no-PodSpec path")
+
+	deployment, err := envw.createBuilderDeployment(context.Background(), env, "default")
+	require.NoError(t, err)
+
+	require.NotNil(t, deployment.Spec.Template.Spec.RuntimeClassName)
+	assert.Equal(t, "gvisor", *deployment.Spec.Template.Spec.RuntimeClassName)
+}
+
+// TestBuilderDeploymentRuntimeClassNilWhenUnset asserts that an env with no
+// RuntimeClassName leaves the builder pod template's RuntimeClassName nil.
+func TestBuilderDeploymentRuntimeClassNilWhenUnset(t *testing.T) {
+	envw := newTestEnvironmentWatcher(t)
+	env := newTestBuilderEnv()
+
+	deployment, err := envw.createBuilderDeployment(context.Background(), env, "default")
+	require.NoError(t, err)
+
+	assert.Nil(t, deployment.Spec.Template.Spec.RuntimeClassName)
+}
+
+// TestBuilderDeploymentRuntimeClassPodSpecOverridesField pins the precedence
+// rule: when both env.Spec.RuntimeClassName and env.Spec.Builder.PodSpec.
+// RuntimeClassName are set to different values, the PodSpec's value wins.
+func TestBuilderDeploymentRuntimeClassPodSpecOverridesField(t *testing.T) {
+	envw := newTestEnvironmentWatcher(t)
+	env := newTestBuilderEnv()
+	env.Spec.RuntimeClassName = new("gvisor")
+	env.Spec.Builder.PodSpec = &apiv1.PodSpec{
+		RuntimeClassName: new("kata"),
+	}
+
+	deployment, err := envw.createBuilderDeployment(context.Background(), env, "default")
+	require.NoError(t, err)
+
+	require.NotNil(t, deployment.Spec.Template.Spec.RuntimeClassName)
+	assert.Equal(t, "kata", *deployment.Spec.Template.Spec.RuntimeClassName,
+		"env.Spec.Builder.PodSpec.RuntimeClassName must win over env.Spec.RuntimeClassName")
+}
+
 // newTestEnvironmentReconciler wires an EnvironmentReconciler with a
 // controller-runtime fake client seeded with crObjs (for the primary
 // Environment Get) and a fake Kubernetes client seeded with k8sObjs (the
@@ -235,11 +284,12 @@ func newTestEnvironmentReconciler(t *testing.T, k8sObjs []runtime.Object, crObjs
 		kubernetesClient: k8sfake.NewClientset(k8sObjs...),
 		nsResolver:       utils.DefaultNSResolver(),
 		fetcherConfig:    cfg,
+		poolMgr:          newBuilderPoolManager(loggerfactory.GetLogger()),
 	}
 }
 
 func envReq(env *fv1.Environment) ctrl.Request {
-	return ctrl.Request{NamespacedName: client.ObjectKey{Name: env.Name, Namespace: env.Namespace}}
+	return ctrl.Request{Name: env.Name, Namespace: env.Namespace}
 }
 
 // TestEnvironmentReconcileCreateIdempotentDelete walks the builder lifecycle:
@@ -310,10 +360,10 @@ func TestEnvironmentReconcilePrunesStaleGeneration(t *testing.T) {
 		LABEL_ENV_RESOURCEVERSION: "1",
 	}
 	_, err := r.kubernetesClient.CoreV1().Services(ns).Create(t.Context(),
-		&apiv1.Service{ObjectMeta: metav1.ObjectMeta{Name: env.Name + "-1", Namespace: ns, Labels: staleLabels}}, metav1.CreateOptions{})
+		&apiv1.Service{Name: env.Name + "-1", Namespace: ns, Labels: staleLabels}, metav1.CreateOptions{})
 	require.NoError(t, err)
 	_, err = r.kubernetesClient.AppsV1().Deployments(ns).Create(t.Context(),
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: env.Name + "-1", Namespace: ns, Labels: staleLabels}}, metav1.CreateOptions{})
+		&appsv1.Deployment{Name: env.Name + "-1", Namespace: ns, Labels: staleLabels}, metav1.CreateOptions{})
 	require.NoError(t, err)
 
 	_, err = r.Reconcile(t.Context(), envReq(env))
@@ -325,4 +375,247 @@ func TestEnvironmentReconcilePrunesStaleGeneration(t *testing.T) {
 	assert.True(t, apierrors.IsNotFound(err), "stale-generation builder deployment must be pruned")
 	_, err = r.kubernetesClient.CoreV1().Services(ns).Get(t.Context(), env.Name+"-2", metav1.GetOptions{})
 	require.NoError(t, err, "current-generation builder service must exist")
+}
+
+// TestEnvironmentReconcileRollsDriftedBuilder is issue #776: builder drift that
+// does NOT bump the Environment's ResourceVersion must still roll the builder.
+//
+// Everything the builder pod is made of that comes from the chart rather than
+// the CR — the fetcher image, the builder image-pull policy, the pod-spec patch
+// — changes without the Environment being touched. The name and selector are
+// keyed on the RV, so they still match, and the reconciler used to find a
+// Deployment and do nothing. The builder then ran the previous image until
+// someone deleted the Deployment by hand; deleting the POD did nothing, because
+// the ReplicaSet recreated it from the same stale template.
+func TestEnvironmentReconcileRollsDriftedBuilder(t *testing.T) {
+	env := newTestBuilderEnv()
+	env.ResourceVersion = "7"
+	r := newTestEnvironmentReconciler(t, nil, env)
+	ns := r.nsResolver.GetBuilderNS(env.Namespace)
+
+	// First reconcile creates the builder at the current desired spec.
+	_, err := r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	name := env.Name + "-7"
+	created, err := r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	originalHash := created.Annotations[builderSpecHashAnnotation]
+	require.NotEmpty(t, originalHash, "the created builder must carry a spec hash to compare against later")
+
+	// Drift the live Deployment the way a chart-level change would: the pod
+	// template no longer matches what the reconciler would produce, while the
+	// Environment — and therefore the name, selector and RV label — is untouched.
+	drifted := created.DeepCopy()
+	drifted.Spec.Template.Spec.Containers[0].Image = "fission/python-builder:STALE"
+	drifted.Annotations[builderSpecHashAnnotation] = "sha256:stale"
+	_, err = r.kubernetesClient.AppsV1().Deployments(ns).Update(t.Context(), drifted, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	_, err = r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	got, err := r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, env.Spec.Builder.Image, got.Spec.Template.Spec.Containers[0].Image,
+		"a drifted builder must be rolled back onto the desired image")
+	assert.Equal(t, originalHash, got.Annotations[builderSpecHashAnnotation],
+		"the spec hash must be re-stamped so the next reconcile is a no-op")
+	assert.Equal(t, name, got.Name,
+		"the Deployment must be updated in place: buildPackage resolves <env>-<rv> as a DNS hostname")
+}
+
+// TestEnvironmentReconcileDoesNotRollAnUndriftedBuilder is the other half, and
+// the direction whose failure mode is silent: a reconciler that rewrote the
+// Deployment every pass would roll every builder on every resync forever.
+// Comparing the apiserver's view of the PodSpec would do exactly that, since it
+// defaults fields we never set — hence hashing our own desired object instead.
+func TestEnvironmentReconcileDoesNotRollAnUndriftedBuilder(t *testing.T) {
+	env := newTestBuilderEnv()
+	env.ResourceVersion = "7"
+	r := newTestEnvironmentReconciler(t, nil, env)
+	ns := r.nsResolver.GetBuilderNS(env.Namespace)
+
+	_, err := r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+	_, err = r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), env.Name+"-7", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	// Count Deployment writes with a reactor rather than comparing
+	// ResourceVersion: the fake clientset does not bump RV on Update, so an
+	// RV comparison passes even when the reconciler rewrites the object on
+	// every pass — the exact regression this test exists to catch.
+	var updates int
+	fakeCS, ok := r.kubernetesClient.(*k8sfake.Clientset)
+	require.True(t, ok, "test reconciler must use the fake clientset")
+	fakeCS.PrependReactor("update", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+		updates++
+		return false, nil, nil
+	})
+
+	for range 3 {
+		_, err = r.Reconcile(t.Context(), envReq(env))
+		require.NoError(t, err)
+	}
+
+	assert.Zero(t, updates,
+		"repeated reconciles of an unchanged environment must not write the Deployment at all")
+}
+
+// TestEnvironmentReconcileDoesNotRollWhenPodSpecPatched is the case the drift
+// check exists for, and the one that breaks a naive hash.
+//
+// env.Spec.Builder.PodSpec routes the pod template through MergePodSpec, whose
+// mergeContainerList round-trips containers through a Go map and emits them in
+// map-iteration order — randomized per range, even inside one process. Hashing
+// that order directly yields a different hash on every call, so the reconciler
+// would "detect drift" forever and roll the builder on every single reconcile:
+// the exact churn this feature exists to prevent, arriving from the other side.
+func TestEnvironmentReconcileDoesNotRollWhenPodSpecPatched(t *testing.T) {
+	env := newTestBuilderEnv()
+	env.ResourceVersion = "7"
+	// Container-free on purpose: mergeContainerList runs regardless of whether
+	// the patch names any container, so an unrelated patch is enough.
+	env.Spec.Builder.PodSpec = &apiv1.PodSpec{
+		NodeSelector: map[string]string{"disktype": "ssd"},
+	}
+	r := newTestEnvironmentReconciler(t, nil, env)
+
+	_, err := r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	var updates int
+	fakeCS, ok := r.kubernetesClient.(*k8sfake.Clientset)
+	require.True(t, ok)
+	fakeCS.PrependReactor("update", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+		updates++
+		return false, nil, nil
+	})
+
+	// Several passes: one map iteration can coincidentally match, a run of them
+	// will not.
+	for range 8 {
+		_, err = r.Reconcile(t.Context(), envReq(env))
+		require.NoError(t, err)
+	}
+
+	assert.Zero(t, updates,
+		"a builder whose environment sets Builder.PodSpec must not be rolled by repeated reconciles")
+}
+
+// TestBuilderSpecHashIsStableAcrossCalls isolates the same invariant without a
+// reconcile, so a failure points at the hash rather than at the controller.
+func TestBuilderSpecHashIsStableAcrossCalls(t *testing.T) {
+	env := newTestBuilderEnv()
+	env.ResourceVersion = "7"
+	env.Spec.Builder.PodSpec = &apiv1.PodSpec{
+		NodeSelector: map[string]string{"disktype": "ssd"},
+	}
+	r := newTestEnvironmentReconciler(t, nil, env)
+	ns := r.nsResolver.GetBuilderNS(env.Namespace)
+
+	first, err := r.genBuilderDeployment(env, ns)
+	require.NoError(t, err)
+	want := first.Annotations[builderSpecHashAnnotation]
+	require.NotEmpty(t, want)
+
+	for i := range 20 {
+		again, err := r.genBuilderDeployment(env, ns)
+		require.NoError(t, err)
+		require.Equalf(t, want, again.Annotations[builderSpecHashAnnotation],
+			"hash must not depend on map iteration order (differed on call %d)", i+2)
+	}
+}
+
+// TestBuilderSpecHashGolden pins the exact output of builderSpecHash. The hash
+// is stamped on builder Deployments and compared on every reconcile: if the
+// value moves for an unchanged template, every environment's builder is torn
+// down and rebuilt on the release that shipped the change. This test exists so
+// that any change to canonicalisation, struct field order, or the JSON
+// marshaler feeding sha256 — including a future encoding/json/v2 migration —
+// fails loudly here instead of shipping a silent fleet-wide builder rebuild.
+//
+// If this test fails, DO NOT just update the constants: decide first whether a
+// one-time builder rebuild is acceptable for the release, and release-note it.
+func TestBuilderSpecHashGolden(t *testing.T) {
+	t.Parallel()
+
+	full := &apiv1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{"envName": "golden", "owner": "buildermgr"},
+		},
+		Spec: apiv1.PodSpec{
+			Containers: []apiv1.Container{
+				{
+					Name:    "builder",
+					Image:   "fission/builder:1.2.3",
+					Command: []string{"/builder"},
+					Env: []apiv1.EnvVar{
+						{Name: "B", Value: "2"},
+						{Name: "A", Value: "1"},
+					},
+					VolumeMounts: []apiv1.VolumeMount{
+						{Name: "userfunc", MountPath: "/userfunc"},
+					},
+				},
+				{Name: "fetcher", Image: "fission/fetcher:1.2.3"},
+			},
+			Volumes: []apiv1.Volume{
+				{Name: "userfunc", VolumeSource: apiv1.VolumeSource{
+					EmptyDir: &apiv1.EmptyDirVolumeSource{},
+				}},
+			},
+		},
+	}
+	zero := &apiv1.PodTemplateSpec{}
+
+	tests := []struct {
+		name string
+		tmpl *apiv1.PodTemplateSpec
+		want string
+	}{
+		// Golden values captured on go1.27.0 (encoding/json v1 semantics).
+		{name: "fully populated", tmpl: full, want: "sha256:6693cf48ecdfdec04ee9911fb0326a148c6d702ab1262f7da3a2ae1b372bcef5"},
+		{name: "zero template", tmpl: zero, want: "sha256:103650a8e8747dd18003a892139ffabcb7111196e28ddc389da8e510ec1ef9d7"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := builderSpecHash(tt.tmpl)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// A builder the pool scaled to zero that then drifts — here a newly enabled
+// builder pod spec patch nodeSelector (the kubernetes.io/arch pin) — must be
+// rolled onto the selector without being scaled back up: the fork's builder
+// pool owns the replica count (idleBuilderReaper / package reconciler).
+func TestEnvironmentReconcileDriftRollKeepsPoolReplicas(t *testing.T) {
+	env := newTestBuilderEnv()
+	env.ResourceVersion = "7"
+	r := newTestEnvironmentReconciler(t, nil, env)
+	ns := r.nsResolver.GetBuilderNS(env.Namespace)
+	_, err := r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	name := env.Name + "-7"
+	created, err := r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	idle := created.DeepCopy()
+	idle.Spec.Replicas = new(int32(0))
+	_, err = r.kubernetesClient.AppsV1().Deployments(ns).Update(t.Context(), idle, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	r.podSpecPatch = &apiv1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/arch": "amd64"}}
+	_, err = r.Reconcile(t.Context(), envReq(env))
+	require.NoError(t, err)
+
+	got, err := r.kubernetesClient.AppsV1().Deployments(ns).Get(t.Context(), name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"kubernetes.io/arch": "amd64"}, got.Spec.Template.Spec.NodeSelector,
+		"the drift roll must carry the patch's nodeSelector")
+	require.NotNil(t, got.Spec.Replicas)
+	assert.Equal(t, int32(0), *got.Spec.Replicas, "the roll must not scale an idle pooled builder back up")
 }

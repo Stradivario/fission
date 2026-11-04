@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,6 +38,27 @@ func TestUrlForFunction(t *testing.T) {
 		t.Run(tc.namespace, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tc.want, UrlForFunction(tc.name, tc.namespace))
+		})
+	}
+}
+
+func TestUrlForFunctionRef(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		fn, ns string
+		suffix string
+		want   string
+	}{
+		{"no suffix falls back to UrlForFunction", "fn", "default", "", "/fission-function/fn"},
+		{"alias suffix, default namespace", "fn", "default", "blue", "/fission-function/fn:blue"},
+		{"alias suffix, other namespace", "fn", "ns1", "blue", "/fission-function/ns1/fn:blue"},
+		{"version suffix", "fn", "ns1", "fn-v3", "/fission-function/ns1/fn:fn-v3"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, UrlForFunctionRef(tc.fn, tc.ns, tc.suffix))
 		})
 	}
 }
@@ -327,4 +349,19 @@ func TestRootFileChecksum_ConfinesToBase(t *testing.T) {
 	// A path escaping base is rejected.
 	_, err = RootFileChecksum(base, "../../etc/hostname")
 	assert.Error(t, err)
+}
+
+// TestServiceFQDN pins the absolute-name contract: in-cluster service dial
+// addresses must be fully qualified WITH the trailing dot, or Go's resolver
+// walks the pod's resolv.conf search path (ndots:5) and multiplies every
+// resolution into the extra A/AAAA queries that drop under parallel load.
+func TestServiceFQDN(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "fn-svc.default.svc.cluster.local.", ServiceFQDN("fn-svc", "default"),
+		"default cluster domain, absolute form, trailing dot")
+	assert.Equal(t, "b-123.fission-builder.svc.example.org.", serviceFQDN("b-123", "fission-builder", "example.org"),
+		"CLUSTER_DOMAIN override must reach the name")
+	assert.True(t, strings.HasSuffix(ServiceFQDN("a", "b"), "."),
+		"the trailing dot IS the fix: without it the name is still search-path relative")
 }

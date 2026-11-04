@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Fission is a Kubernetes-native serverless framework, written in Go (`github.com/fission/fission`, Go 1.26).
+Fission is a Kubernetes-native serverless framework, written in Go (`github.com/fission/fission`, Go 1.27).
 The control plane is shipped as a single multi-headed binary (`fission-bundle`) that runs one of several subsystems based on flags.
 Functions execute inside per-environment pods that the executor manages; the user-facing CLI is `fission`.
 
@@ -14,7 +14,8 @@ Build / lint / test (run from repo root):
 - `make build-fission-cli` — build the `fission` CLI via goreleaser (snapshot, single target).
   `make install-fission-cli` copies it to `/usr/local/bin/fission`.
 - `make code-checks` — `golangci-lint run` (config in `.golangci.yaml`; goimports local prefix `github.com/fission/fission`), plus `make verify-gomod`.
-- `make verify-gomod` — fails if `go.mod` does not keep direct and indirect requirements in separate blocks (`go mod tidy` does NOT enforce this); runs in CI's "Verify dependencies" step.
+- `make verify-gomod` — fails if `go.mod` does not keep direct and indirect requirements in separate blocks; runs in CI's "Verify dependencies" step.
+  Since Go 1.27, `go mod tidy` maintains this layout itself (it relocates misfiled entries); the guard remains for tidy-less hand edits.
   See "Dependency management".
 - `make license` — add the SPDX header (`SPDX-FileCopyrightText` + `SPDX-License-Identifier: Apache-2.0`) to any in-scope source file (`.go`/`.sh`/`.py`/`Dockerfile*`) missing one.
   `make license-check` is the CI gate (runs in `lint.yaml`); run it before pushing.
@@ -40,7 +41,7 @@ Integration tests (`test/integration/`, Go + testify, build tag `//go:build inte
   Setting `FISSION_ROUTER` / `FISSION_ROUTER_INTERNAL` / `FISSION_MCP_BASE_URL` overrides a route with a fixed address (for hand-managed forwards or non-default installs).
 - `/fission-function/<ns>/<name>` moved off the public listener after GHSA-3g33-6vg6-27m8 (see Architecture).
   Tests that invoke functions go through the framework's `Router(t)` HTTP client which auto-routes those paths to the internal listener, or dial `f.RouterInternalBaseURL()` via `f.HTTPClient()` — base-URL hosts are portless route names, so plain `http.Client`s cannot resolve them.
-- Export `FISSION_INTERNAL_AUTH_SECRET` (read from `kubectl get secret fission-internal-auth -n fission -o jsonpath='{.data.master}' | base64 -d`) so the framework's transport signs requests on the internal listener — leave unset to test the verifier's pass-through mode.
+- Export `FISSION_INTERNAL_AUTH_SECRET` (read from `kubectl get secret fission-internal-auth -n fission -o jsonpath='{.data.secret}' | base64 -d`) so the framework's transport signs requests on the internal listener — leave unset to test the verifier's pass-through mode.
 - The MCP test (`TestMCPToolsListAndCall`) needs `svc/mcp` in the cluster (`mcp.enabled`/`mcp.allowInsecure` are on in the kind/kind-ci skaffold profiles); it `t.Skip`s when the endpoint is unreachable.
 - Run the full suite: `go test -tags=integration -timeout=30m -parallel 6 -v ./test/integration/suites/common/...`.
   Set runtime/builder image env vars (`NODE_RUNTIME_IMAGE`, `PYTHON_RUNTIME_IMAGE`, etc.) — tests `t.Skip` when their required image is unset.
@@ -55,12 +56,13 @@ Integration tests (`test/integration/`, Go + testify, build tag `//go:build inte
 ## Testing conventions
 
 When writing or modifying tests, follow `.claude/resources/test-writing-guidelines.md`.
-Key points: use `testify` (`require` for preconditions, `assert` for independent checks) over hand-written comparisons; use `t.Context()` instead of `context.Background()`; prefer fake clientsets over `envtest` for unit tests; table-driven subtests with `t.Parallel()`.
+Key points: use `testify` (`require` for preconditions, `assert` for independent checks) over hand-written comparisons; use `t.Context()` instead of `context.Background()`; prefer fake clientsets over `envtest` for unit tests; table-driven subtests with `t.Parallel()`; `testing/synctest` bubbles for time-dependent code (no sleeps, no clock seams); `pgregory.net/rapid` for property-based tests (never the frozen `testing/quick`); fuzz parser/verifier boundaries; crash-point enumeration and `porcupine` for concurrency/consistency claims.
 
 ## Dependency management
 
 When adding, upgrading, or removing Go dependencies, follow `.claude/resources/go-mod-conventions.md`.
-Key point: `go.mod` keeps **direct** requirements in the first `require (...)` block and **indirect** (`// indirect`) ones in a second block — `go mod tidy` does NOT move entries between blocks, so a `go get` that lands a direct dep in the indirect block must be moved by hand.
+Key point: `go.mod` keeps **direct** requirements in the first `require (...)` block and **indirect** (`// indirect`) ones in a second block.
+Since Go 1.27, `go mod tidy` maintains this layout itself (it moves a direct dep that landed in the indirect block into the direct block); run it after any `go get`.
 `make verify-gomod` (CI-enforced in `lint.yaml`) guards the layout.
 
 ## Repo-specific playbooks
@@ -101,7 +103,10 @@ They publish to `/fission-function/...` on the internal listener; `cmd/fission-b
 MCP subsystem (`pkg/mcp`, `--mcpPort`): exposes opted-in Functions as Model Context Protocol tools for LLM agents over the official `github.com/modelcontextprotocol/go-sdk` Streamable HTTP transport (`/mcp` on the ClusterIP-only `svc/mcp`, Helm `mcp.enabled`, off by default).
 A function opts in via the optional `FunctionSpec.Tool *ToolConfig` field (presence is the on switch, like `Streaming`; `Description` + raw-JSON `InputSchema` + optional `ToolName`).
 `Start` mirrors `pkg/timer` but runs **without** leader election — every replica reconciles `Function` CRDs into its own in-memory `*mcp.Registry` and serves the full tool list, so each must reconcile (the SDK's `*mcp.Server` mutex serializes `AddTool`/`RemoveTools` against serving).
-`tools/call` is **buffered, not streamed** (the SDK returns one `CallToolResult`) and is proxied to `/fission-function/...` on the router internal listener built with `utils.UrlForFunction` (which **folds the default namespace** to `/fission-function/<name>`) and signed with the same `ServiceRouterInternal` HMAC key as the other publishers.
+The Streamable HTTP transport is **stateless** (`StreamableHTTPOptions.Stateless`, SEP-2567): no `Mcp-Session-Id`, GET/DELETE are 405, and each request is self-describing — that is what makes `mcp.replicas > 1` behind the plain ClusterIP correct (a stateful session pinned to one replica never survived the round-robin); progress notifications ride the POST's own SSE response, so streaming works in this mode, while `tools/list_changed` is best-effort (a client sees changes on its next `tools/list`).
+`PropagateRequestCancellation` ties the handler ctx to the POST **only for protocol ≥ 2026-07-28 callers** (SDK gate); for legacy clients the streaming path's client-gone signal is a failed progress write, which the delivery goroutine turns into `cancel(errCallerGone)` — never swallow that error, it is what reclaims an abandoned stream's semaphore slot.
+`AddTool` **panics** on a tool it dislikes (non-object input schema, malformed `x-mcp-header` annotations, future rules) — two guards, both load-bearing: `ToolConfig.Validate` runs on the **admission** path (`validateForAdmission`, NOT only `Validate()` — a rule only `Validate()` runs binds the CLI alone and is bypassed by kubectl/GitOps writers), and the reconciler probes the SDK (`validateToolRegistrable`) **before** `Registry.Upsert` because stored objects and `FunctionVersion` snapshots predate any admission rule and a recovered panic *after* Upsert leaves a registry entry with no `AddTool` behind it (invisible tool, `ToolExposed=True`).
+`tools/call` is **buffered by default**, proxied to `/fission-function/...` on the router internal listener built with `utils.UrlForFunction` (which **folds the default namespace** to `/fission-function/<name>`) and signed with the same `ServiceRouterInternal` HMAC key as the other publishers; when the function has `Spec.Streaming` AND the caller sent an MCP progress token, the proxy streams the response body as progress notifications (UTF-8-safe chunks) while still returning the full buffered `CallToolResult` at the end — that path swaps the hard 60s call ceiling for StreamingConfig idle/max-duration semantics (`pkg/mcp/proxy.go` `InvokeStreaming`).
 AuthZ: bearer JWT (`JWT_SIGNING_KEY`, shared with the router secret) whose `allowed_namespaces` claim scopes `tools/list`/`tools/call`; it **fails closed** — `Start` refuses to run without a key unless `MCP_ALLOW_INSECURE=true`, and the chart fails render when `mcp.enabled && !authentication.enabled && !mcp.allowInsecure`.
 RBAC is read-only on functions + functions/status; `/readyz` gates on the Function cache sync (via a manager `RunnableFunc`) so a warming replica isn't added to the Service.
 
@@ -135,6 +140,10 @@ The CLI (`cmd/fission-cli` + `pkg/fission-cli/`) talks to Kubernetes directly th
   Full debugging detail — and the gotcha that `fission`-namespace pod logs (e.g. MCP) are in the CI `kind-logs-<run>-<ver>` artifact, not the `default`-scoped dump — is in `.claude/resources/fission-ci-failure-patterns.md` / `fission-integration-test-quirks.md`.
 - When building a `/fission-function/<ns>/<name>` URL in Go, use `utils.UrlForFunction(name, namespace)` — it **folds the default namespace** to `/fission-function/<name>`, which is the form the router actually registers.
   A hardcoded `/fission-function/default/<name>` does not resolve.
+- A function's file projections (`spec.secrets[].mountPath` / `spec.configMaps[].mountPath`, RFC-0030 §4) are **relative to the in-pod `/secrets` and `/configs` roots**, never absolute: generic pool pods share a fixed emptyDir set frozen at pool creation, so an arbitrary absolute path is not materializable there at all.
+  Derive the target directory with `fv1.ObjectSubPath(mountPath, namespace, name)` — admission, the fetcher, and the container executor all call it, and a second implementation would drift into files written where nobody looks.
+  Two gotchas that are invisible without it: a reference with **no** mountPath still occupies `<namespace>/<name>`, so an explicit path equal to another reference's default is a collision; and the filenames written are the referenced object's **data keys**, which are mutable after admission, so the fetcher (not the webhook) is what refuses a cross-object overwrite within one specialization pass.
+
 - Poolmgr request accounting has **two disjoint modes that must never mix**: router-admitted requests (index `Admit`) decrement via the `ResolvedEntry.Release` closure, executor-resolved requests via the UnTap RPC into `PoolCache.activeRequests`.
   Calling Release for an executor-resolved entry (or skipping UnTap for one) corrupts the executor's concurrency accounting — when touching `pkg/router/transport.go` or the resolvers, check which mode owns the entry (`Release != nil` ⟺ router-admitted).
 - gorilla/mux's `Route.Methods()` **uppercases the slice it is handed in place** and keeps it as the route's matcher — passing a shared slice (an informer-owned object's field, or the route table's canonical spec) mutates the owner AND races the still-serving previous mux's matcher under churn.

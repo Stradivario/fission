@@ -1,0 +1,684 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package poolmgr
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	meta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/executor/fscache"
+	"github.com/fission/fission/pkg/executor/metrics"
+	"github.com/fission/fission/pkg/executor/util"
+	"github.com/fission/fission/pkg/generated/clientset/versioned"
+	"github.com/fission/fission/pkg/utils"
+)
+
+// funcSvcGetter is the subset of *GenericPoolManager that the provisioner
+// needs. Declared as an interface so unit tests can stub GetFuncSvc without
+// constructing a real GenericPoolManager (which needs a live fsCache, env
+// cache, request channel, etc.). *GenericPoolManager satisfies this
+// interface implicitly.
+type funcSvcGetter interface {
+	GetFuncSvc(ctx context.Context, fn *fv1.Function) (*fscache.FuncSvc, error)
+	UnTapService(ctx context.Context, fnMeta *metav1.ObjectMeta, svcHost string)
+	MarkSpecializationFailure(ctx context.Context, fnMeta *metav1.ObjectMeta)
+}
+
+// ProvisionerConfig configures the RFC-0026 provisioner.
+type ProvisionerConfig struct {
+	// MaxPerFunction is the namespace-wide cap on the effective provisioned
+	// target. The webhook cannot enforce it — MaxPerFunction comes from an
+	// executor env var the webhook never sees — so the provisioner's clamp
+	// in effectiveTarget is the sole enforcement point. The clamped value
+	// is surfaced in status via ProvisionedSpecTarget + the ProvisionedClamped
+	// condition so users know the spec target was reduced.
+	MaxPerFunction int
+
+	// MaxInflightPerFunction bounds the number of concurrent eager
+	// specializations per function. Prevents head-of-line blocking: a warm-up
+	// burst must not saturate EXECUTOR_SPECIALIZATION_CONCURRENCY and starve
+	// on-demand cold starts for other functions (invariant P5).
+	MaxInflightPerFunction int
+
+	// ReconcileInterval is how often the provisioner scans opted-in functions
+	// and reconciles their warm-pod count toward the effective target.
+	ReconcileInterval time.Duration
+}
+
+// Provisioner maintains warm specialized pods for functions that opt into
+// ProvisionedConcurrency (RFC-0026). It runs a periodic reconcile loop that
+// for each opted-in function:
+//  1. Computes the effective target (base Target only in PR 1; schedule
+//     windows arrive in PR 2).
+//  2. Counts ready provisioned pods (Kubernetes API list, not fsCache —
+//     see countProvisionedPods below).
+//  3. If below target: eagerly specializes delta pods via gpm.GetFuncSvc,
+//     paced by MaxInflightPerFunction. Each successfully specialized pod
+//     gets the fission.io/provisioned label (reaper exemption).
+//  4. If above target (target dropped): clears fission.io/provisioned from
+//     excess pods so the idle reaper can retire them (invariant P4: no
+//     immortal pods).
+//  5. Updates FunctionStatus.ProvisionedReady / ProvisionedTarget.
+//
+// The provisioner reuses gpm.GetFuncSvc — the full cold-start flow — so eager
+// pods are byte-identical to on-demand pods: same cache entries, same headless
+// Service membership, same router EndpointSlice visibility. Zero router changes.
+//
+// Provisioned concurrency targets the function's LATEST generation only
+// (RFC-0025): listPods/countProvisionedPods filter on the live Function's
+// current fv1.FUNCTION_GENERATION, so a stale-generation pod left behind by a
+// function update never counts toward ready and never blocks warming the new
+// generation. Keeping an older generation warm for versioned/alias traffic
+// (a FunctionAlias still pinned to a prior FunctionVersion) is NOT this
+// provisioner's job — that pinning is the idle reaper's alias-retention
+// concern (pkg/executor/reaper/idle + versionretain.View.Retained), which
+// exempts a retained (uid, generation) pair from reaping independent of the
+// fission.io/provisioned label. Label-clearing paths (clearProvisionedLabels,
+// disableProvisioningLocked) deliberately do NOT filter by generation — see
+// their doc comments.
+type Provisioner struct {
+	logger           logr.Logger
+	gpm              funcSvcGetter
+	fissionClient    versioned.Interface
+	kubernetesClient kubernetes.Interface
+	crClient         client.Client
+	config           ProvisionerConfig
+
+	// inflight tracks the number of in-flight eager specializations per
+	// function UID. Used by tryAcquire/release to pace warm-up and prevent
+	// head-of-line blocking (invariant P5).
+	inflight sync.Map // map[types.UID]*atomic.Int32
+
+	reconcileLocks sync.Map // map[types.UID]*sync.Mutex
+
+	timers sync.Map // map[types.UID]*fnSchedule
+}
+
+// lockFor returns the per-function reconcile lock for fnUID, creating it on
+// first use. Callers MUST resolve it exactly once per critical section and
+// reuse the returned *sync.Mutex for both Lock and the deferred Unlock —
+// e.g. `lock := p.lockFor(fn.UID); lock.Lock(); defer lock.Unlock()`.
+//
+// A second lookup (such as calling lockFor again for the Unlock) is unsafe:
+// forget(fnUID) deletes the map entry on the Function-delete path, and a
+// concurrent lockFor after that delete LoadOrStores a brand-new, never-locked
+// mutex. Unlocking that fresh mutex is a fatal "sync: unlock of unlocked
+// mutex" — this crashed the executor process (see provisioner.go history).
+func (p *Provisioner) lockFor(fnUID types.UID) *sync.Mutex {
+	lock, _ := p.reconcileLocks.LoadOrStore(fnUID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (p *Provisioner) scheduleFor(fn *fv1.Function) *fnSchedule {
+	sched, _ := p.timers.LoadOrStore(fn.UID, &fnSchedule{name: fn.Name, namespace: fn.Namespace})
+	return sched.(*fnSchedule)
+}
+
+func (p *Provisioner) armTransition(fn *fv1.Function) {
+	if fn.Spec.ProvisionedConcurrency == nil {
+		return
+	}
+	sched := p.scheduleFor(fn)
+	sched.mu.Lock()
+	var next time.Time
+	defer sched.mu.Unlock()
+	now := time.Now()
+	needsRebuild := (sched.generation != fn.Generation) || (len(sched.windows) == 0)
+	if !needsRebuild {
+		for _, pw := range sched.windows {
+			if pw == nil || pw.capped {
+				continue
+			}
+			edge := pw.activeUntil
+			if edge.IsZero() {
+				edge = pw.nextOpen
+			}
+			if !edge.After(now) {
+				needsRebuild = true
+				break
+			}
+		}
+	}
+	if needsRebuild {
+		sched.reBuildWindows(fn, p.logger)
+		sched.generation = fn.Generation
+	}
+	for _, pw := range sched.windows {
+		if pw == nil || pw.capped {
+			continue
+		}
+		var candidate time.Time
+		if pw.activeUntil.IsZero() {
+			candidate = pw.nextOpen
+		} else {
+			candidate = pw.activeUntil
+		}
+		if next.IsZero() || candidate.Before(next) {
+			next = candidate
+		}
+	}
+	if next.IsZero() || !next.After(now) {
+		return
+	}
+	// Floor the delay: a window whose cron fires about as often as its duration
+	// (e.g. start "* * * * * *", duration "2s") otherwise re-arms roughly every
+	// second, and each firing runs a full reconcileFunction — a pod LIST plus an
+	// unconditional status write — outside both ReconcileInterval and the
+	// maxConcurrentReconciles semaphore.
+	const minTransitionDelay = 10 * time.Second
+	delay := max(time.Until(next), minTransitionDelay)
+	if sched.timer == nil {
+		name, namespace := fn.Name, fn.Namespace
+		sched.timer = time.AfterFunc(delay, func() {
+			ctx := context.Background()
+			latest, err := p.fissionClient.CoreV1().Functions(namespace).Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				p.logger.Error(err, "error fetching latest function", "function", name, "namespace", namespace)
+				return
+			}
+			executorType := latest.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType
+			if latest.Spec.ProvisionedConcurrency == nil || (executorType != fv1.ExecutorTypePoolmgr && executorType != "") {
+				p.logger.Info("provisioned concurrency no longer applies to this function", "function", name, "namespace", namespace, "executorType", executorType)
+				return
+			}
+			p.reconcileFunction(ctx, latest)
+			metrics.RecordProvisionedWindowTransition(ctx, name, namespace)
+		})
+	} else {
+		sched.timer.Reset(delay)
+	}
+}
+
+// ProvisionerConfigFromEnv builds ProvisionerConfig from
+// EXECUTOR_PROVISIONED_* env vars.
+// Returns (zero, false, nil) when EXECUTOR_PROVISIONED_CONCURRENCY_ENABLED is
+// unset or explicitly false. Returns (zero, false, err) when the env var is set
+// to an unparseable value (e.g. "yes", "on", "1-with-typo") so the caller can
+// log the silent-disable cause rather than treating it as "feature off".
+func ProvisionerConfigFromEnv() (ProvisionerConfig, bool, error) {
+	v := os.Getenv("EXECUTOR_PROVISIONED_CONCURRENCY_ENABLED")
+	if v == "" {
+		return ProvisionerConfig{}, false, nil
+	}
+	enabled, err := strconv.ParseBool(v)
+	if err != nil {
+		return ProvisionerConfig{}, false, fmt.Errorf("EXECUTOR_PROVISIONED_CONCURRENCY_ENABLED=%q: %w", v, err)
+	}
+	if !enabled {
+		return ProvisionerConfig{}, false, nil
+	}
+	cfg := ProvisionerConfig{
+		MaxPerFunction:         util.AtoiOr("EXECUTOR_PROVISIONED_MAX_PER_FUNCTION", 20),
+		MaxInflightPerFunction: util.AtoiOr("EXECUTOR_PROVISIONED_MAX_INFLIGHT_PER_FUNCTION", 4),
+		ReconcileInterval:      util.DurOr("EXECUTOR_PROVISIONED_RECONCILE_INTERVAL", 30*time.Second),
+	}
+	return cfg, true, nil
+}
+
+func NewProvisioner(
+	logger logr.Logger,
+	gpm funcSvcGetter,
+	fissionClient versioned.Interface,
+	kubernetesClient kubernetes.Interface,
+	crClient client.Client,
+	config ProvisionerConfig,
+) *Provisioner {
+	// Warn on silent-disable footguns: MaxPerFunction=0 makes
+	// effectiveTarget always 0 (no function ever warms); MaxInflightPerFunction=0
+	// makes tryAcquire always reject (no eager specialization ever admitted).
+	// Both leave the feature nominally "on" but actuating nothing.
+	if config.MaxPerFunction <= 0 {
+		logger.Info("EXECUTOR_PROVISIONED_MAX_PER_FUNCTION is non-positive; provisioned concurrency will never warm any function",
+			"maxPerFunction", config.MaxPerFunction)
+	}
+	if config.MaxInflightPerFunction <= 0 {
+		logger.Info("EXECUTOR_PROVISIONED_MAX_INFLIGHT_PER_FUNCTION is non-positive; tryAcquire will reject every eager specialization",
+			"maxInflightPerFunction", config.MaxInflightPerFunction)
+	}
+	return &Provisioner{
+		logger:           logger,
+		gpm:              gpm,
+		fissionClient:    fissionClient,
+		kubernetesClient: kubernetesClient,
+		crClient:         crClient,
+		config:           config,
+		inflight:         sync.Map{},
+		reconcileLocks:   sync.Map{},
+		timers:           sync.Map{},
+	}
+}
+
+// Run starts the provisioner's reconcile loop. A non-positive
+// ReconcileInterval is clamped to 30s to avoid time.NewTicker panic.
+func (p *Provisioner) Run(ctx context.Context) {
+	interval := p.config.ReconcileInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	p.reconcileAll(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.reconcileAll(ctx)
+		}
+	}
+}
+
+func filterOptedFunctions(fnlist *fv1.FunctionList) []fv1.Function {
+	var opted []fv1.Function
+	for _, fn := range fnlist.Items {
+		et := fn.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType
+		if fn.Spec.ProvisionedConcurrency != nil && (et == fv1.ExecutorTypePoolmgr || et == "") {
+			opted = append(opted, fn)
+		}
+	}
+	return opted
+}
+
+// lists all functions and filters only those with
+// fn.Spec.ProvisionedConcurrency and
+// fn.Spec.InvokeStragey.ExecutionStrategy.ExecutorType==poolmgr
+func (p *Provisioner) reconcileAll(ctx context.Context) {
+	fnList := &fv1.FunctionList{}
+	// list all functions
+	err := p.crClient.List(ctx, fnList)
+	if err != nil {
+		p.logger.Error(err, "Unable to fetch functions")
+		return
+	}
+	// filter only functions which have ProvisionedConcurrency and ExecutorType=poolmgr
+	opted := filterOptedFunctions(fnList)
+
+	// if no functions have opted in, return immediately.
+	if len(opted) == 0 {
+		return
+	}
+
+	// maxConcurrentReconciles bounds per-pass parallelism of reconcileFunction.
+	// 10 is a fixed sanity cap chosen to keep the provisioner's burst load on
+	// the API server (eagerSpecialize pod patches + status writes) predictable
+	// at the default 30s ReconcileInterval; raising it is a future tuning knob
+	// once we have metrics-driven evidence it's too low.
+	const maxConcurrentReconciles = 10
+	sem := make(chan struct{}, maxConcurrentReconciles)
+	var wg sync.WaitGroup
+	for _, fn := range opted {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			p.reconcileFunction(ctx, &fn)
+		})
+	}
+	wg.Wait()
+}
+
+func (p *Provisioner) reconcileFunction(ctx context.Context, fn *fv1.Function) {
+	lock := p.lockFor(fn.UID)
+	lock.Lock()
+	defer lock.Unlock()
+	p.reconcileFunctionLocked(ctx, fn)
+}
+
+// reconcileFunctionLocked is the body of reconcileFunction. The caller
+// MUST hold the per-function reconcile lock (lockFor(fn.UID)).
+func (p *Provisioner) reconcileFunctionLocked(ctx context.Context, fn *fv1.Function) {
+	target := p.effectiveTarget(fn)
+	p.armTransition(fn)
+	if target == 0 {
+		p.disableProvisioningLocked(ctx, fn)
+		return
+	}
+
+	ready, err := p.countProvisionedPods(ctx, fn)
+	if err != nil {
+		p.logger.Error(err, "Unable to get count of provisioned pods", "function", fn.Name, "namespace", fn.Namespace)
+		return
+	}
+	if ready < target {
+		delta := target - ready
+		p.fireEagerSpecializations(ctx, fn, delta)
+	} else if ready > target {
+		excess := ready - target
+		p.clearProvisionedLabels(ctx, fn, excess)
+	}
+
+	// Publish observed status on every pass so ProvisionedReady and the
+	// Provisioned=Warming condition surface during warm-up/drain, not only
+	// once ready == target.
+	specTarget := fn.Spec.ProvisionedConcurrency.Target
+	if err := p.updateFunctionStatus(ctx, fn, ready, target, specTarget); err != nil {
+		p.logger.Error(err, "Unable to update status of the function", "function", fn.Name, "namespace", fn.Namespace, "ready", ready, "target", target)
+	}
+}
+
+// provisionedPodLabels builds the label selector shared by every provisioned-
+// pod list in this file. includeGeneration additionally requires
+// fv1.FUNCTION_GENERATION to equal fn's current generation, restricting
+// matches to pods specialized for the LIVE generation only.
+//
+// includeGeneration=true is for the count/list-for-target path
+// (countProvisionedPods): a function update bumps fn.Generation, so
+// pods specialized under the previous generation stop matching and stop
+// counting toward the target — the provisioner immediately starts warming
+// the new generation instead of treating stale pods as already-satisfying
+// it.
+//
+// includeGeneration=false is for the label-clearing paths
+// (clearProvisionedLabels, disableProvisioningLocked): they must find
+// provisioned pods from EVERY generation, including generations the live
+// Function object no longer describes. If clearing were also
+// generation-filtered, a stale-generation pod's fission.io/provisioned label
+// would never be found again once its generation aged out of the selector —
+// leaking the label (and, once a future per-pod reaper check replaces
+// idle.go's current per-function exemption, leaking reaper-exemption too).
+func provisionedPodLabels(fn *fv1.Function, includeGeneration bool) map[string]string {
+	labelMap := map[string]string{
+		fv1.FUNCTION_UID:      string(fn.UID),
+		fv1.SERVED_LABEL:      fv1.SERVED_VALUE,
+		fv1.PROVISIONED_LABEL: fv1.PROVISIONED_VALUE,
+	}
+	if includeGeneration {
+		labelMap[fv1.FUNCTION_GENERATION] = strconv.FormatInt(fn.Generation, 10)
+	}
+	return labelMap
+}
+
+func (p *Provisioner) listPods(ctx context.Context, fn *fv1.Function, includeGeneration bool) (corev1.PodList, error) {
+	podList := corev1.PodList{}
+	err := p.crClient.List(
+		ctx,
+		&podList,
+		client.MatchingLabels(provisionedPodLabels(fn, includeGeneration)),
+	)
+	if err != nil {
+		return podList, err
+	}
+	return podList, nil
+}
+
+func (p *Provisioner) clearProvisionedLabel(ctx context.Context, pod *corev1.Pod) error {
+	patch := fmt.Sprintf(`{"metadata":{"labels":{"%s":null}}}`, fv1.PROVISIONED_LABEL)
+	_, err := p.kubernetesClient.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+	return err
+}
+
+// clearProvisionedLabels removes the "max" number of provisioned label from the oldest pods of the given function.
+// to clear all provisioned labels, set max to -1.
+//
+// Lists across ALL generations (see provisionedPodLabels), not just the
+// live one: a stale-generation pod's provisioned label must still be
+// reachable for clearing, most importantly via disableProvisioningLocked's
+// max=-1 call when ProvisionedConcurrency is removed from the spec — that
+// call must clear every provisioned pod the function ever had, not just
+// pods at its current generation.
+func (p *Provisioner) clearProvisionedLabels(ctx context.Context, fn *fv1.Function, max int) {
+	podList, err := p.listPods(ctx, fn, false)
+	if err != nil {
+		p.logger.Error(err, "Unable to list pods", "function", fn.Name, "namespace", fn.Namespace)
+		return
+	}
+	if len(podList.Items) == 0 {
+		return
+	}
+	sort.Slice(podList.Items, func(i, j int) bool {
+		return podList.Items[i].CreationTimestamp.Before(&podList.Items[j].CreationTimestamp)
+	})
+	if max < 0 {
+		max = len(podList.Items)
+	}
+	if max > len(podList.Items) {
+		max = len(podList.Items)
+	}
+	for i := 0; i < max; i++ {
+		if err := p.clearProvisionedLabel(ctx, &podList.Items[i]); err != nil {
+			p.logger.Error(err, "Unable to clear provisioned label", "pod", podList.Items[i].Name, "namespace", podList.Items[i].Namespace)
+		}
+	}
+}
+
+func (p *Provisioner) tryAcquire(fnUID types.UID) bool {
+	v, _ := p.inflight.LoadOrStore(fnUID, new(atomic.Int32))
+	count := v.(*atomic.Int32)
+	if count.Add(1) <= int32(p.config.MaxInflightPerFunction) {
+		return true
+	}
+	count.Add(-1) // rollback: rejected acquire must not hold a slot
+	return false
+}
+
+func (p *Provisioner) release(fnUID types.UID) {
+	v, ok := p.inflight.Load(fnUID)
+	if !ok {
+		return
+	}
+	v.(*atomic.Int32).Add(-1)
+}
+
+func (p *Provisioner) fireEagerSpecializations(ctx context.Context, fn *fv1.Function, delta int) {
+	for range delta {
+		if !p.tryAcquire(fn.UID) {
+			break
+		}
+		go func() {
+			defer p.release(fn.UID)
+			if err := p.eagerSpecialize(ctx, fn); err != nil {
+				p.logger.Error(err, "eager specialization failed", "namespace", fn.Namespace, "function", fn.Name)
+			}
+		}()
+	}
+}
+
+func (p *Provisioner) eagerSpecialize(ctx context.Context, fn *fv1.Function) error {
+	funSvc, err := p.gpm.GetFuncSvc(ctx, fn)
+	if err != nil {
+		metrics.RecordEagerSpecialization(ctx, fn.Name, fn.Namespace, "error")
+		return err
+	}
+	if funSvc == nil {
+		p.logger.Error(nil, "eager specialization failed, funcSvc is nil", "namespace", fn.Namespace, "function", fn.Name)
+		return fmt.Errorf("funSvc is nil")
+	}
+	if funSvc.Function != nil {
+		defer p.gpm.UnTapService(ctx, funSvc.Function, funSvc.Address)
+	}
+	for _, obj := range funSvc.KubernetesObjects {
+		// gp.go builds kubeObjRefs with Kind "pod" (lowercase), so match
+		// case-insensitively rather than relying on canonical capitalization.
+		if strings.EqualFold(obj.Kind, "Pod") {
+			patch := fmt.Sprintf(`{"metadata":{"labels":{"%s":"%s"}}}`,
+				fv1.PROVISIONED_LABEL, fv1.PROVISIONED_VALUE)
+			_, err := p.kubernetesClient.CoreV1().Pods(obj.Namespace).Patch(
+				ctx, obj.Name, types.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{},
+			)
+			if err == nil {
+				metrics.RecordEagerSpecialization(ctx, fn.Name, fn.Namespace, "success")
+			}
+			if err != nil {
+				// Pod is specialized and serving, just not reaper-exempt.
+				// Next tick will see it as a non-provisioned served pod and
+				// may re-specialize. Accept the race — the provisioner
+				// re-specializes on the next tick.
+				p.logger.Error(err, "provisioned label patch failed (pod is serving, not exempt)", "pod", obj.Name)
+				metrics.RecordEagerSpecialization(ctx, fn.Name, fn.Namespace, "error")
+			}
+		}
+	}
+	return nil
+}
+
+// countProvisionedPods counts ready+running provisioned pods at fn's
+// CURRENT generation only (see provisionedPodLabels) — provisioned
+// concurrency targets the latest generation; see the Provisioner doc
+// comment.
+func (p *Provisioner) countProvisionedPods(ctx context.Context, fn *fv1.Function) (int, error) {
+	podList, err := p.listPods(ctx, fn, true)
+	if err != nil {
+		return 0, err
+	}
+	readyAndRunningPods := utils.ReadyAndRunningPodsFilter(&podList)
+	if len(readyAndRunningPods) < len(podList.Items) {
+		p.logger.V(1).Info("provisioned pod count: some pods not ready+running",
+			"totalPods", len(podList.Items),
+			"readyAndRunning", len(readyAndRunningPods),
+			"function", fn.Name)
+	}
+	return len(readyAndRunningPods), nil
+}
+
+func statusSet(latestFunc *fv1.Function, ready, target, specTarget int) {
+	latestFunc.Status.ProvisionedReady = ready
+	latestFunc.Status.ProvisionedTarget = target
+	latestFunc.Status.ProvisionedSpecTarget = specTarget
+	if target == 0 {
+		// Provisioned concurrency is off (target=0): condition False,
+		// regardless of ready count (which should also be 0).
+		meta.SetStatusCondition(&latestFunc.Status.Conditions, metav1.Condition{
+			Type:               fv1.FunctionConditionProvisioned,
+			Status:             metav1.ConditionFalse,
+			Reason:             fv1.FunctionReasonProvisionedDisabled,
+			ObservedGeneration: latestFunc.Generation,
+		})
+		return
+	}
+	// Determine the reason: clamped takes precedence (surfaces the
+	// spec-vs-effective divergence), then satisfied/warming.
+	clamped := specTarget > target
+	msg := ""
+	if clamped {
+		msg = fmt.Sprintf("spec target %d exceeds the namespace cap; effective target clamped to %d", specTarget, target)
+	}
+	if ready >= target {
+		meta.SetStatusCondition(&latestFunc.Status.Conditions, metav1.Condition{
+			Type:               fv1.FunctionConditionProvisioned,
+			Status:             metav1.ConditionTrue,
+			Reason:             reasonForProvisioned(clamped, fv1.FunctionReasonProvisionedSatisfied),
+			Message:            msg,
+			ObservedGeneration: latestFunc.Generation,
+		})
+	} else {
+		meta.SetStatusCondition(&latestFunc.Status.Conditions, metav1.Condition{
+			Type:               fv1.FunctionConditionProvisioned,
+			Status:             metav1.ConditionFalse,
+			Reason:             reasonForProvisioned(clamped, fv1.FunctionReasonProvisionedWarming),
+			Message:            msg,
+			ObservedGeneration: latestFunc.Generation,
+		})
+	}
+}
+
+// reasonForProvisioned returns ProvisionedClamped when the target was
+// clamped by the namespace cap, otherwise the base reason (Satisfied or
+// Warming). The condition Status (True/False) still reflects
+// ready-vs-target; the Reason surfaces the clamp so `fission fn get`
+// can show why spec says 50 but status says 20.
+func reasonForProvisioned(clamped bool, base string) string {
+	if clamped {
+		return fv1.FunctionReasonProvisionedClamped
+	}
+	return base
+}
+
+func (p *Provisioner) updateFunctionStatus(ctx context.Context, fn *fv1.Function, ready, target, specTarget int) error {
+	metrics.RecordProvisionedTarget(ctx, fn.Name, fn.Namespace, int64(target))
+	metrics.RecordProvisionedReady(ctx, fn.Name, fn.Namespace, int64(ready))
+	backoff := retry.DefaultRetry
+	return retry.RetryOnConflict(backoff, func() error {
+		latestFunc, err := p.fissionClient.CoreV1().Functions(fn.Namespace).Get(ctx, fn.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		statusSet(latestFunc, ready, target, specTarget)
+		_, err = p.fissionClient.CoreV1().Functions(fn.Namespace).UpdateStatus(ctx, latestFunc, metav1.UpdateOptions{})
+		return err
+	})
+}
+
+// effectiveTarget resolves the function's effective provisioned target via
+// effectiveTargetAt (base Target, overridden by any active schedule window),
+// logs any windows that failed to evaluate, and clamps to the namespace-wide
+// MaxPerFunction cap.
+func (p *Provisioner) effectiveTarget(fn *fv1.Function) int {
+	target, errs := effectiveTargetAt(fn.Spec.ProvisionedConcurrency, time.Now())
+	if len(errs) > 0 {
+		for _, e := range errs {
+			p.logger.Error(e, "provisioned concurrency window evaluation failed", "function", fn.Name, "namespace", fn.Namespace)
+		}
+	}
+	return min(target, p.config.MaxPerFunction)
+}
+
+// disableProvisioning clears all provisioned labels, zeroes the function's
+// provisioned status, and drops the in-flight specialization counter. Called
+// when PC is removed from the spec (reconciler.go event path). Takes the
+// per-function reconcile lock. Not called on Function delete — there the
+// status write would race the delete, so DeleteFunction calls
+// clearProvisionedLabels directly.
+func (p *Provisioner) disableProvisioning(ctx context.Context, fn *fv1.Function) {
+	lock := p.lockFor(fn.UID)
+	lock.Lock()
+	defer lock.Unlock()
+	p.disableProvisioningLocked(ctx, fn)
+}
+
+// disableProvisioningLocked is the body of disableProvisioning. The caller
+// MUST hold the per-function reconcile lock (lockFor(fn.UID)).
+func (p *Provisioner) disableProvisioningLocked(ctx context.Context, fn *fv1.Function) {
+	p.clearProvisionedLabels(ctx, fn, -1)
+	p.inflight.Delete(fn.UID)
+	if fn.Spec.ProvisionedConcurrency == nil {
+		if v, ok := p.timers.Load(fn.UID); ok {
+			sched := v.(*fnSchedule)
+			sched.mu.Lock()
+			if sched.timer != nil {
+				sched.timer.Stop()
+			}
+			sched.mu.Unlock()
+		}
+		p.timers.Delete(fn.UID)
+	}
+	if err := p.updateFunctionStatus(ctx, fn, 0, 0, 0); err != nil {
+		p.logger.Error(err, "Unable to update status of the function",
+			"function", fn.Name, "namespace", fn.Namespace)
+	}
+}
+
+// forget frees the per-function map entries (reconcileLocks, inflight) for a
+// deleted function. Called from DeleteFunction to prevent unbounded growth
+// under function churn. No status write — the Function object is being removed.
+func (p *Provisioner) forget(fnUID types.UID) {
+	p.reconcileLocks.Delete(fnUID)
+	p.inflight.Delete(fnUID)
+	if v, ok := p.timers.Load(fnUID); ok {
+		sched := v.(*fnSchedule)
+		sched.mu.Lock()
+		if sched.timer != nil {
+			sched.timer.Stop()
+		}
+		sched.mu.Unlock()
+	}
+	p.timers.Delete(fnUID)
+}

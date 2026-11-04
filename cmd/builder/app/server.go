@@ -13,6 +13,7 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	hmacauth "github.com/fission/fission/pkg/auth/hmac"
 	builder "github.com/fission/fission/pkg/builder"
 	"github.com/fission/fission/pkg/svcinfo"
@@ -22,7 +23,28 @@ import (
 
 // Usage: builder <shared volume path>
 func Run(ctx context.Context, logger logr.Logger, mgr *errgroup.Group, shareVolume string) {
-	builder := builder.MakeBuilder(logger, shareVolume)
+	// Fail closed on a present-but-empty internal-auth key before the
+	// build-endpoint verifier is constructed from it. Run has no error
+	// return; exiting matches how the surrounding startup treats a
+	// configuration this broken.
+	if err := fv1.ValidateInternalAuthEnv(); err != nil {
+		logger.Error(err, "invalid internal-auth environment")
+		os.Exit(1)
+	}
+	// MAX_PARALLEL_BUILDS bounds the number of builds this pod runs at once.
+	// Defaults to 1 (serial), preserving the pre-concurrency behavior.
+	maxParallelBuilds := 1
+	if v := os.Getenv("MAX_PARALLEL_BUILDS"); v != "" {
+		if val, err := strconv.Atoi(v); err != nil {
+			logger.Info("invalid MAX_PARALLEL_BUILDS, defaulting to 1", "value", v, "error", err.Error())
+		} else if val < 1 {
+			logger.Info("MAX_PARALLEL_BUILDS must be greater than 0, defaulting to 1", "value", val)
+		} else {
+			maxParallelBuilds = val
+		}
+	}
+
+	builder := builder.MakeBuilder(logger, shareVolume, maxParallelBuilds)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", builder.Handler)
 	mux.HandleFunc("/clean", builder.Clean)

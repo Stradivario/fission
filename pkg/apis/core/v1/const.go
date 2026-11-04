@@ -4,6 +4,10 @@
 
 package v1
 
+import (
+	"net/url"
+)
+
 var (
 	MinimumKubernetesVersion = [3]int{1, 32, 0}
 )
@@ -24,6 +28,29 @@ const (
 )
 
 const (
+	// DefaultInternalAuthSecret is the chart's master-bearing Secret. It is the
+	// DEFAULT, not a fixed fact: an operator may point the chart at a
+	// pre-created Secret instead (internalAuth.existingSecret), which is the
+	// supported path for GitOps renderers, where the chart's lookup-based
+	// preservation of a generated value cannot work.
+	//
+	// Read it through InternalAuthSecretName, not this constant directly — see
+	// that function's doc for why two components must agree on the name.
+	DefaultInternalAuthSecret = "fission-internal-auth"
+
+	// InternalAuthSecretNameEnv overrides DefaultInternalAuthSecret. The chart
+	// sets it on every component that resolves the master.
+	InternalAuthSecretNameEnv = "FISSION_INTERNAL_AUTH_SECRET_NAME"
+
+	// InternalAuthSecretEnv and InternalAuthSecretOldEnv carry the
+	// internal-auth HMAC master (and, during rotation, the previous master),
+	// injected by the chart via secretKeyRef (internalAuth.envs). Readers may
+	// Getenv them freely: ValidateInternalAuthEnv rejects the
+	// present-but-empty state at every binary's entry point, so past startup
+	// an empty read can only mean "absent" (internal auth disabled).
+	InternalAuthSecretEnv    = "FISSION_INTERNAL_AUTH_SECRET"
+	InternalAuthSecretOldEnv = "FISSION_INTERNAL_AUTH_SECRET_OLD"
+
 	// TenantAuthKeysSecret is the controller-owned Secret (one per tenant
 	// namespace) holding that namespace's derived HMAC keys. It is deliberately
 	// a DIFFERENT name from the chart's master-bearing "fission-internal-auth":
@@ -87,12 +114,38 @@ const (
 	ArchiveTypeOCI ArchiveType = "oci"
 )
 
+// StorageServiceArchivePath is the exact URL path at which storagesvc serves
+// archives (the archive id travels as the `id` query param, so the path never
+// has a sub-segment). It is the single classifier for "this URL targets our
+// own storage service" — the fetcher signs those requests with internal HMAC
+// and admission forbids attaching external SecretRef credentials to them.
+// Kept in one place so the runtime and admission classifications cannot drift.
+const StorageServiceArchivePath = "/v1/archive"
+
+// IsStorageServiceURL reports whether rawURL targets the internal storage
+// service. The host is deliberately not matched — it depends on service name,
+// namespace, and port-forwarding — so the path is the classifier, and it is
+// matched EXACTLY: storagesvc registers only `/v1/archive` (id as a query
+// param), so a legitimate external artifact server whose path merely begins
+// with that (e.g. https://repo.example.com/v1/archive/app.zip) is correctly
+// treated as external. An unparseable URL is treated as NOT storagesvc:
+// signing an external/garbage URL with internal credentials is the worse
+// failure (exfiltration), so both the fetcher's client selection and
+// admission fail open to "external, unsigned" here.
+func IsStorageServiceURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return parsed.Path == StorageServiceArchivePath
+}
+
 const (
-	BuildStatusPending   = "pending"
-	BuildStatusRunning   = "running"
-	BuildStatusSucceeded = "succeeded"
-	BuildStatusFailed    = "failed"
-	BuildStatusNone      = "none"
+	BuildStatusPending   BuildStatus = "pending"
+	BuildStatusRunning   BuildStatus = "running"
+	BuildStatusSucceeded BuildStatus = "succeeded"
+	BuildStatusFailed    BuildStatus = "failed"
+	BuildStatusNone      BuildStatus = "none"
 )
 
 const (
@@ -115,6 +168,35 @@ const (
 	ExecutorTypeContainer ExecutorType = "container"
 )
 
+// RFC-0025 function versioning modes.
+const (
+	VersioningModeAuto   VersioningMode = "auto"
+	VersioningModeManual VersioningMode = "manual"
+)
+
+// RFC-0023 keyed-state defaults and sticky-routing sources.
+const (
+	StickySourceHeader     StickySource = "header"
+	StickySourceQueryParam StickySource = "queryparam"
+
+	// DefaultStateMaxValueBytes caps a single state value when
+	// StateConfig.MaxValueBytes is unset (256KiB; blobs belong in object
+	// storage).
+	DefaultStateMaxValueBytes int64 = 262144
+
+	// MaxStateMaxValueBytes is the hard ceiling a tenant may set
+	// FunctionSpec.State.MaxValueBytes to (4MiB, 16x the default). It bounds the
+	// amplification the /v1/eventlog/append body cap derives from MaxValueBytes
+	// (MaxAppendEvents * MaxValueBytes * 4/3), so no single tenant can force the
+	// shared statesvc to size an unbounded request body — blobs belong in object
+	// storage, not a state value.
+	MaxStateMaxValueBytes int64 = 4 << 20
+
+	// DefaultStateMaxKeys caps a keyspace's live keys when
+	// StateConfig.MaxKeys is unset.
+	DefaultStateMaxKeys int64 = 10000
+)
+
 const (
 	StrategyTypeExecution = "execution"
 )
@@ -135,6 +217,9 @@ const (
 
 const (
 	MessageQueueTypeKafka = "kafka"
+	// MessageQueueTypeStatestore is the RFC-0027 built-in provider: topics are
+	// EventLog streams on the RFC-0021 statestore — no external broker.
+	MessageQueueTypeStatestore = "statestore"
 )
 
 const (
@@ -143,6 +228,12 @@ const (
 	FunctionReferenceTypeFunctionName = "name"
 
 	FunctionReferenceTypeFunctionWeights = "function-weights"
+
+	// FunctionReferenceTypeWorkflow targets a Workflow (same namespace) by
+	// name instead of a function: an HTTPTrigger or TimeTrigger firing it
+	// creates a WorkflowRun (the request body / the trigger's workflowInput
+	// is the run input). Only HTTP and time triggers accept it.
+	FunctionReferenceTypeWorkflow = "workflow"
 
 	// Other function reference types we'd like to support:
 	//   Versioned function, latest version
@@ -194,11 +285,35 @@ const (
 
 	// RFC-0002 EndpointSlice-native data plane labels.
 	//
+	// ENVIRONMENT_RUNTIME_HASH labels a pool pod template (and hence its
+	// ReplicaSets and pods) with a hash of exactly the Environment inputs the
+	// template is generated from (poolmgr's envRuntimeHash). processRS and
+	// the adopt pass compare it against the live Environment to distinguish
+	// "the env's RUNTIME changed -> recycle specialized pods" from
+	// "executor-side template roll (fetcher image/config) -> keep them".
+	//
+	// A hash of the template inputs, deliberately NOT metadata.generation:
+	// generation moves on every spec write, including poolsize — a pure
+	// replica scale — and keying on it recycled every warm pod on the exact
+	// operation operators perform under load.
+	//
+	// It must NEVER be added to the pool Deployment's selector labels
+	// (getEnvironmentPoolLabels): selectors are immutable, so a
+	// hash-bearing selector would fail every env update with
+	// "field is immutable". Template labels only.
+	ENVIRONMENT_RUNTIME_HASH = "fission.io/env-runtime-hash"
+
 	// FUNCTION_GENERATION labels a specialized pool pod with the Function
 	// generation it was specialized from. The per-function Service selector
 	// includes it so stale-generation pods drop out of the EndpointSlices on a
-	// function update (the executor-side equivalent is CacheKeyURG keying).
+	// function update (the executor-side equivalent is CacheKeyUG keying).
 	FUNCTION_GENERATION = "fission.io/function-generation"
+	// FUNCTION_VERSION labels a Function with the published FunctionVersion
+	// name it was specialized from (RFC-0025 phase 3). Empty for every
+	// function until versioned routing lands; carried in
+	// pkg/router/functionServiceMap.go's metadataKey now so the key's shape
+	// doesn't change twice.
+	FUNCTION_VERSION = "fission.io/function-version"
 	// SERVED_LABEL gates a specialized pod's membership in its function
 	// Service: pool pods pass readiness probes before specialization, so the
 	// label is set only by the post-specialization patch — without it the
@@ -210,6 +325,12 @@ const (
 	// different files and MUST agree byte-for-byte — drift means specialized
 	// pods silently never join their Service.
 	SERVED_VALUE = "true"
+	// PROVISIONED_LABEL marks a served pod the provisioner (RFC-0026) is
+	// actively keeping warm. The idle reaper exempts these pods; the
+	// provisioner counts them toward the function's floor.
+	PROVISIONED_LABEL = "fission.io/provisioned"
+	// PROVISIONED_VALUE is PROVISIONED_LABEL's only valid value.
+	PROVISIONED_VALUE = "true"
 	// MANAGED_BY_LABEL marks the Services Fission's data plane owns; the
 	// EndpointSlice controller mirrors Service labels onto slices, and the
 	// router's slice informer filters on it.
@@ -222,7 +343,60 @@ const (
 	// See Function.StrictConcurrencyEnforcement.
 	ConcurrencyEnforcementAnnotation = "fission.io/concurrency-enforcement"
 	ConcurrencyEnforcementStrict     = "strict"
+
+	// PackageAutoFollowDisabledAnnotation opts a Function out of following its
+	// Package's content changes (RFC-0029 §3). With content-keyed re-stamping,
+	// a Package whose archive or OCI digest changes recycles the pods of every
+	// Function referencing it — including deploy-only and OCI packages, which
+	// never build and so never propagated before. Set to "true" to keep the
+	// old manual roll timing.
+	//
+	// This is an escape hatch, not the pinning mechanism: to hold a function on
+	// known-good code, publish an RFC-0025 FunctionVersion and point an alias
+	// at it — a first-class object rather than a deliberately stale stamp.
+	PackageAutoFollowDisabledAnnotation = "fission.io/disable-package-auto-follow"
+
+	// RFC-0025 function version/alias ownership labels. VersionFunctionNameLabel
+	// and VersionFunctionUIDLabel are both stamped on every FunctionVersion by
+	// the publish engine (pkg/versioning). FunctionAlias objects get
+	// VersionFunctionNameLabel only — stamped by `fission alias create` and
+	// `spec apply` — never VersionFunctionUIDLabel: an alias's target Function
+	// UID is only known when the create call can Get() the Function, and
+	// stamping it conditionally would make the label's presence differ between
+	// the desired (spec-applied) and live object, defeating equality checks and
+	// causing a perpetual update loop. Name is deterministic from
+	// spec.FunctionName and always stampable, so it is the only label aliases
+	// carry. alias→function filtering stays client-side today regardless (see
+	// functionalias/list.go) because aliases created before this label existed,
+	// or by hand, would be silently dropped from a selector-based List; a
+	// phase-3 reconciler backfilling the label onto every legacy FunctionAlias
+	// is what lets that filter flip to a label selector.
+	VersionFunctionNameLabel = "fission.io/function-name"
+	VersionFunctionUIDLabel  = "fission.io/function-uid"
 )
+
+// SpecDeploymentUIDAnnotation and SpecDeploymentNameAnnotation are written by
+// `fission spec apply` to mark spec-managed objects: control-plane components
+// treat their presence as Git ownership of the object. This is a
+// control-plane contract, not just a CLI implementation detail — both
+// canaryconfigmgr (treats a spec-managed FunctionAlias as ineligible for a
+// canary rollout) and the `fission function rollback` gate (refuses to
+// repoint a spec-managed alias without --detach) key off the annotation.
+const (
+	SpecDeploymentUIDAnnotation  = "fission-uid"
+	SpecDeploymentNameAnnotation = "fission-name"
+)
+
+// IsSpecManaged reports whether annotations carries SpecDeploymentUIDAnnotation
+// -- key PRESENCE (even with an empty value) marks the object spec-managed, per
+// the control-plane contract on SpecDeploymentUIDAnnotation above. Shared by
+// every consumer of that contract (canaryconfigmgr's alias-mode canary guard,
+// `fission function rollback`'s spec-managed guard) so the presence check
+// itself only needs to be written once.
+func IsSpecManaged(annotations map[string]string) bool {
+	_, managed := annotations[SpecDeploymentUIDAnnotation]
+	return managed
+}
 
 const (
 	ANNOTATION_SVC_HOST = "svcHost"
@@ -239,8 +413,11 @@ const (
 	// Control-plane ServiceAccounts (in the install/release namespace) that need
 	// workload RBAC in each tenant namespace under dynamic tenancy. The tenant
 	// controller binds them to the *TenantWorkloadClusterRole below per namespace.
+	// FissionRouterSA is the router's data-plane SA, bound to
+	// RouterDataplaneTenantClusterRole for EndpointSlice + Service reads.
 	FissionExecutorSA   = "fission-executor"
 	FissionBuildermgrSA = "fission-buildermgr"
+	FissionRouterSA     = "fission-router"
 
 	// The *TenantWorkloadClusterRole names are the fixed-name ClusterRoles
 	// (chart-rendered only in dynamic mode) holding the per-namespace rules a
@@ -249,13 +426,15 @@ const (
 	// install-independent (dynamic tenancy is one Fission install per cluster,
 	// since it watches cluster-wide). Executor/buildermgr carry workload-management
 	// rules; fetcher/builder/fetcher-websocket carry the function-pod sidecar read
-	// rules — all single-sourced from the chart's shared partials so the static
-	// and dynamic paths cannot drift.
+	// rules; router-dataplane carries the EndpointSlice + Service read grant for
+	// the RFC-0002 warm path — all single-sourced from the chart's shared partials
+	// so the static and dynamic paths cannot drift.
 	ExecutorTenantWorkloadClusterRole         = "fission-executor-tenant-workload"
 	BuildermgrTenantWorkloadClusterRole       = "fission-buildermgr-tenant-workload"
 	FetcherTenantWorkloadClusterRole          = "fission-fetcher-tenant-workload"
 	BuilderTenantWorkloadClusterRole          = "fission-builder-tenant-workload"
 	FetcherWebsocketTenantWorkloadClusterRole = "fission-fetcher-websocket-tenant-workload"
+	RouterDataplaneTenantClusterRole          = "fission-router-dataplane-tenant"
 )
 
 const (
@@ -280,4 +459,17 @@ const (
 
 const (
 	BuilderContainerName = "builder"
+)
+
+// Labels buildermgr's EnvironmentReconciler stamps on every environment
+// builder Service/Deployment/pod. Shared here so the CLI's build watch can
+// select builder pods without importing pkg/buildermgr. Note the
+// BuilderLabelEnvNamespace value is the BUILDER namespace (where the pod
+// runs), not the Environment's own namespace.
+const (
+	BuilderLabelEnvName            = "envName"
+	BuilderLabelEnvNamespace       = "envNamespace"
+	BuilderLabelEnvResourceVersion = "envResourceVersion"
+	BuilderLabelOwner              = "owner"
+	BuilderOwnerBuilderMgr         = "buildermgr"
 )

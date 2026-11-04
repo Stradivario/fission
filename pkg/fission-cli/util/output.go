@@ -5,7 +5,8 @@
 package util
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,8 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/fission/fission/pkg/conditions"
+	"github.com/fission/fission/pkg/fission-cli/cliwrapper/cli"
+	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
 )
 
 // NoneValue is rendered in a status column when a controller has not yet
@@ -47,10 +50,19 @@ func ParseOutputFormat(s string) (OutputFormat, error) {
 
 // encode marshals v as JSON or YAML. It is the structured half of the printer,
 // kept pure (no stdout) so it is straightforward to unit test.
-func encode(format OutputFormat, v any) ([]byte, error) {
+func encode[T any](format OutputFormat, v T) ([]byte, error) {
 	switch format {
 	case OutputJSON:
-		return json.MarshalIndent(v, "", "  ")
+		// Lenient on raw passthrough fields: fv1 objects can embed
+		// user-authored JSON (ToolConfig.InputSchema, WorkflowRun
+		// input/output) whose bytes v2 would otherwise validate — display
+		// output must render every record, never fail on one degenerate
+		// stored value. Same rationale as the executor RPC's options.
+		// Deterministic restores v1's sorted map keys: labels/annotations
+		// must not shuffle between two runs of the same command, or diffs
+		// and golden-output scripts break.
+		return json.Marshal(v, jsontext.WithIndent("  "), json.Deterministic(true),
+			jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
 	case OutputYAML:
 		return yaml.Marshal(v)
 	default:
@@ -126,7 +138,7 @@ func PrintObjects[T any](format OutputFormat, items []T, headers []string, row f
 // PrintStructured prints v as json/yaml and returns true when the format is
 // structured; for table/wide it prints nothing and returns false so describe
 // commands fall back to their own human rendering.
-func PrintStructured(format OutputFormat, v any) (bool, error) {
+func PrintStructured[T any](format OutputFormat, v T) (bool, error) {
 	switch format {
 	case OutputJSON, OutputYAML:
 		b, err := encode(format, v)
@@ -141,7 +153,7 @@ func PrintStructured(format OutputFormat, v any) (bool, error) {
 }
 
 // printBytes writes b to stdout ensuring exactly one trailing newline:
-// yaml.Marshal already appends one, json.MarshalIndent does not.
+// yaml.Marshal already appends one, indented json.Marshal does not.
 func printBytes(b []byte) {
 	_, _ = os.Stdout.Write(b)
 	if n := len(b); n == 0 || b[n-1] != '\n' {
@@ -184,4 +196,26 @@ func PrintConditionsTo(out io.Writer, conds []metav1.Condition) {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", c.Type, c.Status, c.Reason, c.Message, age)
 	}
 	w.Flush()
+}
+
+// PrintGet is the shared skeleton of a `fission <resource> get` subcommand:
+// resolve --output, render json/yaml whole-object when asked, otherwise run
+// the caller's table renderer and append the CONDITIONS block (a no-op for an
+// object with none). It returns the resolved format so a caller can gate
+// table-only extras on it (functionalias's HISTORY block). The conditioned
+// constraint rides the GetConditions accessor every CRD has, the same way
+// WaitOn's does.
+func PrintGet[T any, PT conditioned[T]](input cli.Input, obj PT, table func() error) (OutputFormat, error) {
+	format, err := ParseOutputFormat(input.String(flagkey.Output))
+	if err != nil {
+		return format, err
+	}
+	if handled, err := PrintStructured(format, obj); err != nil || handled {
+		return format, err
+	}
+	if err := table(); err != nil {
+		return format, err
+	}
+	PrintConditions(*obj.GetConditions())
+	return format, nil
 }

@@ -81,6 +81,33 @@ func (ns *TestNamespace) CLI(t *testing.T, ctx context.Context, args ...string) 
 	return buf.String()
 }
 
+// CLIExpectError runs an in-process CLI command expected to fail. Returns
+// combined stdout+stderr + the CLI error. Use for negative tests asserting
+// webhook/CEL rejection (e.g. provisionedConcurrency on newdeploy). Fatals
+// if the command unexpectedly succeeds; caller asserts the error message.
+func (ns *TestNamespace) CLIExpectError(t *testing.T, ctx context.Context, args ...string) (string, error) {
+	t.Helper()
+	ns.f.logger.Info("CLIExpectError", "ns", ns.Name, "args", args)
+	cliMu.RLock()
+	defer cliMu.RUnlock()
+	args = withNamespaceFlag(args, ns.Name)
+	c := app.App(cmd.ClientOptions{
+		RestConfig: ns.f.restConfig,
+		Namespace:  ns.Name,
+	})
+	c.SilenceErrors = true
+	c.SilenceUsage = true
+	c.SetArgs(args)
+	buf := new(bytes.Buffer)
+	c.SetOut(buf)
+	c.SetErr(buf)
+	err := c.ExecuteContext(ctx)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	return buf.String(), err
+}
+
 // CLIWithEnv runs an in-process CLI command with extra environment
 // variables set for the duration of the call. Used by tests that exercise
 // CLI flags resolved from the process environment (e.g.
@@ -137,11 +164,41 @@ func (ns *TestNamespace) CLICaptureStdoutBestEffort(t *testing.T, ctx context.Co
 	return ns.cliCaptureStdoutBoth(t, ctx, args...)
 }
 
+// CLICaptureStdoutWithEnv is the env-aware variant of CLICaptureStdout:
+// it sets extra env vars for the duration of the call (restored on return)
+// AND captures os.Stdout in addition to the cobra Out/Err buffer. Used by
+// tests that drive CLI subcommands printing via fmt.Println/os.Stdout
+// while also needing env-resolved flags (e.g. `fission fn test` reading
+// FISSION_INTERNAL_AUTH_SECRET). Holds cliMu.Lock() so concurrent CLI
+// calls don't race on the global stdout or env state.
+func (ns *TestNamespace) CLICaptureStdoutWithEnv(t *testing.T, ctx context.Context, env map[string]string, args ...string) string {
+	t.Helper()
+	out, err := ns.cliCaptureStdoutBothWithEnv(t, ctx, env, args...)
+	require.NoErrorf(t, err, "fission %s\n%s", strings.Join(args, " "), out)
+	return out
+}
+
+// CLICaptureStdoutWithEnvBestEffort is the error-returning variant of
+// CLICaptureStdoutWithEnv, for calls that are EXPECTED to fail (e.g. a state
+// write past its quota) where the test asserts on the returned error.
+func (ns *TestNamespace) CLICaptureStdoutWithEnvBestEffort(t *testing.T, ctx context.Context, env map[string]string, args ...string) (string, error) {
+	t.Helper()
+	return ns.cliCaptureStdoutBothWithEnv(t, ctx, env, args...)
+}
+
 func (ns *TestNamespace) cliCaptureStdoutBoth(t *testing.T, ctx context.Context, args ...string) (string, error) {
 	t.Helper()
-	ns.f.logger.Info("CLICaptureStdout", "ns", ns.Name, "args", args)
+	return ns.cliCaptureStdoutBothWithEnv(t, ctx, nil, args...)
+}
+
+func (ns *TestNamespace) cliCaptureStdoutBothWithEnv(t *testing.T, ctx context.Context, env map[string]string, args ...string) (string, error) {
+	t.Helper()
+	ns.f.logger.Info("CLICaptureStdout", "ns", ns.Name, "env", env, "args", args)
 	cliMu.Lock()
 	defer cliMu.Unlock()
+
+	restore := setEnvOverrides(env)
+	defer restore()
 
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()

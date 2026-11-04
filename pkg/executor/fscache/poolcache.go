@@ -49,7 +49,7 @@ type (
 	// or the channel round-trip on the tap/specialization hot path.
 	PoolCache struct {
 		lock   sync.Mutex
-		cache  map[crd.CacheKeyURG]*funcSvcGroup
+		cache  map[crd.CacheKeyUG]*funcSvcGroup
 		logger logr.Logger
 	}
 
@@ -62,7 +62,7 @@ type (
 // NewPoolCache create a Cache object
 func NewPoolCache(logger logr.Logger) *PoolCache {
 	return &PoolCache{
-		cache:  make(map[crd.CacheKeyURG]*funcSvcGroup),
+		cache:  make(map[crd.CacheKeyUG]*funcSvcGroup),
 		logger: logger,
 	}
 }
@@ -74,14 +74,21 @@ func NewFuncSvcGroup() *funcSvcGroup {
 	}
 }
 
-func (c *PoolCache) MarkFuncDeleted(function crd.CacheKeyURG) {
+// MarkFuncDeleted marks EVERY cache group belonging to the function's UID as
+// deleted, whatever Generation each group is keyed at. Multiple live
+// (UID, Generation) groups per function are the steady state under RFC-0025
+// (the latest generation plus alias-retained older generations, see
+// ListAvailableValue), so stopping at the first UID match would leave the
+// other groups unmarked on Function delete — their pods stay reaper-exempt
+// (ListAvailableValue keeps honouring the unmarked group's svcRetain floor)
+// until an executor restart.
+func (c *PoolCache) MarkFuncDeleted(function crd.CacheKeyUG) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
 	for key := range c.cache {
 		if key.UID == function.UID {
 			c.cache[key].deleted = true
-			break
 		}
 	}
 }
@@ -90,7 +97,7 @@ func (c *PoolCache) MarkFuncDeleted(function crd.CacheKeyURG) {
 // request is parked for capacity it returns a non-nil svcWait; the caller waits
 // on its channel *after* the lock is released (the matching setValue send must
 // be able to acquire the lock).
-func (c *PoolCache) getSvcValue(ctx context.Context, function crd.CacheKeyURG, requestsPerPod int, concurrency int) (*FuncSvc, *svcWait, error) {
+func (c *PoolCache) getSvcValue(ctx context.Context, function crd.CacheKeyUG, requestsPerPod int, concurrency int) (*FuncSvc, *svcWait, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -145,7 +152,7 @@ func (c *PoolCache) getSvcValue(ctx context.Context, function crd.CacheKeyURG, r
 }
 
 // GetSvcValue returns a function service with status in Active else return error
-func (c *PoolCache) GetSvcValue(ctx context.Context, function crd.CacheKeyURG, requestsPerPod int, concurrency int) (*FuncSvc, error) {
+func (c *PoolCache) GetSvcValue(ctx context.Context, function crd.CacheKeyUG, requestsPerPod int, concurrency int) (*FuncSvc, error) {
 	value, svcWaitValue, err := c.getSvcValue(ctx, function, requestsPerPod, concurrency)
 	if svcWaitValue != nil {
 		select {
@@ -175,7 +182,7 @@ func (c *PoolCache) GetSvcValue(ctx context.Context, function crd.CacheKeyURG, r
 // Exceeding either bound returns ErrorTooManyRequests, which the router
 // relays to the client as a fast 429. Sizing rationale lives on
 // poolmgr.defaultMaxPendingSpecializations.
-func (c *PoolCache) ReserveCapacity(function crd.CacheKeyURG, concurrency, maxPending int) error {
+func (c *PoolCache) ReserveCapacity(function crd.CacheKeyUG, concurrency, maxPending int) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -219,8 +226,29 @@ func (c *PoolCache) TouchByAddress(address string) error {
 	return nil
 }
 
-// ListAvailableValue returns a list of the available function services stored in the Cache
-func (c *PoolCache) ListAvailableValue() []*FuncSvc {
+// ListAvailableValue returns a list of the available function services stored
+// in the Cache. retained exempts a non-latest generation from the "drain
+// everything but the latest generation" rule below when it reports true for
+// that (UID, Generation) — the RFC-0025 "warm rollback" correction: a
+// generation a live FunctionAlias still points at must not be treated as
+// unconditionally disposable just because a newer generation exists. deleted
+// groups are unaffected by retained — a function whose CR was removed always
+// drains, alias-referenced or not. Pass nil to keep the pre-RFC-0025 behaviour
+// (every non-latest generation forced to svcRetain=0).
+//
+// Retention is asymmetric between the latest and a retained-non-latest
+// generation, and deliberately so. The latest generation's svcRetain is left
+// exactly as configured (RetainPods, possibly 0): it sits on the router's
+// live traffic path, so it self-warms — losing every pod costs one cold
+// start, then real requests refill it. A retained-but-non-latest generation
+// has NO organic traffic (the alias moved away from it), so its configured
+// svcRetain is never re-achieved once drained to 0 — a zero floor there is
+// not "less warm," it is a guaranteed cold start on the very next rollback,
+// defeating the RFC's headline promise for every function left at the CLI's
+// RetainPods=0 default. Flooring a retained-non-latest generation's
+// svcRetain at 1 keeps exactly one pod alive as insurance against that,
+// without overriding an explicit RetainPods > 1 the operator configured.
+func (c *PoolCache) ListAvailableValue(retained func(uid types.UID, gen int64) bool) []*FuncSvc {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -240,9 +268,29 @@ func (c *PoolCache) ListAvailableValue() []*FuncSvc {
 
 	for key1, values := range c.cache {
 		svcRetain := values.svcRetain
-		// if the function is not latest generation, then we don't need to retain any pods
-		if latestFuncGen[key1.UID] != key1.Generation || values.deleted {
+		// If the function is not latest generation, we don't need to retain any
+		// pods for it UNLESS a live FunctionAlias still references this exact
+		// generation (retained). deleted always forces a drain regardless — an
+		// alias pointing at a generation whose Function CR was removed has
+		// nothing left to serve.
+		isLatest := latestFuncGen[key1.UID] == key1.Generation
+		switch {
+		case values.deleted:
 			svcRetain = 0
+		case !isLatest:
+			// retained() is only meaningful (and only called) for a
+			// non-latest generation — a latest-generation entry is never
+			// drained here regardless of alias retention, so evaluating
+			// retained() for it would be discarded work on every reap tick.
+			if retained != nil && retained(key1.UID, key1.Generation) {
+				if svcRetain < 1 {
+					// See the asymmetry note above: floor at one warm pod,
+					// never lower a larger explicitly-configured RetainPods.
+					svcRetain = 1
+				}
+			} else {
+				svcRetain = 0
+			}
 		}
 		svcCleanQuota := len(values.svcs) - svcRetain
 		if svcCleanQuota <= 0 {
@@ -266,7 +314,7 @@ func (c *PoolCache) ListAvailableValue() []*FuncSvc {
 }
 
 // SetSvcValue marks the value at key [function][address] as active(begin used)
-func (c *PoolCache) SetSvcValue(ctx context.Context, function crd.CacheKeyURG, address string, value *FuncSvc, cpuLimit resource.Quantity, requestsPerPod, svcsRetain int) {
+func (c *PoolCache) SetSvcValue(ctx context.Context, function crd.CacheKeyUG, address string, value *FuncSvc, cpuLimit resource.Quantity, requestsPerPod, svcsRetain int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -310,13 +358,18 @@ func (c *PoolCache) SetSvcValue(ctx context.Context, function crd.CacheKeyURG, a
 		}
 	}
 	if c.logger.V(1).Enabled() {
-		otelUtils.LoggerWithTraceID(ctx, c.logger).V(1).Info("Increase active requests with setValue", "function", function.String(), "address", address, "activeRequests", c.cache[function].svcs[address].activeRequests)
+		otelUtils.LoggerWithTraceID(ctx, c.logger).V(1).Info("SetSvcValue",
+			"function", function.String(),
+			"address", address,
+			"uid", function.UID,
+			"generation", function.Generation,
+			"activeRequests", c.cache[function].svcs[address].activeRequests)
 	}
 	c.cache[function].svcs[address].cpuLimit = cpuLimit
 }
 
 // SetCPUUtilization updates/sets the CPU utilization limit for the pod
-func (c *PoolCache) SetCPUUtilization(function crd.CacheKeyURG, address string, cpuUsage resource.Quantity) {
+func (c *PoolCache) SetCPUUtilization(function crd.CacheKeyUG, address string, cpuUsage resource.Quantity) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -329,26 +382,34 @@ func (c *PoolCache) SetCPUUtilization(function crd.CacheKeyURG, address string, 
 }
 
 // MarkAvailable marks the value at key [function][address] as available
-func (c *PoolCache) MarkAvailable(function crd.CacheKeyURG, address string) {
+func (c *PoolCache) MarkAvailable(function crd.CacheKeyUG, address string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if _, ok := c.cache[function]; ok {
-		if _, ok = c.cache[function].svcs[address]; ok {
-			if c.cache[function].svcs[address].activeRequests > 0 {
-				c.cache[function].svcs[address].activeRequests--
-				if c.logger.V(1).Enabled() {
-					otelUtils.LoggerWithTraceID(context.Background(), c.logger).V(1).Info("Decrease active requests", "function", function.String(), "address", address, "activeRequests", c.cache[function].svcs[address].activeRequests)
-				}
-			} else {
-				otelUtils.LoggerWithTraceID(context.Background(), c.logger).Error(nil, "Invalid request to decrease active requests", "function", function.String(), "address", address, "activeRequests", c.cache[function].svcs[address].activeRequests)
-			}
+	funcSvcGroup, ok := c.cache[function]
+	if !ok {
+		return
+	}
+	svcInfo, ok := funcSvcGroup.svcs[address]
+	if !ok {
+		return
+	}
+	if svcInfo.activeRequests > 0 {
+		svcInfo.activeRequests--
+		if c.logger.V(1).Enabled() {
+			otelUtils.LoggerWithTraceID(context.Background(), c.logger).V(1).Info("MarkAvailable: decreased active requests",
+				"function", function.String(),
+				"address", address,
+				"activeRequests", svcInfo.activeRequests)
 		}
+	} else {
+		otelUtils.LoggerWithTraceID(context.Background(), c.logger).Error(nil, "MarkAvailable: invalid request to decrease active requests (already 0)",
+			"function", function.String(), "address", address)
 	}
 }
 
 // DeleteValue deletes the value at key composed of [function][address]
-func (c *PoolCache) DeleteValue(ctx context.Context, function crd.CacheKeyURG, address string) error {
+func (c *PoolCache) DeleteValue(ctx context.Context, function crd.CacheKeyUG, address string) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -362,7 +423,7 @@ func (c *PoolCache) DeleteValue(ctx context.Context, function crd.CacheKeyURG, a
 }
 
 // MarkSpecializationFailure reduces the svcWaiting count
-func (c *PoolCache) MarkSpecializationFailure(function crd.CacheKeyURG) {
+func (c *PoolCache) MarkSpecializationFailure(function crd.CacheKeyUG) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 

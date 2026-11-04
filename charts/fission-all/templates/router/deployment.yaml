@@ -38,6 +38,18 @@ spec:
       containers:
       - name: router
         image: {{ include "fission-bundleImage" . | quote }}
+        {{- if gt (int (.Values.router.preStopSleep | default 0)) 0 }}
+        lifecycle:
+          preStop:
+            # Delay the drain so this pod's removal from the Service
+            # EndpointSlice reaches every kube-proxy BEFORE the listener
+            # closes. Without it a terminating router still receives
+            # connections it can no longer accept: connection-refused, which
+            # the RFC-0028 §1 gate counts as a platform failure precisely
+            # because it produces no response and no attribution header.
+            sleep:
+              seconds: {{ int .Values.router.preStopSleep }}
+        {{- end }}
         imagePullPolicy: {{ .Values.pullPolicy }}
         command: ["/fission-bundle"]
         args:
@@ -46,29 +58,47 @@ spec:
           - "--routerInternalPort"
           - {{ include "fission.routerInternalPort" . | quote }}
           - "--executorUrl"
-          - "http://executor.{{ .Release.Namespace }}"
+          # Absolute FQDN (trailing dot): the router calls this on every cold
+          # start, and the short name's resolv.conf search walk is the DNS
+          # load that melts down under parallel traffic.
+          - "http://executor.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}."
         env:
         {{- if .Values.authentication.enabled }}
         - name: AUTH_USERNAME
           valueFrom:
             secretKeyRef:
-              name: router
+              name: {{ include "fission.authenticationSecretName" . }}
               key: username
         - name: AUTH_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: router
+              name: {{ include "fission.authenticationSecretName" . }}
               key: password
         - name: JWT_SIGNING_KEY
           valueFrom:
             secretKeyRef:
-              name: router
+              name: {{ include "fission.authenticationSecretName" . }}
               key: jwtSigningKey
         {{- end }}      
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        {{- if .Values.router.enforceSameNamespaceInvocation }}
+        - name: ROUTER_ENFORCE_SAME_NAMESPACE_INVOCATION
+          value: "true"
+        {{- end }}
+        {{- if .Values.router.allowedNamespaces }}
+        - name: ROUTER_ALLOWED_NAMESPACES
+          value: {{ join "," .Values.router.allowedNamespaces | quote }}
+        {{- end }}
+        {{- with .Values.router.gracefulShutdownTimeout }}
+        # Without this the drain is capped at the code default of 30s, so a
+        # larger terminationGracePeriodSeconds would be spent idle while a
+        # longer-running invocation is force-closed (RFC-0028 §2).
+        - name: GRACEFUL_SHUTDOWN_TIMEOUT
+          value: {{ . | quote }}
+        {{- end }}
         - name: ROUTER_ROUND_TRIP_TIMEOUT
           value: {{ .Values.router.roundTrip.timeout | default "50ms" | quote }}
         - name: ROUTER_ROUNDTRIP_TIMEOUT_EXPONENT
@@ -115,6 +145,39 @@ spec:
         {{- if .Values.gatewayAPI.defaultParentRef }}
         - name: GATEWAY_DEFAULT_PARENTREF
           value: {{ .Values.gatewayAPI.defaultParentRef | quote }}
+        {{- end }}
+        {{- if .Values.asyncInvocation.enabled }}
+        # RFC-0024 async invocation: the enqueue branch + the in-router dispatcher.
+        # The statestore driver follows the statestore mode — the embedded HTTP
+        # service (client) or external Postgres directly. ROUTER_INTERNAL_URL is the
+        # dispatcher's delivery target (svc/router-internal, possibly another replica).
+        - name: ASYNC_INVOCATION_ENABLED
+          value: "true"
+        {{- if eq .Values.statestore.mode "embedded" }}
+        - name: STATESTORE_DRIVER
+          value: "client"
+        - name: STATESTORE_DSN
+          value: "http://statestore.{{ .Release.Namespace }}:{{ include "fission.statestorePort" . }}"
+        {{- else if eq .Values.statestore.mode "external" }}
+        - name: STATESTORE_DRIVER
+          value: "postgres"
+        - name: STATESTORE_DSN
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.statestore.external.existingSecret | default "statestore-postgres" }}
+              key: dsn
+        {{- end }}
+        - name: ROUTER_INTERNAL_URL
+          value: {{ include "fission.routerInternalURL" . | quote }}
+        # RFC-0027 broker egress: the router enqueues broker-destined topic
+        # publishes ONLY for types whose classic head is deployed to drain the
+        # queue — a job on a consumer-less queue never dead-letters and is
+        # invisible to every DLQ surface. Extend the list as broker heads gain
+        # egress loops.
+        {{- if .Values.kafka.enabled }}
+        - name: EVENTING_EGRESS_TYPES
+          value: "kafka"
+        {{- end }}
         {{- end }}
         {{- include "fission-resource-namespace.envs" . | indent 8 }}
         {{- include "kube_client.envs" . | indent 8 }}
@@ -165,6 +228,20 @@ spec:
       serviceAccountName: fission-router
       {{- with .Values.router.terminationGracePeriodSeconds }}
       terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
+      {{- if and (not .Values.router.deployAsDaemonSet) (ge (int (.Values.router.replicas | default 1)) 2) }}
+      # Spread replicas across nodes, or two of them can land on one node and a
+      # single drain takes out the whole data plane — the outage replicas: 2
+      # exists to prevent. ScheduleAnyway so single-node clusters (kind) still
+      # schedule both.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              svc: router
+              application: fission-router
       {{- end }}
       volumes:
       - name: config-volume

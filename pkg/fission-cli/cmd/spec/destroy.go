@@ -52,8 +52,8 @@ func (opts *DestroySubCommand) run(input cli.Input) error {
 	} else {
 		// if force delete set to true we fetch all resources with our deployment ID and delete them
 		// set desired state to nothing, but keep the UID so "apply" can find it
-		emptyFr := FissionResources{}
-		emptyFr.DeploymentConfig = fr.DeploymentConfig
+		emptyFr := FissionResources{
+			DeploymentConfig: fr.DeploymentConfig}
 
 		// "apply" the empty state
 		err = forceDeleteResources(input.Context(), opts.Client(), &emptyFr)
@@ -95,12 +95,32 @@ func forceDeleteResources(ctx context.Context, fclient cmd.Client, fr *FissionRe
 		return fmt.Errorf("messageQueueTrigger delete failed: %w", err)
 	}
 
+	_, _, err = applyWorkflows(ctx, fclient, fr, true, false, false)
+	if err != nil {
+		return fmt.Errorf("workflow delete failed: %w", err)
+	}
+
+	// FunctionAliases reference Functions (spec.FunctionName, and an ownerRef
+	// when the Function existed at apply time), so they must go before
+	// Functions — same ordering reason as Workflows above.
+	_, _, err = applyFunctionAliases(ctx, fclient, fr, true, false, false)
+	if err != nil {
+		return fmt.Errorf("functionAlias delete failed: %w", err)
+	}
+
 	_, _, err = applyFunctions(ctx, fclient, fr, true, false, false)
 	if err != nil {
 		return fmt.Errorf("function delete failed: %w", err)
 	}
 
-	_, _, err = applyPackages(ctx, fclient, fr, true, false, false)
+	// destroy uploads no archives, so unlike apply it has no snapshot in hand:
+	// take the one cluster-wide Package enumeration it needs here.
+	livePkgs, err := listAllPackages(ctx, fclient)
+	if err != nil {
+		return fmt.Errorf("list packages: %w", err)
+	}
+
+	_, _, err = applyPackages(ctx, fclient, fr, livePkgs, true, false, false)
 	if err != nil {
 		return fmt.Errorf("package delete failed: %w", err)
 	}
@@ -156,6 +176,16 @@ func (opts *DestroySubCommand) insertNSToResource(input cli.Input, fr *FissionRe
 			fr.KubernetesWatchTriggers[i].Namespace = currentNS
 		}
 	}
+	for i := range fr.Workflows {
+		if fr.Workflows[i].Namespace == "" {
+			fr.Workflows[i].Namespace = currentNS
+		}
+	}
+	for i := range fr.FunctionAliases {
+		if fr.FunctionAliases[i].Namespace == "" {
+			fr.FunctionAliases[i].Namespace = currentNS
+		}
+	}
 
 	return nil
 }
@@ -185,6 +215,18 @@ func deleteResources(ctx context.Context, fclient cmd.Client, fr *FissionResourc
 		return c.MessageQueueTriggers(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	}); err != nil {
 		return fmt.Errorf("messageQueueTrigger delete failed: %w", err)
+	}
+	if err := destroyResources(ctx, fr.Workflows, "workflow", func(ctx context.Context, ns, name string) error {
+		return c.Workflows(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	}); err != nil {
+		return fmt.Errorf("workflow delete failed: %w", err)
+	}
+	// FunctionAliases reference Functions, so delete before Functions — same
+	// ordering reason as Workflows above.
+	if err := destroyResources(ctx, fr.FunctionAliases, "functionAlias", func(ctx context.Context, ns, name string) error {
+		return c.FunctionAliases(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	}); err != nil {
+		return fmt.Errorf("functionAlias delete failed: %w", err)
 	}
 	if err := destroyResources(ctx, fr.Functions, "function", func(ctx context.Context, ns, name string) error {
 		return c.Functions(ns).Delete(ctx, name, metav1.DeleteOptions{})

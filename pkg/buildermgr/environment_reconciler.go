@@ -6,9 +6,13 @@ package buildermgr
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/executor/util"
@@ -29,17 +34,42 @@ import (
 )
 
 const (
-	LABEL_ENV_NAME            = "envName"
-	LABEL_ENV_NAMESPACE       = "envNamespace"
-	LABEL_ENV_RESOURCEVERSION = "envResourceVersion"
-	LABEL_DEPLOYMENT_OWNER    = "owner"
-	BUILDER_MGR               = "buildermgr"
+	// Aliases of the shared fv1.BuilderLabel* constants (the CLI's build
+	// watch selects builder pods by the same labels).
+	LABEL_ENV_NAME            = fv1.BuilderLabelEnvName
+	LABEL_ENV_NAMESPACE       = fv1.BuilderLabelEnvNamespace
+	LABEL_ENV_RESOURCEVERSION = fv1.BuilderLabelEnvResourceVersion
+	LABEL_DEPLOYMENT_OWNER    = fv1.BuilderLabelOwner
+	BUILDER_MGR               = fv1.BuilderOwnerBuilderMgr
+
+	// builderSpecHashAnnotation carries a hash of the builder pod template the
+	// reconciler last applied, so drift that does NOT bump the Environment's
+	// ResourceVersion is still detectable (RFC-0028 phase 3, issue #776).
+	builderSpecHashAnnotation = "fission.io/builder-spec-hash"
 )
 
 var (
 	deletePropagation = metav1.DeletePropagationBackground
 	delOpt            = metav1.DeleteOptions{PropagationPolicy: &deletePropagation}
 )
+
+// environmentPredicate admits spec changes (generation) AND annotation- or
+// label-only changes. The builder objects are named "<env.Name>-<env.ResourceVersion>",
+// and an annotation patch (e.g. Lambforge's `fission.io/force-update` when a
+// suspended project is resumed) bumps ResourceVersion without bumping
+// generation: with GenerationChangedPredicate alone this reconciler never
+// created the builder for the new ResourceVersion, while the package
+// reconciler waited for exactly that name - builds stayed "pending"
+// ("builder deployment not created yet, will retry") until buildermgr
+// restarted. Status-only writes are still dropped.
+func environmentPredicate() predicate.Predicate {
+	return predicate.Or(
+		predicate.GenerationChangedPredicate{},
+		predicate.AnnotationChangedPredicate{},
+		// a label-only edit bumps ResourceVersion the same way
+		predicate.LabelChangedPredicate{},
+	)
+}
 
 // EnvironmentReconciler keeps a per-Environment builder Service + Deployment in
 // sync with the Environment CR. It replaces the informer-driven
@@ -67,6 +97,7 @@ type EnvironmentReconciler struct {
 	useIstio               bool
 	podSpecPatch           *apiv1.PodSpec
 	enableOwnerReferences  bool
+	poolMgr                *BuilderPoolManager
 }
 
 func makeEnvironmentReconciler(
@@ -74,7 +105,8 @@ func makeEnvironmentReconciler(
 	client client.Client,
 	kubernetesClient kubernetes.Interface,
 	fetcherConfig *fetcherConfig.Config,
-	podSpecPatch *apiv1.PodSpec) *EnvironmentReconciler {
+	podSpecPatch *apiv1.PodSpec,
+	poolMgr *BuilderPoolManager) *EnvironmentReconciler {
 
 	useIstio := false
 	enableIstio := os.Getenv("ENABLE_ISTIO")
@@ -96,6 +128,7 @@ func makeEnvironmentReconciler(
 		fetcherConfig:          fetcherConfig,
 		podSpecPatch:           podSpecPatch,
 		enableOwnerReferences:  utils.IsOwnerReferencesEnabled(),
+		poolMgr:                poolMgr,
 	}
 }
 
@@ -108,6 +141,8 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			// too; this explicit delete is the primary path when they are
 			// disabled (the default) and a harmless no-op once GC has run.
 			r.deleteBuilder(ctx, req.Namespace, req.Name)
+			// Drop the pool state so the idle reaper stops tracking the gone env.
+			r.poolMgr.ForgetByName(req.Namespace, req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -115,7 +150,7 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// builder is not supported with the v1 interface; ignore envs without a
 	// builder image.
-	if env.Spec.Version == 1 || len(env.Spec.Builder.Image) == 0 {
+	if !env.HasBuilder() {
 		return ctrl.Result{}, nil
 	}
 
@@ -128,6 +163,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		r.logger.Error(err, "error ensuring builder service", "env_name", env.Name, "builder_namespace", ns)
 		return ctrl.Result{}, err
 	}
+
+	// Register the environment in the builder pool so the idle reaper tracks it
+	// and the PackageReconciler shares its build/pod-claim state. Idempotent, and
+	// it repopulates the in-memory pool after a buildermgr restart (every
+	// Environment re-lists as a Create on startup).
+	r.poolMgr.Ensure(env, ns)
 
 	// NOTE: writing EnvironmentConditionReady here would bump env.RV via the
 	// status subresource, but the builder service name (and its DNS lookup in
@@ -187,10 +228,68 @@ func (r *EnvironmentReconciler) ensureBuilder(ctx context.Context, env *fv1.Envi
 			return fmt.Errorf("error creating builder deployment for environment %s in namespace %s: %w", env.Name, ns, err)
 		}
 	case 1:
-		// already present
+		if err := r.reconcileBuilderDeployment(ctx, env, ns, &deployList[0]); err != nil {
+			return fmt.Errorf("error reconciling builder deployment for environment %s in namespace %s: %w", env.Name, ns, err)
+		}
 	default:
 		return fmt.Errorf("found more than one builder deployment for environment %s in namespace %s", env.Name, ns)
 	}
+	return nil
+}
+
+// reconcileBuilderDeployment rolls an existing builder Deployment whose pod
+// template no longer matches what this reconciler would create.
+//
+// The Environment's ResourceVersion is NOT a sufficient trigger (issue #776).
+// Everything the builder pod is made of that comes from the chart rather than
+// the CR — the fetcher image, the builder image-pull policy, the pod-spec patch
+// — changes without the Environment being touched at all. The RV-keyed
+// name/selector stays identical, so the old code found a matching Deployment
+// and did nothing, and the builder kept running the previous image until
+// someone deleted the Deployment by hand. Deleting the POD does not help
+// either: the ReplicaSet just recreates it from the same stale template.
+//
+// The Deployment is updated in place rather than recreated: its name is
+// <env>-<rv>, which buildPackage resolves as a DNS hostname, so renaming or
+// recreating per-generation would break in-flight builds.
+func (r *EnvironmentReconciler) reconcileBuilderDeployment(ctx context.Context, env *fv1.Environment, ns string, live *appsv1.Deployment) error {
+	desired, err := r.genBuilderDeployment(env, ns)
+	if err != nil {
+		return err
+	}
+	want := desired.Annotations[builderSpecHashAnnotation]
+	if live.Annotations[builderSpecHashAnnotation] == want {
+		return nil
+	}
+
+	// Carry the live object's identity so this is an update, not a create, and
+	// so we do not clobber annotations set by anything else.
+	updated := live.DeepCopy()
+	updated.Spec = desired.Spec
+	updated.Labels = desired.Labels
+	// Selector is immutable on a Deployment: sending a different one makes the
+	// apiserver reject the whole update. It is derived from the same
+	// name/namespace/RV as the live object's, so it cannot legitimately differ
+	// — keep the live value rather than betting the update on that staying true.
+	updated.Spec.Selector = live.Spec.Selector
+	// Keep the live replica count: this fork's builder pool scales builders
+	// to zero when idle and back up on demand (idleBuilderReaper / package
+	// reconciler), and a drift roll must not undo that.
+	updated.Spec.Replicas = live.Spec.Replicas
+	if updated.Annotations == nil {
+		updated.Annotations = map[string]string{}
+	}
+	updated.Annotations[builderSpecHashAnnotation] = want
+
+	if _, err := r.kubernetesClient.AppsV1().Deployments(ns).Update(ctx, updated, metav1.UpdateOptions{}); err != nil {
+		return err
+	}
+	// An empty previous hash means the Deployment predates this annotation, so
+	// the first reconcile after upgrade rolls every builder exactly once — a
+	// one-time cost, not ongoing churn, because the hash matches from then on.
+	r.logger.Info("builder deployment spec drifted, rolling it",
+		"deployment", updated.Name, "namespace", ns,
+		"previous", live.Annotations[builderSpecHashAnnotation], "current", want)
 	return nil
 }
 
@@ -381,7 +480,11 @@ func builderAuthEnvVars(namespace string) []apiv1.EnvVar {
 	}
 }
 
-func (r *EnvironmentReconciler) createBuilderDeployment(ctx context.Context, env *fv1.Environment, ns string) (*appsv1.Deployment, error) {
+// genBuilderDeployment computes the DESIRED builder Deployment for an
+// Environment. Split out from the create path so the reconciler can compute the
+// same object on every pass and compare it against what is live — see
+// builderSpecHash and ensureBuilder.
+func (r *EnvironmentReconciler) genBuilderDeployment(env *fv1.Environment, ns string) (*appsv1.Deployment, error) {
 	name := fmt.Sprintf("%v-%v", env.Name, env.ResourceVersion)
 	sel := r.getLabels(env.Name, ns, env.ResourceVersion)
 	var replicas int32 = 1
@@ -516,6 +619,15 @@ func (r *EnvironmentReconciler) createBuilderDeployment(ctx context.Context, env
 		deployment.Spec.Template.Spec.AutomountServiceAccountToken = new(false)
 	}
 
+	// Fill-if-nil: applies env.Spec.RuntimeClassName only when the merge
+	// above (or the base spec) left RuntimeClassName unset, so a
+	// Builder.PodSpec override always wins. Unconditional — an env can set
+	// RuntimeClassName with no Builder.PodSpec at all. Builder pods get the
+	// same RuntimeClass as runtime pods: an author opting into isolation
+	// means "this env's workloads," and builder pods run user build
+	// commands.
+	util.ApplyEnvRuntimeClass(&deployment.Spec.Template.Spec, env)
+
 	// Re-mount the fission-builder SA token at the canonical Kubernetes
 	// path on the fetcher container only. The pod-level
 	// AutomountServiceAccountToken=false flag set above suppresses the
@@ -532,12 +644,90 @@ func (r *EnvironmentReconciler) createBuilderDeployment(ctx context.Context, env
 		return nil, err
 	}
 
-	_, err = r.kubernetesClient.AppsV1().Deployments(ns).Create(ctx, deployment, metav1.CreateOptions{})
+	// Stamp a hash of the desired pod template so a later reconcile can tell
+	// "this Deployment is what we would create today" from "this Deployment is
+	// stale". Comparing the live PodSpec directly cannot work: the apiserver
+	// defaults dozens of fields on write, so a live-vs-desired comparison is
+	// never equal and would rewrite the Deployment on every pass forever.
+	// Hashing OUR desired object and comparing that to the value we ourselves
+	// stamped sidesteps defaulting entirely.
+	hash, err := builderSpecHash(&deployment.Spec.Template)
 	if err != nil {
 		return nil, err
 	}
+	if deployment.Annotations == nil {
+		deployment.Annotations = map[string]string{}
+	}
+	deployment.Annotations[builderSpecHashAnnotation] = hash
 
-	r.logger.Info("creating builder deployment", "deployment", name)
+	return deployment, nil
+}
 
+// builderSpecHash fingerprints the desired builder pod template. It is stamped
+// on the Deployment (never on the template itself, which would make the hash
+// cover its own value).
+//
+// The template is CANONICALISED first, and that is not cosmetic. MergePodSpec
+// round-trips containers through a map[string]*Container and emits them in map
+// iteration order, which Go randomises per range — so two calls with identical
+// inputs produce slices in different orders, within a single process. Hashing
+// that directly gives a different answer nearly every call, and the reconciler
+// would see permanent drift and roll the builder on every reconcile forever:
+// the exact churn this feature exists to prevent, arriving from the other side.
+// Any environment setting Builder.PodSpec would hit it, since the merge runs
+// whether or not the patch names a container.
+//
+// Sorting by name is safe because container order carries no meaning here: the
+// entrypoint is chosen by name, and init containers are appended by the same
+// merge rather than ordered by the user.
+//
+// This site stays on encoding/json (v1) permanently: the hash is a byte-level
+// contract compared against values stamped by earlier releases, and json/v2
+// changes output bytes (nil slice/map emission, omitempty semantics,
+// escaping). TestBuilderSpecHashGolden pins the exact values.
+func builderSpecHash(tmpl *apiv1.PodTemplateSpec) (string, error) {
+	canonical := tmpl.DeepCopy()
+	sortByName(canonical.Spec.Containers)
+	sortByName(canonical.Spec.InitContainers)
+	slices.SortFunc(canonical.Spec.Volumes, func(a, b apiv1.Volume) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+
+	b, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("error hashing builder pod template: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("sha256:%x", sum), nil
+}
+
+// sortByName orders containers by name and, within each, its env vars and
+// volume mounts — every slice on the path that is assembled from a map or from
+// os.Environ(), whose order is not guaranteed stable across calls or restarts.
+func sortByName(containers []apiv1.Container) {
+	slices.SortFunc(containers, func(a, b apiv1.Container) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	for i := range containers {
+		slices.SortFunc(containers[i].Env, func(a, b apiv1.EnvVar) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		slices.SortFunc(containers[i].VolumeMounts, func(a, b apiv1.VolumeMount) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+	}
+}
+
+// createBuilderDeployment creates the builder Deployment for the current
+// Environment generation.
+func (r *EnvironmentReconciler) createBuilderDeployment(ctx context.Context, env *fv1.Environment, ns string) (*appsv1.Deployment, error) {
+	deployment, err := r.genBuilderDeployment(env, ns)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.kubernetesClient.AppsV1().Deployments(ns).Create(ctx, deployment, metav1.CreateOptions{}); err != nil {
+		return nil, err
+	}
+	r.logger.Info("creating builder deployment", "deployment", deployment.Name)
 	return deployment, nil
 }

@@ -12,7 +12,6 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -51,7 +50,7 @@ func crClient(objs ...client.Object) client.Client {
 }
 
 func envWithImage(name, image string) *fv1.Environment {
-	env := &fv1.Environment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: "e1"}}
+	env := &fv1.Environment{Name: name, Namespace: "default", UID: "e1"}
 	env.Spec.Runtime.Image = image
 	return env
 }
@@ -63,7 +62,8 @@ func TestEnvironmentReconcilerDispatch(t *testing.T) {
 	t.Run("first sight dispatches to every handler with nil old and caches", func(t *testing.T) {
 		h1 := &fakeHandler{requeue: 30 * time.Minute}
 		h2 := &fakeHandler{}
-		r := &environmentReconciler{logger: logr.Discard(), client: crClient(envWithImage("env", "img:1")), handlers: []executortype.EnvReconciler{h1, h2}}
+		c := crClient(envWithImage("env", "img:1"))
+		r := &environmentReconciler{logger: logr.Discard(), client: c, apiReader: c, handlers: []executortype.EnvReconciler{h1, h2}}
 
 		res, err := r.Reconcile(t.Context(), req)
 		require.NoError(t, err)
@@ -76,7 +76,8 @@ func TestEnvironmentReconcilerDispatch(t *testing.T) {
 
 	t.Run("second event hands each handler the cached old object", func(t *testing.T) {
 		h := &fakeHandler{}
-		r := &environmentReconciler{logger: logr.Discard(), client: crClient(envWithImage("env", "img:2")), handlers: []executortype.EnvReconciler{h}}
+		c := crClient(envWithImage("env", "img:2"))
+		r := &environmentReconciler{logger: logr.Discard(), client: c, apiReader: c, handlers: []executortype.EnvReconciler{h}}
 		r.lastSeen.Store(key, envWithImage("env", "img:1"))
 
 		_, err := r.Reconcile(t.Context(), req)
@@ -89,7 +90,8 @@ func TestEnvironmentReconcilerDispatch(t *testing.T) {
 	t.Run("a handler error stops dispatch and does not advance the cache", func(t *testing.T) {
 		h1 := &fakeHandler{reconcErr: assert.AnError}
 		h2 := &fakeHandler{}
-		r := &environmentReconciler{logger: logr.Discard(), client: crClient(envWithImage("env", "img:1")), handlers: []executortype.EnvReconciler{h1, h2}}
+		c := crClient(envWithImage("env", "img:1"))
+		r := &environmentReconciler{logger: logr.Discard(), client: c, apiReader: c, handlers: []executortype.EnvReconciler{h1, h2}}
 
 		_, err := r.Reconcile(t.Context(), req)
 		require.Error(t, err)
@@ -101,7 +103,8 @@ func TestEnvironmentReconcilerDispatch(t *testing.T) {
 	t.Run("delete dispatches cleanup to every handler with the cached object", func(t *testing.T) {
 		h1 := &fakeHandler{}
 		h2 := &fakeHandler{}
-		r := &environmentReconciler{logger: logr.Discard(), client: crClient(), handlers: []executortype.EnvReconciler{h1, h2}} // empty client -> NotFound
+		c := crClient() // empty client -> NotFound from both cache and API reader
+		r := &environmentReconciler{logger: logr.Discard(), client: c, apiReader: c, handlers: []executortype.EnvReconciler{h1, h2}}
 		r.lastSeen.Store(key, envWithImage("env", "img:1"))
 
 		_, err := r.Reconcile(t.Context(), req)
@@ -114,11 +117,29 @@ func TestEnvironmentReconcilerDispatch(t *testing.T) {
 
 	t.Run("delete of an unseen environment is a no-op", func(t *testing.T) {
 		h := &fakeHandler{}
-		r := &environmentReconciler{logger: logr.Discard(), client: crClient(), handlers: []executortype.EnvReconciler{h}}
+		c := crClient()
+		r := &environmentReconciler{logger: logr.Discard(), client: c, apiReader: c, handlers: []executortype.EnvReconciler{h}}
 
 		_, err := r.Reconcile(t.Context(), req)
 		require.NoError(t, err)
 		assert.Empty(t, h.cleaned)
+	})
+
+	t.Run("stale cache NotFound does not trigger cleanup when env exists in API", func(t *testing.T) {
+		h := &fakeHandler{}
+		// Simulate stale cache: client (cache) is empty -> NotFound,
+		// but apiReader has the env -> exists. Use two different fake clients.
+		cacheClient := crClient() // empty -> NotFound from cache
+		apiClient := crClient(envWithImage("env", "img:1"))
+		r := &environmentReconciler{logger: logr.Discard(), client: cacheClient, apiReader: apiClient, handlers: []executortype.EnvReconciler{h}}
+		r.lastSeen.Store(key, envWithImage("env", "img:1"))
+
+		res, err := r.Reconcile(t.Context(), req)
+		require.NoError(t, err)
+		assert.NotZero(t, res.RequeueAfter, "should requeue to retry with fresh cache")
+		assert.Empty(t, h.cleaned, "cleanup must NOT fire when env still exists in API server")
+		cached, _ := r.lastSeen.Load(key)
+		assert.NotNil(t, cached, "lastSeen should be refreshed from API server")
 	})
 }
 
@@ -148,7 +169,9 @@ func TestCollectHandlers(t *testing.T) {
 		handlers := collectHandlers(types)
 		require.Len(t, handlers, 2, "container does not implement EnvReconciler and is skipped")
 		// Deterministic, sorted by executor-type name: newdeploy < poolmgr.
+		// SAFETY: the only EnvReconciler implementations in the input map are fakeEnvExecutorType values.
 		assert.Equal(t, "newdeploy", handlers[0].(fakeEnvExecutorType).id)
+		// SAFETY: the only EnvReconciler implementations in the input map are fakeEnvExecutorType values.
 		assert.Equal(t, "poolmgr", handlers[1].(fakeEnvExecutorType).id)
 	})
 

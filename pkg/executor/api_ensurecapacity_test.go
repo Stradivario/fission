@@ -64,7 +64,7 @@ func (s *capacityStubExecutorType) MarkSpecializationFailure(_ context.Context, 
 
 func poolmgrFn(name string) *fv1.Function {
 	return &fv1.Function{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: "test-uid"},
+		Name: name, Namespace: "default", UID: "test-uid",
 		Spec: fv1.FunctionSpec{
 			InvokeStrategy: fv1.InvokeStrategy{
 				ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypePoolmgr},
@@ -135,6 +135,7 @@ func TestEnsureCapacityWireContract(t *testing.T) {
 		}
 		srv := httptest.NewServer(newExecutor(stub).GetHandler())
 		defer srv.Close()
+		// SAFETY: MakeClient returns *client.Client, which implements capacityCaller.
 		c := client.MakeClient(logger, srv.URL, nil).(capacityCaller)
 
 		_, err := c.EnsureCapacity(t.Context(), poolmgrFn("fn"), 1, 1)
@@ -148,6 +149,7 @@ func TestEnsureCapacityWireContract(t *testing.T) {
 		stub := &capacityStubExecutorType{}
 		srv := httptest.NewServer(newExecutor(stub).GetHandler())
 		defer srv.Close()
+		// SAFETY: MakeClient returns *client.Client, which implements capacityCaller.
 		c := client.MakeClient(logger, srv.URL, nil).(capacityCaller)
 
 		fn := poolmgrFn("fn")

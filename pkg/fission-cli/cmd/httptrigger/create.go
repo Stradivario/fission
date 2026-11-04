@@ -43,14 +43,33 @@ func (opts *CreateSubCommand) do(input cli.Input) error {
 func (opts *CreateSubCommand) complete(input cli.Input) error {
 	functionList := input.StringSlice(flagkey.HtFnName)
 	functionWeightsList := input.IntSlice(flagkey.HtFnWeight)
+	fnAlias := input.String(flagkey.HtFnAlias)
+	fnVersion := input.String(flagkey.HtFnVersion)
 
-	if len(functionList) == 0 {
-		return errors.New("need a function name to create a trigger, use --function")
-	}
+	workflow := input.String(flagkey.TriggerWorkflow)
 
-	functionRef, err := setHtFunctionRef(functionList, functionWeightsList)
-	if err != nil {
-		return err
+	var functionRef *fv1.FunctionReference
+	if workflow != "" {
+		if len(functionList) > 0 || len(functionWeightsList) > 0 || fnAlias != "" || fnVersion != "" {
+			return errors.New("use either --workflow or --function (with its --weight/--alias/--version), not both")
+		}
+		functionRef = &fv1.FunctionReference{Type: fv1.FunctionReferenceTypeWorkflow, Name: workflow}
+	} else {
+		if len(functionList) == 0 {
+			return errors.New("need a function name to create a trigger, use --function (or --workflow)")
+		}
+
+		if err := validateFnRefTagFlags(fnAlias, fnVersion, functionList); err != nil {
+			return err
+		}
+
+		ref, err := setHtFunctionRef(functionList, functionWeightsList)
+		if err != nil {
+			return err
+		}
+		functionRef = ref
+		functionRef.Alias = fnAlias
+		functionRef.Version = fnVersion
 	}
 
 	triggerName := input.String(flagkey.HtName)
@@ -129,6 +148,12 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 		if err != nil {
 			console.Warn(err.Error())
 		}
+
+		if fnAlias != "" || fnVersion != "" {
+			if err := checkFnRefTagOwnership(input.Context(), opts.Client(), fnNamespace, functionList[0], fnAlias, fnVersion); err != nil {
+				return err
+			}
+		}
 	}
 
 	warnIngressDeprecated(input)
@@ -160,6 +185,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 			RouteConfig:       routeConfig,
 			Prefix:            &prefix,
 			KeepPrefix:        input.Bool(flagkey.HtKeepPrefix),
+			InvocationMode:    input.String(flagkey.HtInvocationMode),
 		},
 	}
 
@@ -168,7 +194,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) error {
 
 func (opts *CreateSubCommand) run(input cli.Input) error {
 	// if we're writing a spec, don't call the API; save/print and return.
-	if handled, err := spec.SaveOrDry(input, *opts.trigger, fmt.Sprintf("route-%v.yaml", opts.trigger.Name)); handled {
+	if handled, err := spec.SaveOrDry(input, opts.trigger, fmt.Sprintf("route-%v.yaml", opts.trigger.Name)); handled {
 		return err
 	}
 

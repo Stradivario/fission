@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/fission-cli/cliwrapper/driver/dummy"
 	"github.com/fission/fission/pkg/fission-cli/cmd"
@@ -48,8 +46,8 @@ func captureStdout(t *testing.T, fn func() error) string {
 // fake set here is shared by the subtests below.
 func TestFunctionListOutput(t *testing.T) {
 	fn := &fv1.Function{
-		ObjectMeta: metav1.ObjectMeta{Name: "listfn", Namespace: "default"},
-		Spec:       fv1.FunctionSpec{Environment: fv1.EnvironmentReference{Name: "nodejs"}},
+		Name: "listfn", Namespace: "default",
+		Spec: fv1.FunctionSpec{Environment: fv1.EnvironmentReference{Name: "nodejs"}},
 	}
 	// Reset the sync.Once-guarded client so this test deterministically installs
 	// its own fake regardless of test order.
@@ -61,7 +59,7 @@ func TestFunctionListOutput(t *testing.T) {
 
 	t.Run("json is an array containing the function", func(t *testing.T) {
 		in := dummy.TestFlagSet()
-		in.Set(flagkey.Output, "json")
+		in.SetString(flagkey.Output, "json")
 		out := captureStdout(t, func() error { return List(in) })
 
 		var got []fv1.Function
@@ -75,7 +73,7 @@ func TestFunctionListOutput(t *testing.T) {
 
 	t.Run("wide adds the AGE column", func(t *testing.T) {
 		in := dummy.TestFlagSet()
-		in.Set(flagkey.Output, "wide")
+		in.SetString(flagkey.Output, "wide")
 		out := captureStdout(t, func() error { return List(in) })
 		if !strings.Contains(out, "AGE") {
 			t.Fatalf("wide output missing AGE column:\n%s", out)
@@ -98,7 +96,7 @@ func TestFunctionListOutput(t *testing.T) {
 
 	t.Run("invalid format errors", func(t *testing.T) {
 		in := dummy.TestFlagSet()
-		in.Set(flagkey.Output, "bogus")
+		in.SetString(flagkey.Output, "bogus")
 		if err := List(in); err == nil {
 			t.Fatal("expected an error for -o bogus")
 		}

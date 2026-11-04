@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -25,14 +24,14 @@ import (
 )
 
 type fakeFuncMgr struct {
-	deleted      []crd.CacheKeyURG
+	deleted      []crd.CacheKeyUG
 	refreshed    []string
 	istioCreated []string
 	istioDeleted []string
 	fnSvcDeleted []string
 }
 
-func (f *fakeFuncMgr) markFuncDeleted(k crd.CacheKeyURG) { f.deleted = append(f.deleted, k) }
+func (f *fakeFuncMgr) markFuncDeleted(k crd.CacheKeyUG) { f.deleted = append(f.deleted, k) }
 func (f *fakeFuncMgr) refreshFuncPods(_ context.Context, fn *fv1.Function) error {
 	f.refreshed = append(f.refreshed, fn.Name)
 	return nil
@@ -50,10 +49,14 @@ func (f *fakeFuncMgr) deleteFunctionService(_ context.Context, fn *fv1.Function)
 	return nil
 }
 
-type fakeRSCleaner struct{ processed []string }
+type fakeRSCleaner struct {
+	processed []string
+	err       error
+}
 
-func (f *fakeRSCleaner) processReplicaSet(_ context.Context, rs *appsv1.ReplicaSet) {
+func (f *fakeRSCleaner) processReplicaSet(_ context.Context, rs *appsv1.ReplicaSet) error {
 	f.processed = append(f.processed, rs.Name)
+	return f.err
 }
 
 type fakePoolMgr struct {
@@ -71,7 +74,7 @@ func (f *fakePoolMgr) cleanupEnvPool(_ context.Context, env *fv1.Environment) {
 }
 
 func poolmgrFn(name string, et fv1.ExecutorType) *fv1.Function {
-	fn := &fv1.Function{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: "u1", ResourceVersion: "9", Generation: 2}}
+	fn := &fv1.Function{Name: name, Namespace: "default", UID: "u1", ResourceVersion: "9", Generation: 2}
 	fn.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType = et
 	return fn
 }
@@ -107,7 +110,7 @@ func TestCleanupPoolmgrFunc(t *testing.T) {
 		m := &fakeFuncMgr{}
 		require.NoError(t, cleanupPoolmgrFunc(t.Context(), m, true, false, fn))
 		require.Len(t, m.deleted, 1)
-		assert.Equal(t, crd.CacheKeyURGFromMeta(&fn.ObjectMeta), m.deleted[0])
+		assert.Equal(t, crd.CacheKeyUGFromMeta(&fn.ObjectMeta), m.deleted[0])
 		assert.Equal(t, []string{"fn"}, m.istioDeleted)
 		assert.Empty(t, m.fnSvcDeleted)
 	})
@@ -130,7 +133,7 @@ func TestCleanupPoolmgrFunc(t *testing.T) {
 }
 
 func TestPoolmgrReconcileEnvironment(t *testing.T) {
-	env := &fv1.Environment{ObjectMeta: metav1.ObjectMeta{Name: "env", Namespace: "default", UID: "e1"}}
+	env := &fv1.Environment{Name: "env", Namespace: "default", UID: "e1"}
 
 	t.Run("reconciles the pool and requests the periodic resync", func(t *testing.T) {
 		m := &fakePoolMgr{}
@@ -163,7 +166,7 @@ func crClientK8s(objs ...client.Object) client.Client {
 func TestPoolmgrReplicaSetReconciler(t *testing.T) {
 	key := types.NamespacedName{Name: "rs", Namespace: "default"}
 	req := ctrl.Request{NamespacedName: key}
-	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "rs", Namespace: "default"}}
+	rs := &appsv1.ReplicaSet{Name: "rs", Namespace: "default"}
 
 	t.Run("existing replicaset is handed to the cleaner", func(t *testing.T) {
 		c := &fakeRSCleaner{}
@@ -193,11 +196,13 @@ func (f *fakeEnqueuer) enqueueReadyPod(queueKey, podKey string) {
 
 func warmPod(name, envUID string, phase corev1.PodPhase, managed string) *corev1.Pod {
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Labels: map[string]string{
+		Name:      name,
+		Namespace: "default",
+		Labels: map[string]string{
 			fv1.EXECUTOR_TYPE:   string(fv1.ExecutorTypePoolmgr),
 			fv1.ENVIRONMENT_UID: envUID,
 			"managed":           managed,
-		}},
+		},
 		Status: corev1.PodStatus{Phase: phase},
 	}
 }

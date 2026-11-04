@@ -32,6 +32,32 @@ type FunctionSpecApplyConfiguration struct {
 	Secrets []SecretReferenceApplyConfiguration `json:"secrets,omitempty"`
 	// Reference to a list of configmaps.
 	ConfigMaps []ConfigMapReferenceApplyConfiguration `json:"configmaps,omitempty"`
+	// Env lists per-function environment variables set on the function's
+	// runtime container: literals, plus key-level references into
+	// same-namespace Secrets/ConfigMaps via valueFrom (secretKeyRef /
+	// configMapKeyRef only — fieldRef and resourceFieldRef are rejected at
+	// admission because poolmgr's specialize-time injection cannot honor
+	// pod-level field refs portably; RFC-0030 §1). Function Env wins over
+	// EnvFrom, which wins over the environment podspec's merged env.
+	// Platform-reserved names (FISSION_*, RESOURCE_VERSION_COUNT, and the
+	// interpreter/proxy-hijack set) are denied at admission and enforced
+	// at injection. Additive and backward compatible.
+	Env []corev1.EnvVar `json:"env,omitempty"`
+	// EnvFrom projects whole same-namespace Secrets/ConfigMaps into the
+	// function's environment, with an optional prefix; later sources win
+	// over earlier ones (Kubernetes semantics), and function Env literals
+	// win over all EnvFrom keys.
+	//
+	// Two phase-1 limits, both inherent to native (kubelet) injection:
+	// the kubelet expands envFrom BEFORE container env, so a name the
+	// environment podspec sets as a literal still beats an EnvFrom-supplied
+	// key of the same name; and reserved platform names appearing as data
+	// keys of a referenced object are not filtered (they are unknowable at
+	// admission and mutable afterwards) — they are only shadowed by the
+	// platform vars actually present on the container. Key-level filtering
+	// and full precedence arrive with the poolmgr phase, which resolves
+	// values itself. Additive and backward compatible.
+	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
 	// cpu and memory resources as per K8S standards
 	// This is only for newdeploy to set up resource limitation
 	// when creating deployment for a function.
@@ -59,6 +85,18 @@ type FunctionSpecApplyConfiguration struct {
 	// the on switch (like Streaming): nil (the default) means the function is
 	// never advertised as a tool. Additive and backward compatible.
 	Tool *ToolConfigApplyConfiguration `json:"tool,omitempty"`
+	// State, when non-nil, opts this function into the RFC-0023 keyed-state
+	// API: a scoped statesvc keyspace backed by the RFC-0021 statestore, with
+	// a per-function token injected at specialization time. Presence is the
+	// on switch (like Streaming and Tool): nil (the default) means exactly
+	// today's behavior. Additive and backward compatible.
+	State *StateConfigApplyConfiguration `json:"state,omitempty"`
+	// Invocation, when non-nil, tunes RFC-0024 asynchronous invocation
+	// (X-Fission-Invoke-Mode: async) for this function: the durable retry policy
+	// and the maximum event age before an undelivered invocation is
+	// dead-lettered. A function without it still accepts async mode with platform
+	// defaults; this field only tunes them. Additive and backward compatible.
+	Invocation *InvocationConfigApplyConfiguration `json:"invocation,omitempty"`
 	// Maximum number of pods to be specialized which will serve requests
 	// This is optional. If not specified default value will be taken as 500
 	Concurrency *int `json:"concurrency,omitempty"`
@@ -71,6 +109,19 @@ type FunctionSpecApplyConfiguration struct {
 	// RetainPods specifies the number of specialized pods that should be retained after serving requests
 	// This is optional. If not specified default value will be taken as 0
 	RetainPods *int `json:"retainPods,omitempty"`
+	// ProvisionedConcurrency, when non-nil, opts this function into eager
+	// pre-warming of specialized pods (RFC-0026). The executor's provisioner
+	// keeps at least the configured Target specialized pods warm, published to
+	// the function's headless Service, and exempt from the idle reaper. nil
+	// (the default) is the classic on-demand cold-start path. Additive and
+	// backward compatible. Only valid when
+	// InvokeStrategy.ExecutionStrategy.ExecutorType is poolmgr.
+	ProvisionedConcurrency *ProvisionedConcurrencyConfigApplyConfiguration `json:"provisionedConcurrency,omitempty"`
+	// Versioning, when non-nil, opts this function into RFC-0025 immutable
+	// version snapshots and named aliases. Presence is the on switch (like
+	// Streaming and Tool): nil (the default) means exactly today's mutable
+	// in-place behavior. Additive and backward compatible.
+	Versioning *VersioningConfigApplyConfiguration `json:"versioning,omitempty"`
 	// Podspec specifies podspec to use for executor type container based functions
 	// Different arguments mentioned for container based function are populated inside a pod.
 	PodSpec *corev1.PodSpec `json:"podspec,omitempty"`
@@ -124,6 +175,26 @@ func (b *FunctionSpecApplyConfiguration) WithConfigMaps(values ...*ConfigMapRefe
 	return b
 }
 
+// WithEnv adds the given value to the Env field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the Env field.
+func (b *FunctionSpecApplyConfiguration) WithEnv(values ...corev1.EnvVar) *FunctionSpecApplyConfiguration {
+	for i := range values {
+		b.Env = append(b.Env, values[i])
+	}
+	return b
+}
+
+// WithEnvFrom adds the given value to the EnvFrom field in the declarative configuration
+// and returns the receiver, so that objects can be build by chaining "With" function invocations.
+// If called multiple times, values provided by each call will be appended to the EnvFrom field.
+func (b *FunctionSpecApplyConfiguration) WithEnvFrom(values ...corev1.EnvFromSource) *FunctionSpecApplyConfiguration {
+	for i := range values {
+		b.EnvFrom = append(b.EnvFrom, values[i])
+	}
+	return b
+}
+
 // WithResources sets the Resources field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Resources field is set to the value of the last call.
@@ -172,6 +243,22 @@ func (b *FunctionSpecApplyConfiguration) WithTool(value *ToolConfigApplyConfigur
 	return b
 }
 
+// WithState sets the State field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the State field is set to the value of the last call.
+func (b *FunctionSpecApplyConfiguration) WithState(value *StateConfigApplyConfiguration) *FunctionSpecApplyConfiguration {
+	b.State = value
+	return b
+}
+
+// WithInvocation sets the Invocation field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Invocation field is set to the value of the last call.
+func (b *FunctionSpecApplyConfiguration) WithInvocation(value *InvocationConfigApplyConfiguration) *FunctionSpecApplyConfiguration {
+	b.Invocation = value
+	return b
+}
+
 // WithConcurrency sets the Concurrency field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Concurrency field is set to the value of the last call.
@@ -201,6 +288,22 @@ func (b *FunctionSpecApplyConfiguration) WithOnceOnly(value bool) *FunctionSpecA
 // If called multiple times, the RetainPods field is set to the value of the last call.
 func (b *FunctionSpecApplyConfiguration) WithRetainPods(value int) *FunctionSpecApplyConfiguration {
 	b.RetainPods = &value
+	return b
+}
+
+// WithProvisionedConcurrency sets the ProvisionedConcurrency field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ProvisionedConcurrency field is set to the value of the last call.
+func (b *FunctionSpecApplyConfiguration) WithProvisionedConcurrency(value *ProvisionedConcurrencyConfigApplyConfiguration) *FunctionSpecApplyConfiguration {
+	b.ProvisionedConcurrency = value
+	return b
+}
+
+// WithVersioning sets the Versioning field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Versioning field is set to the value of the last call.
+func (b *FunctionSpecApplyConfiguration) WithVersioning(value *VersioningConfigApplyConfiguration) *FunctionSpecApplyConfiguration {
+	b.Versioning = value
 	return b
 }
 

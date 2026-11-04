@@ -34,7 +34,7 @@ func TestGetResourceReqs(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		flags     map[string]any
+		flags     []dummy.Flag
 		existing  *v1.ResourceRequirements
 		wantErr   bool
 		wantReqs  map[v1.ResourceName]resource.Quantity
@@ -42,46 +42,46 @@ func TestGetResourceReqs(t *testing.T) {
 	}{
 		{
 			name:      "no flags yields empty maps",
-			flags:     map[string]any{},
+			flags:     []dummy.Flag{},
 			wantReqs:  map[v1.ResourceName]resource.Quantity{},
 			wantLimit: map[v1.ResourceName]resource.Quantity{},
 		},
 		{
 			name:      "mincpu only defaults limit to request",
-			flags:     map[string]any{flagkey.RuntimeMincpu: 100},
+			flags:     []dummy.Flag{dummy.Int(flagkey.RuntimeMincpu, 100)},
 			wantReqs:  map[v1.ResourceName]resource.Quantity{v1.ResourceCPU: mustQty("100m")},
 			wantLimit: map[v1.ResourceName]resource.Quantity{v1.ResourceCPU: mustQty("100m")},
 		},
 		{
 			name:      "minmemory only defaults limit to request",
-			flags:     map[string]any{flagkey.RuntimeMinmemory: 64},
+			flags:     []dummy.Flag{dummy.Int(flagkey.RuntimeMinmemory, 64)},
 			wantReqs:  map[v1.ResourceName]resource.Quantity{v1.ResourceMemory: mustQty("64Mi")},
 			wantLimit: map[v1.ResourceName]resource.Quantity{v1.ResourceMemory: mustQty("64Mi")},
 		},
 		{
 			name: "valid cpu and memory ranges",
-			flags: map[string]any{
-				flagkey.RuntimeMincpu:    100,
-				flagkey.RuntimeMaxcpu:    200,
-				flagkey.RuntimeMinmemory: 64,
-				flagkey.RuntimeMaxmemory: 128,
+			flags: []dummy.Flag{
+				dummy.Int(flagkey.RuntimeMincpu, 100),
+				dummy.Int(flagkey.RuntimeMaxcpu, 200),
+				dummy.Int(flagkey.RuntimeMinmemory, 64),
+				dummy.Int(flagkey.RuntimeMaxmemory, 128),
 			},
 			wantReqs:  map[v1.ResourceName]resource.Quantity{v1.ResourceCPU: mustQty("100m"), v1.ResourceMemory: mustQty("64Mi")},
 			wantLimit: map[v1.ResourceName]resource.Quantity{v1.ResourceCPU: mustQty("200m"), v1.ResourceMemory: mustQty("128Mi")},
 		},
 		{
 			name:    "mincpu greater than maxcpu errors",
-			flags:   map[string]any{flagkey.RuntimeMincpu: 200, flagkey.RuntimeMaxcpu: 100},
+			flags:   []dummy.Flag{dummy.Int(flagkey.RuntimeMincpu, 200), dummy.Int(flagkey.RuntimeMaxcpu, 100)},
 			wantErr: true,
 		},
 		{
 			name:    "minmemory greater than maxmemory errors",
-			flags:   map[string]any{flagkey.RuntimeMinmemory: 128, flagkey.RuntimeMaxmemory: 64},
+			flags:   []dummy.Flag{dummy.Int(flagkey.RuntimeMinmemory, 128), dummy.Int(flagkey.RuntimeMaxmemory, 64)},
 			wantErr: true,
 		},
 		{
 			name:      "existing requirements are preserved",
-			flags:     map[string]any{},
+			flags:     []dummy.Flag{},
 			existing:  &v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: mustQty("50m")}, Limits: v1.ResourceList{v1.ResourceCPU: mustQty("50m")}},
 			wantReqs:  map[v1.ResourceName]resource.Quantity{v1.ResourceCPU: mustQty("50m")},
 			wantLimit: map[v1.ResourceName]resource.Quantity{v1.ResourceCPU: mustQty("50m")},
@@ -91,10 +91,7 @@ func TestGetResourceReqs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			in := dummy.TestFlagSet()
-			for k, v := range tt.flags {
-				in.Set(k, v)
-			}
+			in := dummy.TestFlagSetWith(tt.flags...)
 			got, err := GetResourceReqs(in, tt.existing)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -146,8 +143,8 @@ func TestApplyLabelsAndAnnotations(t *testing.T) {
 	t.Run("applies labels and annotations", func(t *testing.T) {
 		t.Parallel()
 		in := dummy.TestFlagSet()
-		in.Set(flagkey.Labels, "team=a,env=prod")
-		in.Set(flagkey.Annotation, []string{"owner=me"})
+		in.SetString(flagkey.Labels, "team=a,env=prod")
+		in.SetStringSlice(flagkey.Annotation, []string{"owner=me"})
 		om := &metav1.ObjectMeta{}
 		require.NoError(t, ApplyLabelsAndAnnotations(in, om))
 		assert.Equal(t, map[string]string{"team": "a", "env": "prod"}, om.Labels)
@@ -166,14 +163,14 @@ func TestApplyLabelsAndAnnotations(t *testing.T) {
 	t.Run("invalid label errors", func(t *testing.T) {
 		t.Parallel()
 		in := dummy.TestFlagSet()
-		in.Set(flagkey.Labels, "not a label")
+		in.SetString(flagkey.Labels, "not a label")
 		require.Error(t, ApplyLabelsAndAnnotations(in, &metav1.ObjectMeta{}))
 	})
 
 	t.Run("invalid annotation errors", func(t *testing.T) {
 		t.Parallel()
 		in := dummy.TestFlagSet()
-		in.Set(flagkey.Annotation, []string{"noequals"})
+		in.SetStringSlice(flagkey.Annotation, []string{"noequals"})
 		require.Error(t, ApplyLabelsAndAnnotations(in, &metav1.ObjectMeta{}))
 	})
 }
@@ -182,7 +179,7 @@ func TestGetSpecDir(t *testing.T) {
 	t.Parallel()
 	in := dummy.TestFlagSet()
 	assert.Equal(t, "specs", GetSpecDir(in))
-	in.Set(flagkey.SpecDir, "custom")
+	in.SetString(flagkey.SpecDir, "custom")
 	assert.Equal(t, "custom", GetSpecDir(in))
 }
 
@@ -190,7 +187,7 @@ func TestGetSpecIgnore(t *testing.T) {
 	t.Parallel()
 	in := dummy.TestFlagSet()
 	assert.Equal(t, SPEC_IGNORE_FILE, GetSpecIgnore(in))
-	in.Set(flagkey.SpecIgnore, ".myignore")
+	in.SetString(flagkey.SpecIgnore, ".myignore")
 	assert.Equal(t, ".myignore", GetSpecIgnore(in))
 }
 
@@ -208,7 +205,7 @@ func TestGetValidationFlag(t *testing.T) {
 	for _, tt := range tests {
 		in := dummy.TestFlagSet()
 		if tt.val != "" {
-			in.Set(flagkey.SpecValidate, tt.val)
+			in.SetString(flagkey.SpecValidate, tt.val)
 		}
 		assert.Equal(t, tt.want, GetValidationFlag(in), "val=%q", tt.val)
 	}
@@ -243,7 +240,7 @@ func TestGetSpecIgnoreParser(t *testing.T) {
 
 func TestCheckFunctionExistence(t *testing.T) {
 	t.Parallel()
-	fn := &fv1.Function{ObjectMeta: metav1.ObjectMeta{Name: "exists", Namespace: "default"}}
+	fn := &fv1.Function{Name: "exists", Namespace: "default"}
 	client := cmd.Client{FissionClientSet: fissionfake.NewClientset(fn)}
 
 	require.NoError(t, CheckFunctionExistence(t.Context(), client, []string{"exists"}, "default"))
@@ -256,23 +253,23 @@ func TestCheckFunctionExistence(t *testing.T) {
 func TestCheckHTTPTriggerDuplicates(t *testing.T) {
 	t.Parallel()
 	existing := &fv1.HTTPTrigger{
-		ObjectMeta: metav1.ObjectMeta{Name: "t1", Namespace: "default"},
-		Spec:       fv1.HTTPTriggerSpec{RelativeURL: "/foo", Method: http.MethodGet},
+		Name: "t1", Namespace: "default",
+		Spec: fv1.HTTPTriggerSpec{RelativeURL: "/foo", Method: http.MethodGet},
 	}
 	client := cmd.Client{FissionClientSet: fissionfake.NewClientset(existing)}
 
 	t.Run("same host url method is a duplicate", func(t *testing.T) {
 		dup := &fv1.HTTPTrigger{
-			ObjectMeta: metav1.ObjectMeta{Name: "t2", Namespace: "default"},
-			Spec:       fv1.HTTPTriggerSpec{RelativeURL: "/foo", Method: http.MethodGet},
+			Name: "t2", Namespace: "default",
+			Spec: fv1.HTTPTriggerSpec{RelativeURL: "/foo", Method: http.MethodGet},
 		}
 		require.Error(t, CheckHTTPTriggerDuplicates(t.Context(), client, dup))
 	})
 
 	t.Run("different url is not a duplicate", func(t *testing.T) {
 		ok := &fv1.HTTPTrigger{
-			ObjectMeta: metav1.ObjectMeta{Name: "t3", Namespace: "default"},
-			Spec:       fv1.HTTPTriggerSpec{RelativeURL: "/bar", Method: http.MethodGet},
+			Name: "t3", Namespace: "default",
+			Spec: fv1.HTTPTriggerSpec{RelativeURL: "/bar", Method: http.MethodGet},
 		}
 		require.NoError(t, CheckHTTPTriggerDuplicates(t.Context(), client, ok))
 	})
@@ -284,8 +281,8 @@ func TestCheckHTTPTriggerDuplicates(t *testing.T) {
 
 func TestSecretAndConfigMapExists(t *testing.T) {
 	t.Parallel()
-	secret := &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default"}}
-	cm := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "default"}}
+	secret := &v1.Secret{Name: "s", Namespace: "default"}
+	cm := &v1.ConfigMap{Name: "c", Namespace: "default"}
 	kc := k8sfake.NewClientset(secret, cm)
 
 	require.NoError(t, SecretExists(t.Context(), &metav1.ObjectMeta{Name: "s", Namespace: "default"}, kc))
@@ -300,7 +297,7 @@ func TestGetSvcName(t *testing.T) {
 
 	t.Run("single matching service", func(t *testing.T) {
 		t.Parallel()
-		svc := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "router", Namespace: "fission", Labels: map[string]string{"application": "fission-router"}}}
+		svc := &v1.Service{Name: "router", Namespace: "fission", Labels: map[string]string{"application": "fission-router"}}
 		kc := k8sfake.NewClientset(svc)
 		name, err := GetSvcName(t.Context(), kc, "fission-router")
 		require.NoError(t, err)
@@ -316,8 +313,8 @@ func TestGetSvcName(t *testing.T) {
 
 	t.Run("multiple matching services error", func(t *testing.T) {
 		t.Parallel()
-		s1 := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: "fission", Labels: map[string]string{"application": "fission-router"}}}
-		s2 := &v1.Service{ObjectMeta: metav1.ObjectMeta{Name: "r2", Namespace: "fission", Labels: map[string]string{"application": "fission-router"}}}
+		s1 := &v1.Service{Name: "r1", Namespace: "fission", Labels: map[string]string{"application": "fission-router"}}
+		s2 := &v1.Service{Name: "r2", Namespace: "fission", Labels: map[string]string{"application": "fission-router"}}
 		kc := k8sfake.NewClientset(s1, s2)
 		_, err := GetSvcName(t.Context(), kc, "fission-router")
 		require.Error(t, err)
@@ -403,8 +400,8 @@ func TestFunctionPodLogs(t *testing.T) {
 	t.Run("no pods for function errors", func(t *testing.T) {
 		t.Parallel()
 		fn := &fv1.Function{
-			ObjectMeta: metav1.ObjectMeta{Name: "fn", Namespace: "default", UID: "uid-1"},
-			Spec:       fv1.FunctionSpec{Environment: fv1.EnvironmentReference{Name: "nodejs", Namespace: "default"}},
+			Name: "fn", Namespace: "default", UID: "uid-1",
+			Spec: fv1.FunctionSpec{Environment: fv1.EnvironmentReference{Name: "nodejs", Namespace: "default"}},
 		}
 		client := cmd.Client{
 			FissionClientSet: fissionfake.NewClientset(fn),
@@ -414,4 +411,22 @@ func TestFunctionPodLogs(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no active pods")
 	})
+}
+
+// TestGetRouterInternalURLIgnoresPublicRouterVar locks in that the internal
+// listener's resolution never falls back to FISSION_ROUTER_URL (the public
+// listener's override): the two are unrelated env vars, and a fallback here
+// would silently point `fn test`/`fn test --async` HMAC-signed requests at
+// the wrong (public) listener. With FISSION_ROUTER_INTERNAL_URL unset and no
+// cluster to port-forward to, resolution must fail on pod discovery, not
+// quietly succeed with the public URL.
+func TestGetRouterInternalURLIgnoresPublicRouterVar(t *testing.T) {
+	t.Setenv("FISSION_ROUTER_URL", "http://should-not-be-used.invalid")
+	t.Setenv("FISSION_ROUTER_INTERNAL_URL", "")
+
+	client := cmd.Client{KubernetesClient: k8sfake.NewClientset()}
+	_, err := GetRouterInternalURL(t.Context(), client)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "should-not-be-used")
+	assert.Contains(t, err.Error(), "no available pod")
 }

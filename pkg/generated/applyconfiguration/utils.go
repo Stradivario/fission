@@ -20,6 +20,8 @@ import (
 func ForKind(kind schema.GroupVersionKind) interface{} {
 	switch kind {
 	// Group=fission.io, Version=v1
+	case v1.SchemeGroupVersion.WithKind("AliasTargetRecord"):
+		return &corev1.AliasTargetRecordApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("Archive"):
 		return &corev1.ArchiveApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("Builder"):
@@ -34,6 +36,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &corev1.ChecksumApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("ConfigMapReference"):
 		return &corev1.ConfigMapReferenceApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("DestinationRef"):
+		return &corev1.DestinationRefApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("Environment"):
 		return &corev1.EnvironmentApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("EnvironmentReference"):
@@ -52,6 +56,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &corev1.FissionTenantStatusApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("Function"):
 		return &corev1.FunctionApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("FunctionAlias"):
+		return &corev1.FunctionAliasApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("FunctionAliasSpec"):
+		return &corev1.FunctionAliasSpecApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("FunctionAliasStatus"):
+		return &corev1.FunctionAliasStatusApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("FunctionPackageRef"):
 		return &corev1.FunctionPackageRefApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("FunctionReference"):
@@ -60,6 +70,10 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &corev1.FunctionSpecApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("FunctionStatus"):
 		return &corev1.FunctionStatusApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("FunctionVersion"):
+		return &corev1.FunctionVersionApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("FunctionVersionSpec"):
+		return &corev1.FunctionVersionSpecApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("GatewayParentRef"):
 		return &corev1.GatewayParentRefApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("GatewayRouteConfig"):
@@ -74,6 +88,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &corev1.HTTPTriggerStatusApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("IngressConfig"):
 		return &corev1.IngressConfigApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("InvocationConfig"):
+		return &corev1.InvocationConfigApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("InvokeStrategy"):
 		return &corev1.InvokeStrategyApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("KubernetesWatchTrigger"):
@@ -98,12 +114,22 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &corev1.PackageSpecApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("PackageStatus"):
 		return &corev1.PackageStatusApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("ProvisionedConcurrencyConfig"):
+		return &corev1.ProvisionedConcurrencyConfigApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("ProvisionedWindow"):
+		return &corev1.ProvisionedWindowApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("RetryPolicy"):
+		return &corev1.RetryPolicyApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("RouteConfig"):
 		return &corev1.RouteConfigApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("Runtime"):
 		return &corev1.RuntimeApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("SecretReference"):
 		return &corev1.SecretReferenceApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("StateConfig"):
+		return &corev1.StateConfigApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("StickyConfig"):
+		return &corev1.StickyConfigApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("StreamingConfig"):
 		return &corev1.StreamingConfigApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("TimeTrigger"):
@@ -114,6 +140,38 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &corev1.TimeTriggerStatusApplyConfiguration{}
 	case v1.SchemeGroupVersion.WithKind("ToolConfig"):
 		return &corev1.ToolConfigApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("TopicRef"):
+		return &corev1.TopicRefApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("VersioningConfig"):
+		return &corev1.VersioningConfigApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("Workflow"):
+		return &corev1.WorkflowApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowBranch"):
+		return &corev1.WorkflowBranchApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowBranchState"):
+		return &corev1.WorkflowBranchStateApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowCatchRoute"):
+		return &corev1.WorkflowCatchRouteApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowChoiceCondition"):
+		return &corev1.WorkflowChoiceConditionApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowChoiceRule"):
+		return &corev1.WorkflowChoiceRuleApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowRetentionPolicy"):
+		return &corev1.WorkflowRetentionPolicyApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowRun"):
+		return &corev1.WorkflowRunApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowRunEventSummary"):
+		return &corev1.WorkflowRunEventSummaryApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowRunSpec"):
+		return &corev1.WorkflowRunSpecApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowRunStatus"):
+		return &corev1.WorkflowRunStatusApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowSpec"):
+		return &corev1.WorkflowSpecApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowState"):
+		return &corev1.WorkflowStateApplyConfiguration{}
+	case v1.SchemeGroupVersion.WithKind("WorkflowStatus"):
+		return &corev1.WorkflowStatusApplyConfiguration{}
 
 	}
 	return nil

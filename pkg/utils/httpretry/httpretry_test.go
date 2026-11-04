@@ -111,6 +111,52 @@ func TestRetriesOn429(t *testing.T) {
 	assert.Equal(t, int32(2), attempts.Load())
 }
 
+// TestNoRetryOn429SkipsRetry pins the executor client's opt-out: a 429 must
+// propagate on the first attempt when NoRetryOn429 is set, so deliberate
+// back-pressure (the per-function concurrency limit, the per-environment pod
+// cap) fast-fails instead of being retried and eventually surfaced as a
+// generic "giving up" error that erases the original 429.
+func TestNoRetryOn429SkipsRetry(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	opts := fastOpts(3)
+	opts.NoRetryOn429 = true
+	resp, err := newClient(opts).Get(srv.URL) //nolint:noctx
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
+	assert.Equal(t, int32(1), attempts.Load(), "429 must not be retried when NoRetryOn429 is set")
+}
+
+// TestNoRetryOn429StillRetries5xx confirms NoRetryOn429 is scoped to 429 only:
+// 5xx responses still retry per the default policy.
+func TestNoRetryOn429StillRetries5xx(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) < 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	opts := fastOpts(3)
+	opts.NoRetryOn429 = true
+	resp, err := newClient(opts).Get(srv.URL) //nolint:noctx
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, int32(2), attempts.Load(), "NoRetryOn429 must not suppress the 5xx retry")
+}
+
 // TestRewindsBodyEachAttempt is the load-bearing case: the HMAC signer reads
 // the body to sign it, so every retried attempt must see the full body again.
 func TestRewindsBodyEachAttempt(t *testing.T) {

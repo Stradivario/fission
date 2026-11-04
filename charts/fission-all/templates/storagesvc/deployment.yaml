@@ -48,6 +48,8 @@ spec:
         {{- if .Values.storagesvc.archivePruner.enabled }}
         - name: PRUNE_INTERVAL
           value: "{{.Values.storagesvc.archivePruner.interval}}"
+        - name: PRUNE_MAX_ORPHANS_PER_CYCLE
+          value: "{{.Values.storagesvc.archivePruner.maxOrphansPerCycle}}"
         {{- end }}
         - name: DEBUG_ENV
           value: {{ .Values.debugEnv | quote }}

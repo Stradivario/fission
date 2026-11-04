@@ -8,6 +8,7 @@ package v1
 
 import (
 	corev1 "github.com/fission/fission/pkg/apis/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 // TimeTriggerSpecApplyConfiguration represents a declarative configuration of the TimeTriggerSpec type for use
@@ -18,13 +19,22 @@ import (
 type TimeTriggerSpecApplyConfiguration struct {
 	// Cron schedule
 	Cron *string `json:"cron,omitempty"`
-	// The reference to function
+	// The reference to function. Alias is read from the embedded
+	// FunctionReference.Alias (RFC-0025) — TimeTriggerSpec has no field of
+	// its own for it, so there is exactly one JSON path (spec.functionref.alias)
+	// and one Go path (spec.Alias, promoted) for the concept, never two
+	// competing ones. The timer publisher (a later RFC-0025 task) reads it
+	// the same way timer.go:80 already reads the promoted spec.Name today.
 	*FunctionReferenceApplyConfiguration `json:"functionref,omitempty"`
 	// HTTP Method for trigger, ex : GET, POST, PUT, DELETE, HEAD (default: "POST")
 	Method *string `json:"method,omitempty"`
 	// Subpath to trigger a specific route if function
 	// internally supports routing, (default: "/")
 	Subpath *string `json:"subpath,omitempty"`
+	// WorkflowInput is the input of every run a workflow-targeting
+	// trigger (functionref.type "workflow") starts. Any JSON value; empty
+	// means {}. Ignored for function targets.
+	WorkflowInput *apiextensionsv1.JSON `json:"workflowInput,omitempty"`
 }
 
 // TimeTriggerSpecApplyConfiguration constructs a declarative configuration of the TimeTriggerSpec type for use with
@@ -56,6 +66,24 @@ func (b *TimeTriggerSpecApplyConfiguration) WithType(value corev1.FunctionRefere
 func (b *TimeTriggerSpecApplyConfiguration) WithName(value string) *TimeTriggerSpecApplyConfiguration {
 	b.ensureFunctionReferenceApplyConfigurationExists()
 	b.FunctionReferenceApplyConfiguration.Name = &value
+	return b
+}
+
+// WithAlias sets the Alias field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Alias field is set to the value of the last call.
+func (b *TimeTriggerSpecApplyConfiguration) WithAlias(value string) *TimeTriggerSpecApplyConfiguration {
+	b.ensureFunctionReferenceApplyConfigurationExists()
+	b.FunctionReferenceApplyConfiguration.Alias = &value
+	return b
+}
+
+// WithVersion sets the Version field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Version field is set to the value of the last call.
+func (b *TimeTriggerSpecApplyConfiguration) WithVersion(value string) *TimeTriggerSpecApplyConfiguration {
+	b.ensureFunctionReferenceApplyConfigurationExists()
+	b.FunctionReferenceApplyConfiguration.Version = &value
 	return b
 }
 
@@ -93,5 +121,13 @@ func (b *TimeTriggerSpecApplyConfiguration) WithMethod(value string) *TimeTrigge
 // If called multiple times, the Subpath field is set to the value of the last call.
 func (b *TimeTriggerSpecApplyConfiguration) WithSubpath(value string) *TimeTriggerSpecApplyConfiguration {
 	b.Subpath = &value
+	return b
+}
+
+// WithWorkflowInput sets the WorkflowInput field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the WorkflowInput field is set to the value of the last call.
+func (b *TimeTriggerSpecApplyConfiguration) WithWorkflowInput(value apiextensionsv1.JSON) *TimeTriggerSpecApplyConfiguration {
+	b.WorkflowInput = &value
 	return b
 }

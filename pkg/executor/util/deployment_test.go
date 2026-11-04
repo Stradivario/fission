@@ -14,7 +14,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	apiv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -24,11 +23,11 @@ import (
 )
 
 func secret(ns, name, rv string) *apiv1.Secret {
-	return &apiv1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, ResourceVersion: rv}}
+	return &apiv1.Secret{Namespace: ns, Name: name, ResourceVersion: rv}
 }
 
 func configMap(ns, name, rv string) *apiv1.ConfigMap {
-	return &apiv1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, ResourceVersion: rv}}
+	return &apiv1.ConfigMap{Namespace: ns, Name: name, ResourceVersion: rv}
 }
 
 func secretRef(ns, name string) fv1.SecretReference {
@@ -47,16 +46,17 @@ func TestReferencedResourcesRVSum(t *testing.T) {
 	tests := []struct {
 		name    string
 		objects []runtime.Object
-		secrets []fv1.SecretReference
-		cfgmaps []fv1.ConfigMapReference
+		spec    fv1.FunctionSpec
 		want    int64
 	}{
 		{
 			name:    "sums referenced secret and configmap resource versions",
 			objects: []runtime.Object{secret(ns, "s1", "10"), configMap(ns, "c1", "20")},
-			secrets: []fv1.SecretReference{secretRef(ns, "s1")},
-			cfgmaps: []fv1.ConfigMapReference{configMapRef(ns, "c1")},
-			want:    30,
+			spec: fv1.FunctionSpec{
+				Secrets:    []fv1.SecretReference{secretRef(ns, "s1")},
+				ConfigMaps: []fv1.ConfigMapReference{configMapRef(ns, "c1")},
+			},
+			want: 30,
 		},
 		{
 			name: "ignores unreferenced objects in the namespace",
@@ -64,9 +64,11 @@ func TestReferencedResourcesRVSum(t *testing.T) {
 				secret(ns, "s1", "10"), secret(ns, "s2", "99"),
 				configMap(ns, "c1", "20"), configMap(ns, "c2", "77"),
 			},
-			secrets: []fv1.SecretReference{secretRef(ns, "s1")},
-			cfgmaps: []fv1.ConfigMapReference{configMapRef(ns, "c1")},
-			want:    30,
+			spec: fv1.FunctionSpec{
+				Secrets:    []fv1.SecretReference{secretRef(ns, "s1")},
+				ConfigMaps: []fv1.ConfigMapReference{configMapRef(ns, "c1")},
+			},
+			want: 30,
 		},
 		{
 			name:    "empty references return zero without listing",
@@ -76,14 +78,53 @@ func TestReferencedResourcesRVSum(t *testing.T) {
 		{
 			name:    "missing referenced object contributes zero and does not error",
 			objects: []runtime.Object{secret(ns, "s1", "10")},
-			secrets: []fv1.SecretReference{secretRef(ns, "s1"), secretRef(ns, "ghost")},
-			want:    10,
+			spec: fv1.FunctionSpec{
+				Secrets: []fv1.SecretReference{secretRef(ns, "s1"), secretRef(ns, "ghost")},
+			},
+			want: 10,
 		},
 		{
 			name:    "cross-namespace reference is skipped",
 			objects: []runtime.Object{secret("other", "s1", "10")},
-			secrets: []fv1.SecretReference{secretRef("other", "s1")},
-			want:    0,
+			spec: fv1.FunctionSpec{
+				Secrets: []fv1.SecretReference{secretRef("other", "s1")},
+			},
+			want: 0,
+		},
+		{
+			name:    "env valueFrom references contribute (RFC-0030)",
+			objects: []runtime.Object{secret(ns, "s1", "10"), configMap(ns, "c1", "20")},
+			spec: fv1.FunctionSpec{
+				Env: []apiv1.EnvVar{
+					{Name: "A", ValueFrom: &apiv1.EnvVarSource{SecretKeyRef: &apiv1.SecretKeySelector{
+						Name: "s1", Key: "k"}}},
+					{Name: "B", ValueFrom: &apiv1.EnvVarSource{ConfigMapKeyRef: &apiv1.ConfigMapKeySelector{
+						Name: "c1", Key: "k"}}},
+				},
+			},
+			want: 30,
+		},
+		{
+			name:    "envFrom references contribute (RFC-0030)",
+			objects: []runtime.Object{secret(ns, "s1", "10"), configMap(ns, "c1", "20")},
+			spec: fv1.FunctionSpec{
+				EnvFrom: []apiv1.EnvFromSource{
+					{SecretRef: &apiv1.SecretEnvSource{Name: "s1"}},
+					{ConfigMapRef: &apiv1.ConfigMapEnvSource{Name: "c1"}},
+				},
+			},
+			want: 30,
+		},
+		{
+			name:    "object referenced via both channels contributes once",
+			objects: []runtime.Object{secret(ns, "s1", "10")},
+			spec: fv1.FunctionSpec{
+				Secrets: []fv1.SecretReference{secretRef(ns, "s1")},
+				EnvFrom: []apiv1.EnvFromSource{
+					{SecretRef: &apiv1.SecretEnvSource{Name: "s1"}},
+				},
+			},
+			want: 10,
 		},
 	}
 
@@ -91,7 +132,7 @@ func TestReferencedResourcesRVSum(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			client := fake.NewClientset(tc.objects...)
-			got, err := ReferencedResourcesRVSum(t.Context(), client, ns, tc.secrets, tc.cfgmaps)
+			got, err := ReferencedResourcesRVSum(t.Context(), client, ns, tc.spec)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
 		})
@@ -104,8 +145,8 @@ func TestScaleDeployment(t *testing.T) {
 	const ns, name = "default", "dep1"
 	replicas := int32(1)
 	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
-		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Namespace: ns, Name: name,
+		Spec: appsv1.DeploymentSpec{Replicas: &replicas},
 	}
 	client := fake.NewClientset(dep)
 
@@ -117,7 +158,9 @@ func TestScaleDeployment(t *testing.T) {
 		if action.GetSubresource() != "scale" {
 			return false, nil, nil
 		}
+		// SAFETY: this reactor is registered for "update" on the scale subresource, so the action is an UpdateAction carrying a *Scale.
 		obj := action.(k8stesting.UpdateAction).GetObject()
+		// SAFETY: see above; the update object on the scale subresource is a *Scale.
 		captured = obj.(*autoscalingv1.Scale)
 		return true, obj, nil
 	})
@@ -136,8 +179,8 @@ func TestWaitForDeployment(t *testing.T) {
 	t.Run("returns once available replicas meet the target", func(t *testing.T) {
 		t.Parallel()
 		dep := &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ready"},
-			Status:     appsv1.DeploymentStatus{AvailableReplicas: 1},
+			Namespace: ns, Name: "ready",
+			Status: appsv1.DeploymentStatus{AvailableReplicas: 1},
 		}
 		client := fake.NewClientset(dep)
 
@@ -154,7 +197,7 @@ func TestWaitForDeployment(t *testing.T) {
 	t.Run("surfaces a get error", func(t *testing.T) {
 		t.Parallel()
 		client := fake.NewClientset()
-		missing := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "ghost"}}
+		missing := &appsv1.Deployment{Namespace: ns, Name: "ghost"}
 
 		got, err := WaitForDeployment(t.Context(), client, loggerfactory.GetLogger(), missing, 1, 1)
 		require.Error(t, err)
@@ -167,8 +210,8 @@ func TestWaitForDeployment(t *testing.T) {
 		// otherwise sleep; a cancelled context must short-circuit instead of
 		// blocking for the (floored) timeout window.
 		dep := &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "pending"},
-			Status:     appsv1.DeploymentStatus{AvailableReplicas: 0},
+			Namespace: ns, Name: "pending",
+			Status: appsv1.DeploymentStatus{AvailableReplicas: 0},
 		}
 		client := fake.NewClientset(dep)
 		ctx, cancel := context.WithCancel(t.Context())

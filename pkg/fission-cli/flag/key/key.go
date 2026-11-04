@@ -37,61 +37,127 @@ const (
 	ReplicasMinscale = "minscale"
 	ReplicasMaxscale = "maxscale"
 
-	FnName                  = resourceName
-	FnSpecializationTimeout = "specializationtimeout"
-	FnEnvironmentName       = "env"
-	FnPackageName           = "pkgname"
-	FnImageName             = "image"
-	FnPort                  = "port"
-	FnCommand               = "command"
-	FnArgs                  = "args"
-	FnEntrypoint            = "entrypoint"
-	FnBuildCmd              = "buildcmd"
-	FnSecret                = "secret"
-	FnForce                 = force
-	FnCfgMap                = "configmap"
-	FnExecutorType          = "executortype"
-	FnExecutionTimeout      = "fntimeout"
-	FnTestTimeout           = "timeout"
-	FnLogPod                = "pod"
-	FnLogFollow             = "follow"
-	FnLogDetail             = "detail"
-	FnLogDBType             = "dbtype"
-	FnLogReverseQuery       = "reverse"
-	FnLogCount              = "recordcount"
-	FnLogRequestID          = "request-id"
-	FnLogTraceID            = "trace-id"
-	FnLogLevel              = "level"
-	FnTestBody              = "body"
-	FnTestHeader            = "header"
-	FnTestQuery             = "query"
-	FnIdleTimeout           = "idletimeout"
-	FnStreaming             = "streaming"
-	FnStreamingProtocol     = "streamingprotocol"
-	FnStreamingIdleTimeout  = "streamingidletimeout"
-	FnStreamingMaxDuration  = "streamingmaxduration"
-	FnExposeAsMCP           = "expose-as-mcp"
-	FnToolDescription       = "tool-description"
-	FnToolInputSchema       = "tool-input-schema"
-	FnToolName              = "tool-name"
-	FnConcurrency           = "concurrency"
-	FnRequestsPerPod        = "requestsperpod"
-	FnOnceOnly              = "onceonly"
-	FnSubPath               = "subpath"
-	FnRunEnvVersion         = "env-version"
-	FnRunKeep               = "keep"
-	FnRunWatch              = "watch"
-	FnRunDebugPort          = "debug-port"
-	FnRunEnvVar             = "env-var"
-	FnRunEnvFile            = "env-from"
-	FnRunBuild              = "build"
-	FnRunBuilderImage       = "builder-image"
-	FnGracePeriod           = "graceperiod"
-	FnLogAllPods            = "all-pods"
-	FnRetainPods            = "retainpods"
+	FnName                   = resourceName
+	FnSpecializationTimeout  = "specializationtimeout"
+	FnEnvironmentName        = "env"
+	FnPackageName            = "pkgname"
+	FnImageName              = "image"
+	FnPort                   = "port"
+	FnCommand                = "command"
+	FnArgs                   = "args"
+	FnEntrypoint             = "entrypoint"
+	FnBuildCmd               = "buildcmd"
+	FnSecret                 = "secret"
+	FnForce                  = force
+	FnCfgMap                 = "configmap"
+	FnSecretMount            = "secret-mount"
+	FnCfgMapMount            = "configmap-mount"
+	FnEnvVar                 = "env-var"
+	FnEnvFromSecret          = "env-from-secret"
+	FnEnvFromConfigMap       = "env-from-configmap"
+	FnExecutorType           = "executortype"
+	FnExecutionTimeout       = "fntimeout"
+	FnTestTimeout            = "timeout"
+	FnLogPod                 = "pod"
+	FnLogFollow              = "follow"
+	FnLogDetail              = "detail"
+	FnLogDBType              = "dbtype"
+	FnLogReverseQuery        = "reverse"
+	FnLogCount               = "recordcount"
+	FnLogRequestID           = "request-id"
+	FnLogTraceID             = "trace-id"
+	FnLogLevel               = "level"
+	FnTestBody               = "body"
+	FnTestHeader             = "header"
+	FnTestQuery              = "query"
+	FnIdleTimeout            = "idletimeout"
+	FnStreaming              = "streaming"
+	FnStreamingProtocol      = "streamingprotocol"
+	FnStreamingIdleTimeout   = "streamingidletimeout"
+	FnStreamingMaxDuration   = "streamingmaxduration"
+	FnExposeAsMCP            = "expose-as-mcp"
+	FnToolDescription        = "tool-description"
+	FnToolInputSchema        = "tool-input-schema"
+	FnToolName               = "tool-name"
+	FnConcurrency            = "concurrency"
+	FnRequestsPerPod         = "requestsperpod"
+	FnOnceOnly               = "onceonly"
+	FnSubPath                = "subpath"
+	FnRunEnvVersion          = "env-version"
+	FnRunKeep                = "keep"
+	FnRunWatch               = "watch"
+	FnRunDebugPort           = "debug-port"
+	FnRunEnvVar              = "env-var"
+	FnRunEnvFile             = "env-from"
+	FnRunBuild               = "build"
+	FnRunBuilderImage        = "builder-image"
+	FnGracePeriod            = "graceperiod"
+	FnLogAllPods             = "all-pods"
+	FnRetainPods             = "retainpods"
+	FnProvisionedConcurrency = "provisioned-concurrency"
+	FnProvisionedSchedule    = "provisioned-schedule"
+
+	// RFC-0025 versioning opt-in (fn create/update).
+	FnVersioning     = "versioning"
+	FnRetainVersions = "retain-versions"
+
+	DlqID    = "id"
+	DlqAll   = "all"
+	DlqLimit = "limit"
+
+	FnTestAsync = "async"
+
+	// RFC-0025 `fission fn test --alias`/`--version`: smoke-test a specific
+	// FunctionAlias or pinned FunctionVersion instead of the live function.
+	// Mutually exclusive with each other; the strings themselves are shared
+	// with AliasName/AliasVersion/FnRollbackAlias -- flag names are scoped
+	// per-subcommand, so reuse is fine.
+	FnTestAlias   = "alias"
+	FnTestVersion = "version"
+
+	// RFC-0025 `fission fn describe --version`: render the SNAPSHOT inspector
+	// for one pinned FunctionVersion instead of the live function view. The
+	// string is reused from FnTestVersion/FnPodsVersion/FnLogVersion -- flag
+	// names are scoped per-subcommand, so this is safe (see the FnTestAlias
+	// comment above).
+	FnDescribeVersion = "version"
+
+	// RFC-0024 async invocation config (fn create/update).
+	FnAsyncMaxAttempts = "async-retry-max-attempts"
+	FnAsyncMaxAge      = "async-max-age"
+	FnAsyncOnSuccess   = "async-on-success"
+	FnAsyncOnFailure   = "async-on-failure"
+	DlqQueue           = "queue"
+	// RFC-0027 `fission topic` dev commands.
+	TopicName        = "topic"
+	TopicData        = "data"
+	TopicContentType = "content-type"
+
+	TopicMQType = "mqtype"
+	TopicLimit  = "limit"
+	// RFC-0027 topic destinations (statestore built-in eventing).
+	FnAsyncOnSuccessTopic = "async-on-success-topic"
+	FnAsyncOnFailureTopic = "async-on-failure-topic"
+
+	// RFC-0023 `fission fn state` admin commands.
+	StateKey       = "key"
+	StateValue     = "value"
+	StatePrefix    = "prefix"
+	StateTTL       = "ttl"
+	StateIfVersion = "if-version"
+
+	// RFC-0023 keyed-state config (fn create/update).
+	FnState              = "state"
+	FnStateKeyspace      = "state-keyspace"
+	FnStateMaxKeys       = "state-max-keys"
+	FnStateMaxValueBytes = "state-max-value-bytes"
+	FnStateTTL           = "state-ttl"
+	FnStateStickySource  = "state-sticky-source"
+	FnStateStickyName    = "state-sticky-name"
 
 	HtName              = resourceName
 	HtMethod            = "method"
+	HtInvocationMode    = "invocation-mode"
 	HtUrl               = "url"
 	HtHost              = "host"
 	HtIngress           = "createingress"
@@ -106,6 +172,8 @@ const (
 	HtGateway           = "gateway"
 	HtFnName            = "function"
 	HtFnWeight          = "weight"
+	HtFnAlias           = "function-alias"
+	HtFnVersion         = "function-version"
 	HtFilter            = HtFnName
 	HtPrefix            = "prefix"
 	HtKeepPrefix        = "keepprefix"
@@ -114,11 +182,24 @@ const (
 	TokPassword = "password"
 	TokAuthURI  = "authuri"
 
+	// TriggerWorkflow targets a Workflow instead of a function (HTTP and
+	// time triggers); TriggerWorkflowInput is a time trigger's run input.
+	TriggerWorkflow      = "workflow"
+	TriggerWorkflowInput = "workflow-input"
+
 	TtName   = resourceName
 	TtCron   = "cron"
 	TtFnName = "function"
 	TtRound  = "round"
 	TtMethod = "method"
+
+	WfName     = resourceName
+	WfFile     = "file"
+	WfOffline  = "offline"
+	WfInput    = "input"
+	WfIO       = "io"
+	WfWorkflow = "workflow"
+	WfOpen     = "open"
 
 	MqtName            = resourceName
 	MqtFnName          = "function"
@@ -136,20 +217,23 @@ const (
 	MqtSecret          = "secret"
 	MqtKind            = "mqtkind"
 
-	EnvName            = resourceName
-	EnvPoolsize        = "poolsize"
-	EnvImage           = "image"
-	EnvBuilderImage    = "builder"
-	EnvBuildcommand    = "buildcmd"
-	EnvKeeparchive     = "keeparchive"
-	EnvExternalNetwork = "externalnetwork"
-	EnvGracePeriod     = "graceperiod"
-	EnvVersion         = "version"
-	EnvImagePullSecret = "imagepullsecret"
-	EnvExecutorType    = "executortype"
-	EnvForce           = force
-	EnvBuilder         = "builder-env"
-	EnvRuntime         = "runtime-env"
+	EnvName               = resourceName
+	EnvPoolsize           = "poolsize"
+	EnvImage              = "image"
+	EnvBuilderImage       = "builder"
+	EnvBuildcommand       = "buildcmd"
+	EnvBuilderIdleTimeout = "builder-idletimeout"
+	EnvBuilderPoolsize    = "builder-poolsize"
+	EnvKeeparchive        = "keeparchive"
+	EnvExternalNetwork    = "externalnetwork"
+	EnvGracePeriod        = "graceperiod"
+	EnvVersion            = "version"
+	EnvImagePullSecret    = "imagepullsecret"
+	EnvExecutorType       = "executortype"
+	EnvForce              = force
+	EnvBuilder            = "builder-env"
+	EnvRuntime            = "runtime-env"
+	EnvRuntimeClass       = "runtimeclass"
 
 	KwName      = resourceName
 	KwFnName    = "function"
@@ -165,12 +249,16 @@ const (
 	PkgDeployArchive  = "deployarchive"
 	PkgSrcChecksum    = "srcchecksum"
 	PkgDeployChecksum = "deploychecksum"
+	PkgSrcSecret      = "srcsecret"
+	PkgDeploySecret   = "deploysecret"
 	PkgInsecure       = "insecure"
 	PkgOCI            = "oci"
+	PkgSrcOCI         = "srcoci"
 	PkgBuildCmd       = "buildcmd"
 	PkgOutput         = Output
 	PkgStatus         = "status"
 	PkgOrphan         = "orphan"
+	PkgWatch          = "watch"
 
 	SpecSave             = "spec"
 	SpecDir              = "specdir"
@@ -208,6 +296,29 @@ const (
 	TenantFunctionNamespace = "function-namespace"
 	TenantBuilderNamespace  = "builder-namespace"
 	TenantForce             = "force"
+
+	// RFC-0025 `fission fn publish`.
+	PublishDescription = "description"
+	PublishWait        = "wait"
+
+	// RFC-0025 `fission alias` (FunctionAlias) commands.
+	AliasName             = resourceName
+	AliasFunction         = "function"
+	AliasVersion          = "version"
+	AliasPackageDigest    = "package-digest"
+	AliasWeight           = "weight"
+	AliasSecondaryVersion = "secondary-version"
+	AliasClearWeight      = "clear-weight"
+	AliasWait             = "wait"
+
+	// RFC-0025 `fission fn rollback`.
+	FnRollbackAlias  = "alias"
+	FnRollbackTo     = "to"
+	FnRollbackDetach = "detach"
+	FnRollbackWait   = "wait"
+
+	// RFC-0025 `fission fn gc-versions`.
+	GCVersionsKeep = "keep"
 
 	DefaultSpecOutputDir = "fission-dump"
 )

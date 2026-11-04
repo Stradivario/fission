@@ -64,7 +64,7 @@ func (opts *CreateSubCommand) run(input cli.Input) (err error) {
 		if err = opts.env.Validate(); err != nil {
 			return fv1.AggregateValidationErrors("Environment", err)
 		}
-		_, err = spec.SaveOrDry(input, *opts.env, fmt.Sprintf("env-%v.yaml", opts.env.Name))
+		_, err = spec.SaveOrDry(input, opts.env, fmt.Sprintf("env-%v.yaml", opts.env.Name))
 		return err
 	}
 
@@ -123,6 +123,22 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 		}
 	}
 
+	// Only set the pointer when the user provided a value so that an unset
+	// timeout falls back to the buildermgr default (600s).
+	var builderIdleTimeout *int64
+	if input.IsSet(flagkey.EnvBuilderIdleTimeout) {
+		v := input.Int64(flagkey.EnvBuilderIdleTimeout)
+		builderIdleTimeout = &v
+	}
+
+	// Only set the pointer when the user provided a value so that an unset
+	// pool size falls back to the buildermgr default (1 builder pod).
+	var builderPoolSize *int32
+	if input.IsSet(flagkey.EnvBuilderPoolsize) {
+		v := int32(input.Int(flagkey.EnvBuilderPoolsize))
+		builderPoolSize = &v
+	}
+
 	builderEnvParams := input.StringSlice(flagkey.EnvBuilder)
 	builderEnvList := util.GetEnvVarFromStringSlice(builderEnvParams)
 
@@ -163,8 +179,10 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 				},
 			},
 			Builder: fv1.Builder{
-				Image:   envBuilderImg,
-				Command: envBuildCmd,
+				Image:       envBuilderImg,
+				Command:     envBuildCmd,
+				IdleTimeout: builderIdleTimeout,
+				PoolSize:    builderPoolSize,
 				Container: &apiv1.Container{
 					Name: fv1.BuilderContainerName,
 					Env:  builderEnvList,
@@ -180,10 +198,18 @@ func createEnvironmentFromCmd(input cli.Input) (*fv1.Environment, error) {
 			Poolsize:                     poolsize,
 			Resources:                    *resourceReq,
 			AllowAccessToExternalNetwork: envExternalNetwork,
-			TerminationGracePeriod:       envGracePeriod,
+			TerminationGracePeriod:       new(envGracePeriod),
 			KeepArchive:                  keepArchive,
 			ImagePullSecret:              pullSecret,
 		},
+	}
+
+	if input.IsSet(flagkey.EnvRuntimeClass) {
+		// An explicit empty value leaves the field unset (same as `env update`),
+		// rather than setting &"" which server-side validation would then reject.
+		if rc := input.String(flagkey.EnvRuntimeClass); rc != "" {
+			env.Spec.RuntimeClassName = &rc
+		}
 	}
 
 	err = util.ApplyLabelsAndAnnotations(input, &env.ObjectMeta)

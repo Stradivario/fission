@@ -16,7 +16,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	otellogglobal "go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -53,8 +52,8 @@ type OtelConfig struct {
 // (comma-separated exporter names); the exact token "otlp" turns on metric push
 // (a token match, not a substring, so "otlphttp"/"notlp" do not enable it).
 func parseOtelConfig() OtelConfig {
-	config := OtelConfig{}
-	config.endpoint = os.Getenv(OtelEndpointEnvVar)
+	config := OtelConfig{
+		endpoint: os.Getenv(OtelEndpointEnvVar)}
 	insecure, err := strconv.ParseBool(os.Getenv(OtelInsecureEnvVar))
 	if err != nil {
 		insecure = true
@@ -193,7 +192,7 @@ func InitProvider(ctx context.Context, logger logr.Logger, serviceName string) (
 			sdklog.WithResource(res),
 			sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
 		)
-		otellogglobal.SetLoggerProvider(loggerProvider)
+		otel.SetLoggerProvider(loggerProvider)
 	}
 
 	// Shutdown will flush any remaining spans/logs and shut down the exporters.

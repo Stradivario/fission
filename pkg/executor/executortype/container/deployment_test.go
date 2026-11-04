@@ -36,7 +36,7 @@ func newTestContainer() *Container {
 func newTestContainerFunction() *fv1.Function {
 	grace := int64(30)
 	return &fv1.Function{
-		ObjectMeta: metav1.ObjectMeta{Name: "ctr-fn", Namespace: "default"},
+		Name: "ctr-fn", Namespace: "default",
 		Spec: fv1.FunctionSpec{
 			InvokeStrategy: fv1.InvokeStrategy{
 				ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypeContainer, MinScale: 1, MaxScale: 3},
@@ -100,6 +100,30 @@ func TestContainerGetDeploymentSpec(t *testing.T) {
 		assert.Equal(t, int32(2), *deployment.Spec.Replicas)
 	})
 
+	t.Run("nil TerminationGracePeriodSeconds falls back to the default", func(t *testing.T) {
+		cn := newTestContainer()
+		fn := newTestContainerFunction()
+		fn.Spec.PodSpec.TerminationGracePeriodSeconds = nil
+		replicas := int32(1)
+
+		deployment, err := cn.getDeploymentSpec(t.Context(), fn, &replicas, "ctr-fn", "default", nil, nil)
+		require.NoError(t, err)
+
+		pod := deployment.Spec.Template.Spec
+		require.NotNil(t, pod.TerminationGracePeriodSeconds)
+		assert.Equal(t, int64(6*60), *pod.TerminationGracePeriodSeconds)
+	})
+
+	t.Run("nil PodSpec returns an error instead of panicking", func(t *testing.T) {
+		cn := newTestContainer()
+		fn := newTestContainerFunction()
+		fn.Spec.PodSpec = nil
+		replicas := int32(1)
+
+		_, err := cn.getDeploymentSpec(t.Context(), fn, &replicas, "ctr-fn", "default", nil, nil)
+		require.Error(t, err)
+	})
+
 	t.Run("istio disables sidecar injection", func(t *testing.T) {
 		cn := newTestContainer()
 		cn.useIstio = true
@@ -143,7 +167,7 @@ func TestContainerFnDeleteCacheMiss(t *testing.T) {
 	fn := newTestContainerFunction()
 	fn.UID = "abcdef01-2345-6789-abcd-ef0123456789"
 
-	// fsCache is intentionally left empty so GetByFunctionUID misses.
+	// fsCache is intentionally left empty so ListByFunctionUID finds nothing.
 	require.NoError(t, cn.fnDelete(t.Context(), fn),
 		"fnDelete must tolerate a cache miss and clean up by computed name")
 }

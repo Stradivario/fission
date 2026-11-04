@@ -16,7 +16,7 @@ func Commands() *cobra.Command {
 		Use:   "create",
 		Short: "Create a time trigger",
 	}, Create, flag.FlagSet{
-		Optional: []flag.Flag{flag.TtName, flag.TtFnName,
+		Optional: []flag.Flag{flag.TtName, flag.TtFnName, flag.TtWorkflow, flag.TtWorkflowInput,
 			flag.TtCron, flag.TtMethod, flag.FnSubPath,
 
 			flag.SpecSave, flag.SpecDry,
@@ -29,7 +29,7 @@ func Commands() *cobra.Command {
 		Short:   "Update a time trigger",
 	}, Update, flag.FlagSet{
 		Required: []flag.Flag{flag.TtName},
-		Optional: []flag.Flag{flag.TtFnName, flag.TtCron, flag.TtMethod, flag.FnSubPath},
+		Optional: []flag.Flag{flag.TtFnName, flag.TtWorkflow, flag.TtWorkflowInput, flag.TtCron, flag.TtMethod, flag.FnSubPath},
 	})
 
 	deleteCmd := wrapper.SubCommand(&cobra.Command{

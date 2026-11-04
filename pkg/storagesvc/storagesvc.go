@@ -6,7 +6,7 @@ package storagesvc
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"math"
 	"net"
@@ -62,7 +62,21 @@ type (
 	}
 )
 
+// uploadSpoolThresholdBytes bounds the memory the HMAC verifier spends per
+// archive upload: bodies up to this size are hashed in memory, larger ones
+// spool to a temp file (see hmacauth.VerifierOpts.SpoolThresholdBytes). 4 MiB
+// keeps typical source archives fully in memory while capping what a burst of
+// maximum-size uploads can pin.
+const uploadSpoolThresholdBytes int64 = 4 << 20
+
 // Functions handling storage interface
+
+// listWireOpts pins the /v1/archives list emission; shared with the
+// jsonwire_compat fixture so the byte-golden gates this site.
+// FormatNilSliceAsNull keeps v1's null-for-nil (no archives) distinct from
+// [] (empty listing) on the wire.
+var listWireOpts = json.FormatNilSliceAsNull(true)
+
 func getStorageType(storage Storage) string {
 	return string(storage.getStorageType())
 }
@@ -72,7 +86,7 @@ func (ss *StorageService) listItems(w http.ResponseWriter, r *http.Request) {
 	// get all archives on storage
 	// out of them, there may be some just created but not referenced by packages yet.
 	// need to filter them out.
-	archivesInStorage, err := ss.storageClient.getItemIDsWithFilter(ss.storageClient.filterAllItems, false)
+	archivesInStorage, err := ss.storageClient.getItemIDsWithFilter(ss.storageClient.filterAllItems)
 	if err != nil {
 		logger.Error(err, "error getting items from storage")
 		return
@@ -95,7 +109,7 @@ func (ss *StorageService) listItems(w http.ResponseWriter, r *http.Request) {
 	logger.V(1).Info("archives in storage", "archives", archivesInStorage)
 
 	// respond with the list of items
-	resp, err := json.Marshal(archivesInStorage)
+	resp, err := json.Marshal(archivesInStorage, listWireOpts)
 	if err != nil {
 		http.Error(w, "error marshaling item list", http.StatusInternalServerError)
 		return
@@ -172,6 +186,9 @@ func (ss *StorageService) uploadHandler(w http.ResponseWriter, r *http.Request) 
 	ur := &UploadResponse{
 		ID: id,
 	}
+	// Marshal for pkg/storagesvc/client's Go v1/v2 decoder (cross-version RPC
+	// wire); plain v2 Marshal is wire-compatible (UploadResponse has no
+	// omitempty tags or slice/map fields).
 	resp, err := json.Marshal(ur)
 	if err != nil {
 		logger.Error(err, "error marshaling uploaded file response", "filename", handler.Filename)
@@ -351,11 +368,17 @@ func (ss *StorageService) makeHandler() http.Handler {
 		opts = append(opts, httpmux.WithMiddleware(hmacauth.ServiceVerifierNamespaceFromHeader(ss.authSecret, ss.authSecretOld, hmacauth.ServiceStoragesvc, hmacauth.VerifierOpts{
 			SkewSec: 60,
 			Bypass:  []string{"/healthz"},
-			// Caps the body the verifier buffers to check its signature; the
-			// verifier resolves 0 to 256 MiB. Operator-tunable via
+			// Caps the body the verifier accepts while checking its signature;
+			// the verifier resolves 0 to 256 MiB. Operator-tunable via
 			// STORAGE_MAX_ARCHIVE_SIZE_MIB — see the maxUploadBytes field and values.yaml.
 			MaxBodyBytes: ss.maxUploadBytes,
-			Logger:       ss.logger.WithName("hmac"),
+			// Spool over-threshold archive bodies to disk while hashing, so a
+			// concurrent burst of large uploads costs the verifier at most the
+			// threshold in memory each — not MaxBodyBytes each. Storagesvc
+			// writes accepted archives to its backing store anyway, so the
+			// extra disk round-trip is the right trade on this listener.
+			SpoolThresholdBytes: uploadSpoolThresholdBytes,
+			Logger:              ss.logger.WithName("hmac"),
 		})))
 	}
 	m := httpmux.New(opts...)
@@ -461,7 +484,11 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		if err != nil {
 			pruneInterval = defaultPruneInterval
 		}
-		pruner, err := MakeArchivePruner(logger, clientGen, storageClient, time.Duration(pruneInterval))
+		maxOrphansPerCycle, err := strconv.Atoi(os.Getenv("PRUNE_MAX_ORPHANS_PER_CYCLE"))
+		if err != nil {
+			maxOrphansPerCycle = defaultMaxOrphansPerCycle
+		}
+		pruner, err := MakeArchivePruner(logger, clientGen, storageClient, time.Duration(pruneInterval), maxOrphansPerCycle)
 		if err != nil {
 			return fmt.Errorf("error creating archivePruner: %w", err)
 		}

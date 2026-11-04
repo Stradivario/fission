@@ -7,12 +7,62 @@ Expand the name of the chart.
 {{- end -}}
 
 {{/*
+fission.nameFormat selects how generated resource names are built, and is
+validated here so a typo fails the render rather than silently falling back to
+legacy behaviour.
+
+  standard (default) — release-qualified names with room to stay distinct.
+  legacy             — the pre-1.(N+1) names, kept as an escape hatch.
+
+RFC-0029 phase 2; `standard` became the default in 1.(N+1), closing #2906.
+
+Flipping the default is safe because `fullname` has exactly four consumers and
+all of them are hook JOBS — no Deployment, Service, Secret, ConfigMap,
+ServiceAccount, Role or CRD name is derived from it. Two of those Jobs already
+carry a `randNumeric 3` suffix, so their names change on every render anyway,
+and the analytics Jobs carry `hook-delete-policy: hook-succeeded`, so a
+successful run leaves nothing behind under the old name.
+
+The one residue: a hook Job that FAILED and was never cleaned up stays under
+its old name after the flip. It is inert — an orphaned completed/failed Job —
+but it will not be reaped by `before-hook-creation`, which matches on name.
+Delete it by hand if you see one.
+
+#2835 (two installs sharing a cluster) additionally needs the instance-class
+filter and does NOT close on this: every fixed-name resource (router, executor,
+the ClusterRoles) still collides.
+*/}}
+{{- define "fission.nameFormat" -}}
+{{- $v := default "standard" .Values.nameFormat -}}
+{{- if not (has $v (list "legacy" "standard")) -}}
+{{- fail (printf "nameFormat must be \"legacy\" or \"standard\", got %q" $v) -}}
+{{- end -}}
+{{- $v -}}
+{{- end -}}
+
+{{/*
 Create a default fully qualified app name.
-We truncate at 24 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
+
+The legacy form truncates at 24 characters. That is NOT a Kubernetes limit —
+names allow 253, and DNS labels 63 — it is historical, and it is what makes two
+releases collide: any two release names sharing a 24-character prefix produce
+the same fullname, so a second install silently reuses the first's object names.
+
+The standard form keeps 43. That budget is derived, not chosen: the longest
+suffix any consumer appends is `-<chart version>-post-install` (20 characters
+at a 6-character version), and Job names must stay within 63 because the Job
+controller stamps the name into the `job-name` LABEL, where 63 is a hard limit.
+43 + 20 = 63. Raising it silently produces Jobs the apiserver rejects — which
+is exactly what the chart test caught while this was being written.
 */}}
 {{- define "fullname" -}}
 {{- $name := default .Chart.Name .Values.nameOverride -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 24 | trimSuffix "-" -}}
+{{- $full := printf "%s-%s" .Release.Name $name -}}
+{{- if eq (include "fission.nameFormat" .) "standard" -}}
+{{- $full | trunc 43 | trimSuffix "-" -}}
+{{- else -}}
+{{- $full | trunc 24 | trimSuffix "-" -}}
+{{- end -}}
 {{- end -}}
 
 
@@ -150,6 +200,41 @@ it). Disabled by default → behaviour is unchanged for single-replica installs.
 {{- end }}
 
 {{/*
+fission.internalAuthSecretName is the Secret holding the internal-auth HMAC
+master: the operator's pre-created one when internalAuth.existingSecret is set,
+otherwise the chart-generated "fission-internal-auth".
+
+Every consumer must go through this. The Go side resolves the same name from
+FISSION_INTERNAL_AUTH_SECRET_NAME (fv1.InternalAuthSecretName), and a
+disagreement between the two does not fail loudly — the secretKeyRef is
+optional, so pods start with the env var absent and every archive fetch and
+builder upload 401s with nothing naming the Secret as the cause.
+*/}}
+{{- define "fission.internalAuthSecretName" -}}
+{{- default "fission-internal-auth" .Values.internalAuth.existingSecret -}}
+{{- end -}}
+
+{{/*
+fission.internalAuthGenerateInCluster is non-empty when the pre-upgrade hook,
+not the template, mints the master.
+
+Exactly one of them may provision it, and this is the ONLY place that decides
+which. Three templates gate on this answer — the Secret itself, the hook's
+GENERATE_AUTH_SECRET env, and the hook's RBAC — and open-coding the condition
+in each is how they drift apart. Both drift directions fail silently: both
+provisioning means two masters race and half the derived keys are wrong;
+neither means no master at all and every internal call is unsigned.
+
+The whitespace trimming is load-bearing. A stray newline would make the
+`include` non-empty, so the helper would read as true in every case.
+*/}}
+{{- define "fission.internalAuthGenerateInCluster" -}}
+{{- if and .Values.internalAuth.enabled .Values.internalAuth.autoGenerate (not .Values.internalAuth.existingSecret) (not .Values.internalAuth.secret) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
 internalAuth.envs renders the two env entries that wire the HMAC shared
 secret into a Fission control-plane container. See the design at docs/internal-auth/00-design.md. The OLD
 secret is mounted with optional: true so rotation can drop it without
@@ -160,14 +245,54 @@ forcing the chart to render an empty key.
 - name: FISSION_INTERNAL_AUTH_SECRET
   valueFrom:
     secretKeyRef:
-      name: fission-internal-auth
+      name: {{ include "fission.internalAuthSecretName" . }}
       key: secret
 - name: FISSION_INTERNAL_AUTH_SECRET_OLD
   valueFrom:
     secretKeyRef:
-      name: fission-internal-auth
+      name: {{ include "fission.internalAuthSecretName" . }}
       key: oldSecret
       optional: true
+# The Go side (fetcher pod-spec builder, storagesvc client) resolves the same
+# name from this env var; see fv1.InternalAuthSecretName.
+- name: FISSION_INTERNAL_AUTH_SECRET_NAME
+  value: {{ include "fission.internalAuthSecretName" . | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+eventHooks.envs renders the EVENTHOOK_* env entries that wire the
+package-build / function-deploy lifecycle event dispatcher into a Fission
+control-plane container (buildermgr, executor). See the design at
+docs/features/build-deploy-webhooks.md. Disabled (the default) when
+eventHooks.enabled is false, matching internalAuth.envs' off-by-default
+pattern above. Not to be confused with .Values.webhook / fission-webhook.svc
+below, which is the unrelated K8s admission webhook.
+*/}}
+{{- define "eventHooks.envs" }}
+{{- if .Values.eventHooks.enabled }}
+- name: EVENTHOOK_ENABLED
+  value: "true"
+{{- if .Values.eventHooks.packageBuild }}
+- name: EVENTHOOK_PACKAGE_BUILD_NAMESPACE
+  value: {{ .Values.eventHooks.packageBuild.namespace | default "" | quote }}
+- name: EVENTHOOK_PACKAGE_BUILD_FUNCTION
+  value: {{ .Values.eventHooks.packageBuild.function | default "" | quote }}
+- name: EVENTHOOK_PACKAGE_BUILD_SUBPATH
+  value: {{ .Values.eventHooks.packageBuild.subpath | default "" | quote }}
+- name: EVENTHOOK_PACKAGE_BUILD_URL
+  value: {{ .Values.eventHooks.packageBuild.url | default "" | quote }}
+{{- end }}
+{{- if .Values.eventHooks.functionDeploy }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_NAMESPACE
+  value: {{ .Values.eventHooks.functionDeploy.namespace | default "" | quote }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_FUNCTION
+  value: {{ .Values.eventHooks.functionDeploy.function | default "" | quote }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_SUBPATH
+  value: {{ .Values.eventHooks.functionDeploy.subpath | default "" | quote }}
+- name: EVENTHOOK_FUNCTION_DEPLOY_URL
+  value: {{ .Values.eventHooks.functionDeploy.url | default "" | quote }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -247,6 +372,17 @@ http://router-internal.{{ .Release.Namespace }}:{{ include "fission.routerIntern
 {{- end -}}
 
 {{/*
+fission.authenticationSecretName is the Secret the router and MCP deployments
+read auth credentials (username/password) and the JWT signing key from —
+either a user-managed Secret named by authentication.existingSecret (which
+must carry the keys username, password and jwtSigningKey) or the
+chart-generated "router" Secret (templates/router/secret.yaml).
+*/}}
+{{- define "fission.authenticationSecretName" -}}
+{{ .Values.authentication.existingSecret | default "router" }}
+{{- end -}}
+
+{{/*
 fission.podNamespaceEnv injects POD_NAMESPACE via the downward API — the
 namespace fission-bundle's AddressResolver derives sibling-service URL
 defaults from when a URL flag/env is not explicitly set.
@@ -272,4 +408,330 @@ pkg/svcinfo.PortMCP.
 */}}
 {{- define "fission.mcpPort" -}}
 {{ .Values.mcp.port | default 8890 }}
+{{- end -}}
+
+{{/*
+fission.statestorePort is the embedded statestore's capability API port.
+Mirrored by pkg/svcinfo.PortStatestore (RFC-0021).
+*/}}
+{{- define "fission.statestorePort" -}}
+{{ (.Values.statestore | default dict).port | default 8891 }}
+{{- end -}}
+
+{{/*
+fission.statesvcPort is the statesvc function-facing keyed-state API port.
+Mirrored by pkg/svcinfo.PortStateSvc (RFC-0023).
+*/}}
+{{- define "fission.statesvcPort" -}}
+{{ (.Values.functionState | default dict).port | default 8893 }}
+{{- end -}}
+
+{{/*
+fission.workflowPort is the workflow engine head's port. Mirrored by
+pkg/svcinfo.PortWorkflow (RFC-0022).
+*/}}
+{{- define "fission.workflowPort" -}}
+{{ (.Values.workflows | default dict).port | default 8892 }}
+{{- end -}}
+
+{{/*
+fission.crdsMode is the CRD delivery mechanism (RFC-0029 §1), normalised and
+validated. Single-writer by design — exactly one mechanism ever writes the CRD
+objects, because two server-side appliers under different field managers is an
+ownership fight nobody wins.
+
+  hook (default) — the pre-install/pre-upgrade Job server-side-applies the
+                   CRD bundle embedded in its own image, before the release
+                   manifests roll. This also delivers RFC-0028's
+                   CRDs-before-controllers ordering.
+
+                   This is why the hook Job and every object it depends on
+                   (ServiceAccount, ClusterRole, ClusterRoleBinding, and the
+                   namespaced Role/RoleBinding) are annotated
+                   pre-install AS WELL AS pre-upgrade: in this mode the hook
+                   delivers the CRDs a FRESH cluster has none of, which is
+                   what makes a one-shot `helm install` work. Anything the
+                   Job needs must also carry a hook-weight strictly below
+                   the Job's, or Helm may order the Job first.
+  none           — bring your own (`kubectl create -k crds/v1` /
+                   `make create-crds`); the hook only checks presence, exactly
+                   as it does today.
+
+The RFC's third mode, `manifests` (CRDs templated into the rendered set for
+Argo/Flux diffing), needs the generated YAML to live inside the chart
+directory — Helm's .Files cannot read outside it — so it lands with the
+chart-packaging change rather than being half-shipped here.
+*/}}
+{{- define "fission.crdsMode" -}}
+{{- $mode := dig "mode" "hook" (.Values.crds | default dict) -}}
+{{- if eq $mode "manifests" -}}
+{{- fail "crds.mode=manifests is not available yet (it needs the CRD manifests packaged inside the chart); use hook or none" -}}
+{{- end -}}
+{{- if not (has $mode (list "hook" "none")) -}}
+{{- fail (printf "crds.mode must be one of hook|none, got %q" $mode) -}}
+{{- end -}}
+{{- $mode -}}
+{{- end -}}
+
+{{/*
+fission.crdNames is the space-separated list of Fission CRD object names the
+hook's RBAC fences its mutating verbs to. It must stay in lockstep with
+crds/v1 — a CRD missing here is one the hook cannot update, which surfaces as
+a forbidden error on the upgrade that introduces its schema change.
+*/}}
+{{- define "fission.crdNames" -}}
+canaryconfigs.fission.io environments.fission.io fissiontenants.fission.io functionaliases.fission.io functions.fission.io functionversions.fission.io httptriggers.fission.io kuberneteswatchtriggers.fission.io messagequeuetriggers.fission.io packages.fission.io timetriggers.fission.io workflowruns.fission.io workflows.fission.io
+{{- end -}}
+
+{{/*
+fission.adoptSecretNames is the space-separated list of chart-generated Secrets
+the pre-upgrade hook stamps helm.sh/resource-policy=keep onto, so that moving
+their generation out of the templating layer does not prune the live object on
+the next upgrade (RFC-0029 §3; mechanism verified on Helm v4.2.3).
+
+What belongs here is decided by ONE question: could Helm prune this object?
+Not "who owns it" — that reading is what the internalAuth entry below had to
+stop using, and the two entries genuinely differ:
+
+  - internal-auth-secret.yaml and webhook-server/cert.yaml carry NO
+    helm.sh/hook annotation, so they are ordinary release-manifest resources
+    and Helm prunes them the moment a template stops rendering them. They need
+    retention whether or not an existingSecret is set.
+  - router/secret.yaml IS a hook resource ("helm.sh/hook": pre-install,
+    pre-upgrade), so it lives outside Helm's deletion set and is never pruned.
+    Its existingSecret guard below is therefore correct and must stay.
+
+That asymmetry looks like an oversight and is not. Do not "fix" it by making
+the two branches match.
+
+Empty when nothing needs adopting, which makes the whole migration render away.
+*/}}
+{{- define "fission.adoptSecretNames" -}}
+{{- $names := list -}}
+{{- /*
+The CHART-GENERATED name, unconditionally — deliberately not the resolved one.
+
+Retention has to cover the object Helm previously managed, and setting
+existingSecret is exactly what removes that object from the rendered manifest.
+The obvious-looking `(not .Values.internalAuth.existingSecret)` guard here
+destroys the master in the most natural adoption there is: an operator with a
+chart-generated master who sets `existingSecret: fission-internal-auth` to take
+ownership of it. The template stops rendering it, nothing stamps keep, and Helm
+prunes a Secret that is still in use — every control-plane pod wedges on next
+restart and function pods run unsigned.
+
+Naming a Secret that does not exist is free (the hook logs "no live secret to
+adopt" and moves on), and an operator-supplied Secret under a DIFFERENT name is
+still never added — Helm never managed it, so it was never at risk.
+
+The unconditional form does have a cost, and it is retention, not exposure: on
+a migration to `existingSecret: <another-name>`, the old chart-generated master
+is stamped keep in every namespace it was replicated into and then survives
+`helm uninstall`, where Helm would previously have pruned it. Live HMAC key
+material outliving the release is the lesser failure — the alternative deletes
+a master that is still in use — but it is why values.yaml carries the "NOTE ON
+SECRET RETENTION" block describing the manual per-namespace cleanup.
+*/}}
+{{- if .Values.internalAuth.enabled -}}
+{{- $names = append $names "fission-internal-auth" -}}
+{{- end -}}
+{{- /*
+Guarded, unlike internalAuth above, and deliberately so: router/secret.yaml is
+a HOOK resource, so it is outside Helm's deletion set and cannot be pruned. See
+the header — the test is prunability, not ownership.
+*/}}
+{{- if and .Values.authentication.enabled (not .Values.authentication.existingSecret) -}}
+{{- $names = append $names "router" -}}
+{{- end -}}
+{{- if not .Values.webhook.certManager.enabled -}}
+{{- $names = append $names "fission-webhook-certs" -}}
+{{- end -}}
+{{- join " " $names -}}
+{{- end -}}
+
+{{/*
+fission.adoptSecretNamespaces is the namespace set the retention adoption runs
+over. It mirrors internal-auth-secret.yaml's own replication set exactly: under
+STATIC tenancy the master is copied into defaultNamespace and every
+additionalFissionNamespaces, because kubelet cannot resolve a cross-namespace
+secretKeyRef. Leaving those copies out means they prune on upgrade and function
+pods come up unsigned — a silent failure, described in full on
+AdoptSecretsForKeep in cmd/preupgradechecks/adoptsecrets.go.
+
+Under dynamic/cluster tenancy the tenant copies are INTENTIONALLY removed (each
+tenant gets a controller-owned derived key instead), so pinning them with a keep
+annotation would fight that design — hence the same tenancy gate.
+*/}}
+{{- define "fission.adoptSecretNamespaces" -}}
+{{- $namespaces := list .Release.Namespace -}}
+{{- if eq (include "fission.tenancyMode" .) "static" -}}
+{{-   if and .Values.defaultNamespace (ne .Values.defaultNamespace .Release.Namespace) -}}
+{{-     $namespaces = append $namespaces .Values.defaultNamespace -}}
+{{-   end -}}
+{{-   range $ns := .Values.additionalFissionNamespaces -}}
+{{-     if not (has $ns $namespaces) -}}
+{{-       $namespaces = append $namespaces $ns -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- join " " $namespaces -}}
+{{- end -}}
+
+{{/*
+fission.functionNamespaces is the deduped namespace set function workloads
+render into: .Values.functionNamespace when set (else .Values.defaultNamespace),
+plus every .Values.additionalFissionNamespaces entry. Mirrors pkg/utils
+NamespaceResolver.FunctionNamespaces (each resource namespace resolved through
+GetFunctionNS): functionNamespace replaces only the DEFAULT namespace when set;
+additionalFissionNamespaces entries always map to themselves. This is the exact
+range router/role-dataplane.yaml and executor/networkpolicy-environment-egress.yaml
+each recomputed inline before switching to this helper.
+
+Space-joined like fission.adoptSecretNamespaces above; split with
+`splitList " "` at the call site, e.g.:
+
+  {{- range $ns := splitList " " (include "fission.functionNamespaces" $) }}
+*/}}
+{{- define "fission.functionNamespaces" -}}
+{{- $namespaces := list -}}
+{{- if .Values.functionNamespace -}}
+{{-   $namespaces = append $namespaces .Values.functionNamespace -}}
+{{- else -}}
+{{-   $namespaces = append $namespaces .Values.defaultNamespace -}}
+{{- end -}}
+{{- range $ns := .Values.additionalFissionNamespaces -}}
+{{-   $namespaces = append $namespaces $ns -}}
+{{- end -}}
+{{- join " " ($namespaces | uniq) -}}
+{{- end -}}
+
+{{/*
+fission.saMetadata renders the annotations and labels a ServiceAccount inherits
+from the `serviceAccounts` values block, as complete metadata sub-blocks.
+
+  {{- include "fission.saMetadata" (dict "root" . "component" "storagesvc") }}
+
+Each component key merges over the chart-wide default, so an operator can stamp
+an ownership label on every account and still give storagesvc its own IRSA role
+annotation. Nothing renders when both maps are empty, which keeps the manifest
+byte-identical for anyone not using the feature.
+
+Cloud workload identity (#3166) is the motivating case, and it is why the
+annotations are per-component rather than chart-wide only: an EKS IRSA role ARN
+is scoped to one component's permissions, so a single shared value would either
+over-grant every account or fit none of them.
+
+The component key is the account's own name, not the deployment's — several
+components own more than one (misc-functions owns both `fetcher` and `builder`)
+and two accounts have no component block of their own. `fission.saComponents`
+below is the canonical list, and the chart test walks it against the rendered
+accounts so a new one cannot silently miss this include.
+*/}}
+{{- define "fission.saMetadata" -}}
+{{- include "fission.saAnnotationsBlock" . }}
+{{- include "fission.saLabelsBlock" . }}
+{{- end -}}
+
+{{/*
+fission.saAnnotationsBlock and fission.saLabelsBlock are fission.saMetadata's
+halves, for the accounts that already own one of the two blocks: pre-upgrade
+checks owns Helm hook annotations, and four accounts carry chart labels. Those
+templates merge the entry helpers into the block they own and include only the
+missing half from here — emitting a second `annotations:` key in the same
+mapping would be invalid YAML, and Helm would not catch it.
+
+All three carry their own indentation, two spaces, for the `metadata:` level
+every ServiceAccount in this chart sits at. That is what lets a call site write
+a bare `{{- include ... }}`: piping an empty include through `nindent` yields a
+line of spaces rather than nothing, so a chart with no serviceAccounts values
+set would grow whitespace-only lines in every account it renders.
+*/}}
+{{- define "fission.saAnnotationsBlock" -}}
+{{- $annotations := include "fission.saAnnotations" . -}}
+{{- if $annotations }}
+  annotations:
+{{- $annotations | nindent 4 }}
+{{- end }}
+{{- end -}}
+
+{{- define "fission.saLabelsBlock" -}}
+{{- $labels := include "fission.saLabels" . -}}
+{{- if $labels }}
+  labels:
+{{- $labels | nindent 4 }}
+{{- end }}
+{{- end -}}
+
+{{/*
+fission.saAnnotations and fission.saLabels resolve the merged map for one
+component and emit it as bare, unindented YAML entries. Callers wrap them in
+`with` so an empty map renders nothing:
+
+  {{- with include "fission.saLabels" (dict "root" . "component" "workflow") }}{{ . | nindent 4 }}{{- end }}
+
+merge's first argument wins, so the component map overrides the chart-wide one
+key by key rather than replacing it wholesale.
+
+BOTH arguments are deep-copied. merge mutates its destination, and these helpers
+run once per account against the same chart-wide map, so a version of sprig that
+writes through to either argument would let the first account's keys contaminate
+the other eighteen. Current sprig does not, and TestServiceAccountNoCrossAccountLeak
+is what keeps that from becoming a silent regression on a helm bump.
+*/}}
+{{- define "fission.saAnnotations" -}}
+{{- $sa := .root.Values.serviceAccounts | default dict -}}
+{{- $merged := merge (deepCopy (dig .component "annotations" dict $sa)) (deepCopy ($sa.annotations | default dict)) -}}
+{{- range $k, $v := $merged -}}
+{{- if hasPrefix "helm.sh/" $k -}}
+{{- fail (printf "serviceAccounts.%s: %q is reserved — the chart owns helm.sh/* annotations (hook ordering and delete policy on the pre-upgrade account); overriding one would emit a duplicate key and change when the hook runs" $.component $k) -}}
+{{- end -}}
+{{- end -}}
+{{- $entries := list -}}
+{{- range $k, $v := $merged -}}
+{{- $entries = append $entries (printf "%s: %s" $k ($v | quote)) -}}
+{{- end -}}
+{{- join "\n" $entries -}}
+{{- end -}}
+
+{{- define "fission.saLabels" -}}
+{{- $sa := .root.Values.serviceAccounts | default dict -}}
+{{- $merged := merge (deepCopy (dig .component "labels" dict $sa)) (deepCopy ($sa.labels | default dict)) -}}
+{{- range $k, $v := $merged -}}
+{{- if has $k (list "svc" "application" "chart") -}}
+{{- fail (printf "serviceAccounts.%s: %q is reserved — the chart owns it as a component identity label. `svc` in particular selects components in the router NetworkPolicy and the support dump, so overriding it would emit a duplicate key and detach this account from both" $.component $k) -}}
+{{- end -}}
+{{- end -}}
+{{- $entries := list -}}
+{{- range $k, $v := $merged -}}
+{{- $entries = append $entries (printf "%s: %s" $k ($v | quote)) -}}
+{{- end -}}
+{{- join "\n" $entries -}}
+{{- end -}}
+
+{{/*
+fission.saComponents is the canonical list of ServiceAccount component keys —
+the contract between values.yaml, the templates, and the two things that hold
+them together: fission.validateSaComponents rejects a key that is not on it, and
+the chart test proves every key on it annotates exactly one rendered account.
+
+Keep it sorted, and add to it in the same commit that adds a ServiceAccount.
+*/}}
+{{- define "fission.saComponents" -}}
+builder buildermgr canaryconfig executor fetcher kafka kubewatcher mcp mqtKeda preupgrade router statestore statestoreMqt statesvc storagesvc tenantController timer webhook workflow
+{{- end -}}
+
+{{/*
+fission.validateSaComponents fails the render on an unrecognised key under
+`serviceAccounts`. Without it a typo is silent and total: `serviceAccounts.storagesv`
+parses fine, renders fine, and produces an account with no role annotation — so
+the first symptom is storagesvc getting AccessDenied from S3 at runtime, a long
+way from the values file that caused it.
+*/}}
+{{- define "fission.validateSaComponents" -}}
+{{- $known := concat (splitList " " (include "fission.saComponents" .)) (list "annotations" "labels") -}}
+{{- range $k, $v := (.Values.serviceAccounts | default dict) -}}
+{{- if not (has $k $known) -}}
+{{- fail (printf "serviceAccounts.%s: unknown key. Expected `annotations`, `labels`, or one of: %s" $k (include "fission.saComponents" $)) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}

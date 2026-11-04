@@ -85,6 +85,10 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 		function.Spec.ConfigMaps = configMaps
 	}
 
+	if err := applyFunctionEnvFlags(input, function); err != nil {
+		return err
+	}
+
 	if len(envName) > 0 {
 		function.Spec.Environment.Name = envName
 	}
@@ -122,6 +126,29 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 		function.Spec.Tool = toolConfig
 	}
 
+	// --state toggles the keyed-state config; when off it clears it (opt-out
+	// retains the keyspace data — see statesvc's reconciler). The other
+	// --state-* flags merge onto the existing config (only set fields change).
+	if input.IsSet(flagkey.FnState) {
+		function.Spec.State = getStateConfig(input, function.Spec.State)
+	}
+
+	// The --async-* flags merge onto the existing InvocationConfig (only set fields
+	// change); an empty --async-on-success/--async-on-failure (or -topic variant)
+	// clears that destination.
+	function.Spec.Invocation, err = getInvocationConfig(input, function.Spec.Invocation)
+	if err != nil {
+		return err
+	}
+
+	// --versioning toggles the versioning config; 'off' clears it.
+	// --retain-versions merges onto the existing (or newly-set) config and
+	// requires versioning to be enabled either way.
+	function.Spec.Versioning, err = getVersioningConfig(input, function.Spec.Versioning)
+	if err != nil {
+		return err
+	}
+
 	err = checkExecutorPoolManager(input, function.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType)
 	if err != nil {
 		return err
@@ -137,6 +164,20 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 
 	if input.IsSet(flagkey.FnRetainPods) {
 		function.Spec.RetainPods = input.Int(flagkey.FnRetainPods)
+	}
+
+	if input.IsSet(flagkey.FnProvisionedConcurrency) || input.IsSet(flagkey.FnProvisionedSchedule) {
+		existing := function.Spec.ProvisionedConcurrency
+		provisionedConcurrency, err := getProvisionedConcurrencyConfig(input)
+		if err != nil {
+			return err
+		}
+		// Preserve configured windows when only the base target was given, so
+		// bumping --provisioned-concurrency does not silently drop the schedule.
+		if provisionedConcurrency != nil && existing != nil && !input.IsSet(flagkey.FnProvisionedSchedule) {
+			provisionedConcurrency.Windows = existing.Windows
+		}
+		function.Spec.ProvisionedConcurrency = provisionedConcurrency
 	}
 
 	if input.IsSet(flagkey.FnOnceOnly) {
@@ -201,11 +242,31 @@ func (opts *UpdateSubCommand) complete(input cli.Input) error {
 	// TODO : One corner case where user just updates the pkg reference with fnUpdate, but internally this new pkg reference
 	// references a diff env than the spec
 
-	// update function spec with new package metadata
-	function.Spec.Package.PackageRef = fv1.PackageRef{
-		Namespace:       newPkgMeta.Namespace,
-		Name:            newPkgMeta.Name,
-		ResourceVersion: newPkgMeta.ResourceVersion,
+	// Two distinct situations hide behind "update the package reference", and
+	// conflating them breaks one or the other:
+	//
+	//   - RE-POINTING at a different package (`--pkg <other>`). The reference
+	//     must move even though this command never wrote that package, so
+	//     UpdatePackage hands back its no-op result — the very ObjectMeta it
+	//     was given. Guarding on ResourceVersion here would leave the function
+	//     serving its old package forever.
+	//
+	//   - REFRESHING the stamp on the SAME package. Here the ResourceVersion
+	//     is the whole payload: bumping it is what recycles pods. But it is
+	//     only ours to bump when THIS command actually wrote the package.
+	//     Copying whatever ResourceVersion the package happens to carry also
+	//     picks up controller STATUS writes — a FunctionSpec change with no
+	//     content behind it, which mints an RFC-0025 version for an update
+	//     that changed nothing about the code. A Git-applied content change
+	//     needs no help from here: buildermgr re-stamps for it (RFC-0029 §3).
+	ref := function.Spec.Package.PackageRef
+	repointing := ref.Name != newPkgMeta.Name || ref.Namespace != newPkgMeta.Namespace
+	if repointing || pkg.ResourceVersion != newPkgMeta.ResourceVersion {
+		function.Spec.Package.PackageRef = fv1.PackageRef{
+			Namespace:       newPkgMeta.Namespace,
+			Name:            newPkgMeta.Name,
+			ResourceVersion: newPkgMeta.ResourceVersion,
+		}
 	}
 
 	if function.Spec.Environment.Name != pkg.Spec.Environment.Name {
@@ -230,7 +291,7 @@ func (opts *UpdateSubCommand) run(input cli.Input) error {
 		if err != nil {
 			return fv1.AggregateValidationErrors("Function", err)
 		}
-		err = spec.SpecSave(*opts.function, opts.specFile, false)
+		err = spec.SpecSave(opts.function, opts.specFile, false)
 		if err != nil {
 			return fmt.Errorf("error saving function spec: %w", err)
 		}
@@ -254,5 +315,21 @@ func (opts *UpdateSubCommand) run(input cli.Input) error {
 	}
 
 	fmt.Printf("Function '%v' updated\n", opts.function.Name)
+	if hint := versioningAutoHint(opts.function); hint != "" {
+		fmt.Print(hint)
+	}
 	return nil
+}
+
+// versioningAutoHint returns the breadcrumb line printed after a successful
+// `fn update` when the function's versioning mode is auto, or "" when it
+// isn't opted in. Auto-versioning mints a new FunctionVersion asynchronously
+// once the package build succeeds — not synchronously with this update — so
+// the hint tells the caller where to watch for it rather than leaving them
+// to wonder why `fn get --version` doesn't show a new version yet.
+func versioningAutoHint(fn *fv1.Function) string {
+	if fn.Spec.Versioning == nil || fn.Spec.Versioning.Mode != fv1.VersioningModeAuto {
+		return ""
+	}
+	return fmt.Sprintf("versioning=auto: a new version is minted once the build succeeds (fission fn versions --name %v)\n", fn.Name)
 }

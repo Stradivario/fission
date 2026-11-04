@@ -27,7 +27,6 @@ import (
 	"github.com/fission/fission/pkg/fission-cli/console"
 	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
 	"github.com/fission/fission/pkg/fission-cli/util"
-	typedv1 "github.com/fission/fission/pkg/generated/clientset/versioned/typed/core/v1"
 	"github.com/fission/fission/pkg/utils"
 )
 
@@ -105,6 +104,16 @@ func (opts *ApplySubCommand) insertNamespace(input cli.Input, fr *FissionResourc
 	for i := range fr.KubernetesWatchTriggers {
 		if fr.KubernetesWatchTriggers[i].Namespace == "" || input.Bool(flagkey.ForceNamespace) {
 			fr.KubernetesWatchTriggers[i].Namespace = currentNS
+		}
+	}
+	for i := range fr.Workflows {
+		if fr.Workflows[i].Namespace == "" || input.Bool(flagkey.ForceNamespace) {
+			fr.Workflows[i].Namespace = currentNS
+		}
+	}
+	for i := range fr.FunctionAliases {
+		if fr.FunctionAliases[i].Namespace == "" || input.Bool(flagkey.ForceNamespace) {
+			fr.FunctionAliases[i].Namespace = currentNS
 		}
 	}
 
@@ -345,13 +354,35 @@ func pluralize(num int, word string) string {
 	return word + "s"
 }
 
+// listAllPackages enumerates every Package in every namespace.
+//
+// This is the single cluster-wide Package enumeration applyResources performs:
+// the resulting snapshot is threaded to both consumers that need it (archive
+// de-duplication in applyArchives and the create/update/delete diff in
+// applyPackages) rather than each listing for itself. See applyResources for
+// what sharing one snapshot across both costs.
+//
+// It is not the only Package listing a `spec apply` command makes: validation
+// lists them too (getAllPackages, in validate.go), as does the build watch
+// under --wait.
+func listAllPackages(ctx context.Context, fclient cmd.Client) ([]fv1.Package, error) {
+	l, err := fclient.FissionClientSet.CoreV1().Packages(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return l.Items, nil
+}
+
 // applyArchives figures out the set of archives that need to be uploaded, and uploads them.
 // Under dryRun the read-only work still runs — local archives are built/checksummed
 // and matched against archives already on the cluster — so the resolved Package
 // specs (and therefore the diff) are accurate for unchanged archives; only the
 // actual upload of a new/changed archive is skipped (such a Package legitimately
 // shows as a would-create/update).
-func applyArchives(input cli.Input, fclient cmd.Client, specDir string, fr *FissionResources, dryRun bool) error {
+//
+// livePkgs is the caller's cluster-wide Package snapshot; it is read only to
+// build the content-index of archives already present on the cluster.
+func applyArchives(input cli.Input, fclient cmd.Client, specDir string, fr *FissionResources, livePkgs []fv1.Package, dryRun bool) error {
 	// archive:// URL -> archive map.
 	archiveFiles := make(map[string]fv1.Archive)
 
@@ -368,13 +399,9 @@ func applyArchives(input cli.Input, fclient cmd.Client, specDir string, fr *Fiss
 		archiveFiles[archiveUrl] = *ar
 	}
 
-	// get list of packages, make content-indexed map of available archives
+	// make content-indexed map of available archives from the caller's snapshot
 	availableArchives := make(map[string]string) // (sha256 -> url)
-	pkgs, err := fclient.FissionClientSet.CoreV1().Packages(metav1.NamespaceAll).List(input.Context(), metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-	for _, pkg := range pkgs.Items {
+	for _, pkg := range livePkgs {
 		for _, ar := range []fv1.Archive{pkg.Spec.Source, pkg.Spec.Deployment} {
 			if ar.Type == fv1.ArchiveTypeUrl && len(ar.URL) > 0 {
 				availableArchives[ar.Checksum.Sum] = ar.URL
@@ -439,8 +466,36 @@ func applyResources(input cli.Input, fclient cmd.Client, specDir string, fr *Fis
 
 	applyStatus := make(map[string]ResourceApplyStatus)
 
+	// One cluster-wide Package enumeration per apply, shared by the two consumers
+	// that need it: applyArchives indexes it by archive checksum to skip
+	// re-uploading bytes already on the cluster, and applyPackages diffs the spec
+	// against it.
+	//
+	// Nothing the CLI itself does between the two consumers writes a Package:
+	// pkgutil.UploadArchiveFile only pushes archive bytes to storagesvc, and
+	// applyEnvironments touches only Environments.
+	//
+	// The buildermgr, though, is a genuine concurrent writer of these same
+	// objects — updatePackage sets spec.Deployment, and the status write that
+	// follows it sets status.BuildStatus — and those are exactly the fields the
+	// equal() closure in applyPackages reads. So sharing one snapshot does not
+	// merely move the staleness window, it widens it: the second List this
+	// replaces ran *after* the archive uploads, this one runs before them, so
+	// the diff can now be reading a package set that is stale by the whole
+	// upload duration.
+	//
+	// That is accepted deliberately. A build landing inside the window makes its
+	// package read not-ready, so it takes the update path and gets retriggered:
+	// redundant work that converges on the next reconcile, not lost data. The
+	// alternative is the second full cluster-wide enumeration on every apply
+	// that issue #3664 was filed to remove.
+	livePkgs, err := listAllPackages(input.Context(), fclient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list packages: %w", err)
+	}
+
 	// upload archives that need to be uploaded. Changes archive references in fr.Packages.
-	err := applyArchives(input, fclient, specDir, fr, dryRun)
+	err = applyArchives(input, fclient, specDir, fr, livePkgs, dryRun)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -451,7 +506,7 @@ func applyResources(input cli.Input, fclient cmd.Client, specDir string, fr *Fis
 	}
 	applyStatus["environment"] = *ras
 
-	pkgMeta, ras, err := applyPackages(input.Context(), fclient, fr, delete, specAllowConflicts, dryRun)
+	pkgMeta, ras, err := applyPackages(input.Context(), fclient, fr, livePkgs, delete, specAllowConflicts, dryRun)
 	if err != nil {
 		return nil, nil, fmt.Errorf("package apply failed: %w", err)
 	}
@@ -465,6 +520,30 @@ func applyResources(input cli.Input, fclient cmd.Client, specDir string, fr *Fis
 	// no-op/created packages, and the dryRunResourceVersion sentinel for packages
 	// that would be updated — so a would-be package update correctly cascades into
 	// a would-be update of the functions that reference it, matching a real apply.
+	// Packages this apply actually wrote. Copying a package's CURRENT
+	// ResourceVersion into every referencing function is only correct for
+	// these: a package's ResourceVersion also drifts on controller STATUS
+	// writes (buildermgr records a content hash), so stamping unconditionally
+	// re-stamps functions whose package nobody touched — which bumps their
+	// generation, recycles their pods and mints an RFC-0025 version. A GitOps
+	// controller reapplies on every sync, so that is continuous churn, not a
+	// one-off. See TestSpecApplyIsIdempotent.
+	written := make(map[string]bool, len(ras.Created)+len(ras.Updated))
+	for _, m := range ras.Created {
+		written[k8sCache.MetaObjectToName(m).String()] = true
+	}
+	for _, m := range ras.Updated {
+		written[k8sCache.MetaObjectToName(m).String()] = true
+	}
+
+	// Stamps the live functions already carry, so an untouched package leaves
+	// its referencing functions byte-identical instead of empty (which would
+	// itself read as a change and force an update).
+	liveStamps, err := liveFunctionStamps(input.Context(), fclient)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	for i, f := range fr.Functions {
 		if f.Spec.InvokeStrategy.ExecutionStrategy.ExecutorType == fv1.ExecutorTypeContainer {
 			continue
@@ -482,7 +561,30 @@ func applyResources(input cli.Input, fclient cmd.Client, specDir string, fr *Fis
 			return nil, nil, fmt.Errorf("function %v/%v references package %v/%v, which doesn't exist in the specs",
 				f.Namespace, f.Name, f.Spec.Package.PackageRef.Namespace, f.Spec.Package.PackageRef.Name)
 		}
-		fr.Functions[i].Spec.Package.PackageRef.ResourceVersion = m.ResourceVersion
+
+		// Default to the package's current ResourceVersion. That is right when
+		// this apply wrote the package (the change must reach running pods),
+		// and it is the only stamp available for a function that is new, or
+		// that this spec repoints at a different package.
+		rv := m.ResourceVersion
+
+		// The one case that must NOT take the current version: the package was
+		// untouched by this apply and the live function already references that
+		// same package. Re-stamping there would rewrite an unchanged function
+		// on every apply, minting spurious RFC-0025 versions.
+		//
+		// "Same package" is load-bearing. A spec that repoints a function from
+		// pkgA to an untouched pkgB must not inherit pkgA's stamp: the
+		// reference would name pkgB with pkgA's ResourceVersion, the next apply
+		// would preserve that same wrong value, and nothing converges —
+		// package restamping only fires when pkgB itself is written.
+		fnKey := k8sCache.MetaObjectToName(&f.ObjectMeta).String()
+		if live, isLive := liveStamps[fnKey]; !written[k] && isLive &&
+			live.Name == f.Spec.Package.PackageRef.Name &&
+			live.Namespace == f.Spec.Package.PackageRef.Namespace {
+			rv = live.ResourceVersion
+		}
+		fr.Functions[i].Spec.Package.PackageRef.ResourceVersion = rv
 	}
 
 	_, ras, err = applyFunctions(input.Context(), fclient, fr, delete, specAllowConflicts, dryRun)
@@ -490,6 +592,23 @@ func applyResources(input cli.Input, fclient cmd.Client, specDir string, fr *Fis
 		return nil, nil, fmt.Errorf("function apply failed: %w", err)
 	}
 	applyStatus["function"] = *ras
+
+	// Aliases apply after functions: they carry an ownerRef to the Function
+	// they target (set when the Function already exists on the cluster — see
+	// applyFunctionAliases) and, for name-pinned aliases (spec.Version), the
+	// webhook resolves against existing FunctionVersions, which only the
+	// version-control loop / `fission fn publish` create (FunctionVersion is
+	// deliberately not spec-managed). A name-pinned alias whose target version
+	// doesn't exist yet is rejected by the webhook; that error surfaces as-is
+	// so the user knows to publish first. A digest-pinned alias
+	// (spec.PackageDigest) has no such precondition — it resolves
+	// asynchronously once a matching version is published (eventual
+	// consistency, RFC-0025).
+	_, ras, err = applyFunctionAliases(input.Context(), fclient, fr, delete, specAllowConflicts, dryRun)
+	if err != nil {
+		return nil, nil, fmt.Errorf("functionAlias apply failed: %w", err)
+	}
+	applyStatus["FunctionAlias"] = *ras
 
 	_, ras, err = applyHTTPTriggers(input.Context(), fclient, fr, delete, specAllowConflicts, dryRun)
 	if err != nil {
@@ -508,6 +627,12 @@ func applyResources(input cli.Input, fclient cmd.Client, specDir string, fr *Fis
 		return nil, nil, fmt.Errorf("timeTrigger apply failed: %w", err)
 	}
 	applyStatus["TimeTrigger"] = *ras
+
+	_, ras, err = applyWorkflows(input.Context(), fclient, fr, delete, specAllowConflicts, dryRun)
+	if err != nil {
+		return nil, nil, fmt.Errorf("workflow apply failed: %w", err)
+	}
+	applyStatus["Workflow"] = *ras
 
 	_, ras, err = applyMessageQueueTriggers(input.Context(), fclient, fr, delete, specAllowConflicts, dryRun)
 	if err != nil {
@@ -640,360 +765,222 @@ func waitForPackageBuild(ctx context.Context, fclient cmd.Client, pkg *fv1.Packa
 	}
 }
 
-func applyPackages(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	packages := func(ns string) typedv1.PackageInterface {
-		return fclient.FissionClientSet.CoreV1().Packages(ns)
+// applyPackages reconciles the spec's Packages against livePkgs, the caller's
+// cluster-wide Package snapshot. The snapshot is supplied rather than fetched
+// here so that applyResources performs one Package enumeration rather than two;
+// callers with no snapshot in hand (spec destroy) obtain one from
+// listAllPackages. See applyResources for how stale the snapshot can be by the
+// time the diff below reads it.
+func applyPackages(ctx context.Context, fclient cmd.Client, fr *FissionResources, livePkgs []fv1.Package, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
+	packages := fclient.FissionClientSet.CoreV1().Packages
+	// A package is up to date when its spec matches (or its env + non-empty
+	// source + build command match), its metadata matches, and its last
+	// build succeeded — otherwise we (re)apply to (re)build it.
+	equal := func(existing, desired *fv1.Package) bool {
+		specMatches := reflect.DeepEqual(existing.Spec, desired.Spec) ||
+			(reflect.DeepEqual(existing.Spec.Environment, desired.Spec.Environment) &&
+				!reflect.DeepEqual(existing.Spec.Source, fv1.Archive{}) &&
+				reflect.DeepEqual(existing.Spec.Source, desired.Spec.Source) &&
+				existing.Spec.BuildCommand == desired.Spec.BuildCommand)
+		// "none" (a deploy-archive package needing no build) is as ready a
+		// terminal state as "succeeded"; treating only the latter as ready
+		// would re-apply unchanged deploy packages on every run.
+		ready := existing.Status.BuildStatus == fv1.BuildStatusSucceeded ||
+			existing.Status.BuildStatus == fv1.BuildStatusNone
+		// A source-build package that has "succeeded" but no deployment
+		// archive is in a broken state (the deploy URL was wiped by a
+		// previous spec apply). Force a re-apply so the update path can
+		// retrigger the build.
+		if ready && existing.Spec.BuildCommand != "" &&
+			!existing.Spec.Source.IsEmpty() && existing.Spec.Deployment.IsEmpty() {
+			ready = false
+		}
+		return specMatches &&
+			isObjectMetaEqual(existing.ObjectMeta, desired.ObjectMeta) &&
+			ready
 	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.Package, *fv1.Package]{
-		items: func(fr *FissionResources) []fv1.Package { return fr.Packages },
-		list: func(ctx context.Context) ([]fv1.Package, error) {
-			l, err := packages(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(p *fv1.Package) *metav1.ObjectMeta { return &p.ObjectMeta },
-		// A package is up to date when its spec matches (or its env + non-empty
-		// source + build command match), its metadata matches, and its last
-		// build succeeded — otherwise we (re)apply to (re)build it.
-		equal: func(existing, desired *fv1.Package) bool {
-			specMatches := reflect.DeepEqual(existing.Spec, desired.Spec) ||
-				(reflect.DeepEqual(existing.Spec.Environment, desired.Spec.Environment) &&
-					!reflect.DeepEqual(existing.Spec.Source, fv1.Archive{}) &&
-					reflect.DeepEqual(existing.Spec.Source, desired.Spec.Source) &&
-					existing.Spec.BuildCommand == desired.Spec.BuildCommand)
-			// "none" (a deploy-archive package needing no build) is as ready a
-			// terminal state as "succeeded"; treating only the latter as ready
-			// would re-apply unchanged deploy packages on every run.
-			ready := existing.Status.BuildStatus == fv1.BuildStatusSucceeded ||
-				existing.Status.BuildStatus == fv1.BuildStatusNone
-			// A source-build package that has "succeeded" but no deployment
-			// archive is in a broken state (the deploy URL was wiped by a
-			// previous spec apply). Force a re-apply so the update path can
-			// retrigger the build.
-			if ready && existing.Spec.BuildCommand != "" &&
-				!existing.Spec.Source.IsEmpty() && existing.Spec.Deployment.IsEmpty() {
-				ready = false
-			}
-			return specMatches &&
-				isObjectMetaEqual(existing.ObjectMeta, desired.ObjectMeta) &&
-				ready
-		},
-		create: func(ctx context.Context, p *fv1.Package) (*metav1.ObjectMeta, error) {
-			n, err := packages(p.Namespace).Create(ctx, p, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		update: func(ctx context.Context, existing, desired *fv1.Package) (*metav1.ObjectMeta, error) {
-			// We may be racing the package builder (a previous version might be
-			// building), so wait for a non-running build status first. Decide
-			// from the live object (existing): desired comes from the spec file
-			// and carries no status, so the wait/re-trigger must read the real
-			// BuildStatus.
-			current, err := waitForPackageBuild(ctx, fclient, existing)
-			if err != nil {
-				console.Warn(fmt.Sprintf("Error waiting for package '%v' build, ignoring", desired.Name))
-				current = existing
-			}
+	ops := standardOps(
+		packages,
+		func(fr *FissionResources) []fv1.Package { return fr.Packages },
+		func(l *fv1.PackageList) []fv1.Package { return l.Items },
+		func(o *fv1.Package) *metav1.ObjectMeta { return &o.ObjectMeta },
+		equal,
+	)
+	// The snapshot is already in hand, so this needs no context.
+	ops.list = func(context.Context) ([]fv1.Package, error) { return livePkgs, nil }
+	ops.update = func(ctx context.Context, existing, desired *fv1.Package) (*metav1.ObjectMeta, error) {
+		// We may be racing the package builder (a previous version might be
+		// building), so wait for a non-running build status first. Decide
+		// from the live object (existing): desired comes from the spec file
+		// and carries no status, so the wait/re-trigger must read the real
+		// BuildStatus.
+		current, err := waitForPackageBuild(ctx, fclient, existing)
+		if err != nil {
+			console.Warn(fmt.Sprintf("Error waiting for package '%v' build, ignoring", desired.Name))
+			current = existing
+		}
 
-			// Determine whether a build must be (re)triggered after the spec
-			// Update below. With the /status subresource the main-resource
-			// Update cannot touch BuildStatus, so we must issue a separate
-			// UpdateStatus to set it back to "pending".
-			//
-			// A retrigger is needed when:
-			//  1. The previous build failed (existing behaviour), OR
-			//  2. This is a source-build package (has a build command and
-			//     source archive). The spec Update overwrites spec.Deployment
-			//     with the empty value from the spec file, wiping the deploy
-			//     archive URL that the buildermgr wrote on the last successful
-			//     build. Without a retrigger the package would be stuck with
-			//     buildstatus=succeeded but no deploy archive.
-			retrigger := current.Status.BuildStatus == fv1.BuildStatusFailed ||
-				(desired.Spec.BuildCommand != "" && !desired.Spec.Source.IsEmpty())
+		// Determine whether a build must be (re)triggered after the spec
+		// Update below. With the /status subresource the main-resource
+		// Update cannot touch BuildStatus, so we must issue a separate
+		// UpdateStatus to set it back to "pending".
+		//
+		// A retrigger is needed when:
+		//  1. The previous build failed (existing behaviour), OR
+		//  2. This is a source-build package (has a build command and
+		//     source archive). The spec Update overwrites spec.Deployment
+		//     with the empty value from the spec file, wiping the deploy
+		//     archive URL that the buildermgr wrote on the last successful
+		//     build. Without a retrigger the package would be stuck with
+		//     buildstatus=succeeded but no deploy archive.
+		retrigger := current.Status.BuildStatus == fv1.BuildStatusFailed ||
+			(desired.Spec.BuildCommand != "" && !desired.Spec.Source.IsEmpty())
 
-			// Apply the spec, re-getting on conflict: the buildermgr writes a
-			// package's build status concurrently, which can bump the
-			// ResourceVersion between our read and this Update.
-			n, err := util.UpdateOnConflict(ctx, packages(desired.Namespace), desired.Name, func(cur *fv1.Package) {
-				desired.ResourceVersion = cur.ResourceVersion
-				*cur = *desired
-			})
-			if err != nil {
-				return nil, err
-			}
-			// Re-trigger a build via the /status subresource. This is
-			// separate from the spec Update above because the apiserver
-			// ignores status fields on a main-resource write when the
-			// /status subresource is enabled.
-			if retrigger {
-				if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					live, gerr := packages(desired.Namespace).Get(ctx, desired.Name, metav1.GetOptions{})
-					if gerr != nil {
-						return gerr
-					}
-					live.Status.BuildStatus = fv1.BuildStatusPending
-					var uerr error
-					n, uerr = packages(desired.Namespace).UpdateStatus(ctx, live, metav1.UpdateOptions{})
-					return uerr
-				}); err != nil {
-					return nil, err
+		// Apply the spec, re-getting on conflict: the buildermgr writes a
+		// package's build status concurrently, which can bump the
+		// ResourceVersion between our read and this Update.
+		n, err := util.UpdateOnConflict(ctx, packages(desired.Namespace), desired.Name, func(cur *fv1.Package) {
+			desired.ResourceVersion = cur.ResourceVersion
+			*cur = *desired
+		})
+		if err != nil {
+			return nil, err
+		}
+		// Re-trigger a build via the /status subresource. This is
+		// separate from the spec Update above because the apiserver
+		// ignores status fields on a main-resource write when the
+		// /status subresource is enabled.
+		if retrigger {
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				live, gerr := packages(desired.Namespace).Get(ctx, desired.Name, metav1.GetOptions{})
+				if gerr != nil {
+					return gerr
 				}
+				live.Status.BuildStatus = fv1.BuildStatusPending
+				var uerr error
+				n, uerr = packages(desired.Namespace).UpdateStatus(ctx, live, metav1.UpdateOptions{})
+				return uerr
+			}); err != nil {
+				return nil, err
 			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return packages(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+		}
+		return &n.ObjectMeta, nil
+	}
+	return applyResourceType(ctx, fr, ops, delete, specAllowConflicts, dryRun)
+}
+
+// liveFunctionStamps returns each existing function's current
+// PackageRef.ResourceVersion, keyed by namespace/name.
+//
+// Needed because a function in a spec FILE carries no ResourceVersion — that
+// field is a runtime stamp, not something a user writes. So "leave it alone"
+// cannot mean "leave it empty": an empty stamp differs from what is live and
+// would force the very update this is avoiding.
+// The whole PackageRef is returned, not just the stamp: a stamp is only worth
+// preserving when the live function still points at the SAME package the spec
+// now names. Keying on the function alone would carry the old package's
+// ResourceVersion onto a repointed reference.
+func liveFunctionStamps(ctx context.Context, fclient cmd.Client) (map[string]fv1.PackageRef, error) {
+	list, err := fclient.FissionClientSet.CoreV1().Functions(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list functions to preserve package stamps: %w", err)
+	}
+	out := make(map[string]fv1.PackageRef, len(list.Items))
+	for i := range list.Items {
+		fn := &list.Items[i]
+		out[k8sCache.MetaObjectToName(&fn.ObjectMeta).String()] = fn.Spec.Package.PackageRef
+	}
+	return out, nil
 }
 
 func applyFunctions(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	functions := func(ns string) typedv1.FunctionInterface {
-		return fclient.FissionClientSet.CoreV1().Functions(ns)
-	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.Function, *fv1.Function]{
-		items: func(fr *FissionResources) []fv1.Function { return fr.Functions },
-		list: func(ctx context.Context) ([]fv1.Function, error) {
-			l, err := functions(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(f *fv1.Function) *metav1.ObjectMeta { return &f.ObjectMeta },
-		equal: func(e, d *fv1.Function) bool {
+	return applyResourceType(ctx, fr, standardOps(
+		fclient.FissionClientSet.CoreV1().Functions,
+		func(fr *FissionResources) []fv1.Function { return fr.Functions },
+		func(l *fv1.FunctionList) []fv1.Function { return l.Items },
+		func(o *fv1.Function) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.Function) bool {
 			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		create: func(ctx context.Context, f *fv1.Function) (*metav1.ObjectMeta, error) {
-			n, err := functions(f.Namespace).Create(ctx, f, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		update: func(ctx context.Context, _, d *fv1.Function) (*metav1.ObjectMeta, error) {
-			n, err := util.UpdateOnConflict(ctx, functions(d.Namespace), d.Name, func(cur *fv1.Function) {
-				d.ResourceVersion = cur.ResourceVersion
-				*cur = *d
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return functions(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+	), delete, specAllowConflicts, dryRun)
 }
 
 func applyEnvironments(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	environments := func(ns string) typedv1.EnvironmentInterface {
-		return fclient.FissionClientSet.CoreV1().Environments(ns)
-	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.Environment, *fv1.Environment]{
-		items: func(fr *FissionResources) []fv1.Environment { return fr.Environments },
-		list: func(ctx context.Context) ([]fv1.Environment, error) {
-			l, err := environments(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(e *fv1.Environment) *metav1.ObjectMeta { return &e.ObjectMeta },
-		equal: func(e, d *fv1.Environment) bool {
+	return applyResourceType(ctx, fr, standardOps(
+		fclient.FissionClientSet.CoreV1().Environments,
+		func(fr *FissionResources) []fv1.Environment { return fr.Environments },
+		func(l *fv1.EnvironmentList) []fv1.Environment { return l.Items },
+		func(o *fv1.Environment) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.Environment) bool {
 			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		create: func(ctx context.Context, e *fv1.Environment) (*metav1.ObjectMeta, error) {
-			n, err := environments(e.Namespace).Create(ctx, e, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		update: func(ctx context.Context, _, d *fv1.Environment) (*metav1.ObjectMeta, error) {
-			n, err := util.UpdateOnConflict(ctx, environments(d.Namespace), d.Name, func(cur *fv1.Environment) {
-				d.ResourceVersion = cur.ResourceVersion
-				*cur = *d
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return environments(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+	), delete, specAllowConflicts, dryRun)
 }
 
 func applyHTTPTriggers(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	triggers := func(ns string) typedv1.HTTPTriggerInterface {
-		return fclient.FissionClientSet.CoreV1().HTTPTriggers(ns)
-	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.HTTPTrigger, *fv1.HTTPTrigger]{
-		items: func(fr *FissionResources) []fv1.HTTPTrigger { return fr.HttpTriggers },
-		list: func(ctx context.Context) ([]fv1.HTTPTrigger, error) {
-			l, err := triggers(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(t *fv1.HTTPTrigger) *metav1.ObjectMeta { return &t.ObjectMeta },
-		equal: func(e, d *fv1.HTTPTrigger) bool {
+	ops := standardOps(
+		fclient.FissionClientSet.CoreV1().HTTPTriggers,
+		func(fr *FissionResources) []fv1.HTTPTrigger { return fr.HttpTriggers },
+		func(l *fv1.HTTPTriggerList) []fv1.HTTPTrigger { return l.Items },
+		func(o *fv1.HTTPTrigger) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.HTTPTrigger) bool {
 			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		// read-only duplicate-route check; runs in dry-run too so a preview
-		// surfaces the conflict a real apply would reject.
-		validate: func(ctx context.Context, t *fv1.HTTPTrigger) error {
-			return util.CheckHTTPTriggerDuplicates(ctx, fclient, t)
-		},
-		create: func(ctx context.Context, t *fv1.HTTPTrigger) (*metav1.ObjectMeta, error) {
-			n, err := triggers(t.Namespace).Create(ctx, t, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		update: func(ctx context.Context, _, d *fv1.HTTPTrigger) (*metav1.ObjectMeta, error) {
-			n, err := util.UpdateOnConflict(ctx, triggers(d.Namespace), d.Name, func(cur *fv1.HTTPTrigger) {
-				d.ResourceVersion = cur.ResourceVersion
-				*cur = *d
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return triggers(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+	)
+	// read-only duplicate-route check; runs in dry-run too so a preview
+	// surfaces the conflict a real apply would reject.
+	ops.validate = func(ctx context.Context, t *fv1.HTTPTrigger) error {
+		return util.CheckHTTPTriggerDuplicates(ctx, fclient, t)
+	}
+	return applyResourceType(ctx, fr, ops, delete, specAllowConflicts, dryRun)
 }
 
 func applyKubernetesWatchTriggers(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	watches := func(ns string) typedv1.KubernetesWatchTriggerInterface {
-		return fclient.FissionClientSet.CoreV1().KubernetesWatchTriggers(ns)
-	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.KubernetesWatchTrigger, *fv1.KubernetesWatchTrigger]{
-		items: func(fr *FissionResources) []fv1.KubernetesWatchTrigger { return fr.KubernetesWatchTriggers },
-		list: func(ctx context.Context) ([]fv1.KubernetesWatchTrigger, error) {
-			l, err := watches(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(t *fv1.KubernetesWatchTrigger) *metav1.ObjectMeta { return &t.ObjectMeta },
-		equal: func(e, d *fv1.KubernetesWatchTrigger) bool {
+	return applyResourceType(ctx, fr, standardOps(
+		fclient.FissionClientSet.CoreV1().KubernetesWatchTriggers,
+		func(fr *FissionResources) []fv1.KubernetesWatchTrigger { return fr.KubernetesWatchTriggers },
+		func(l *fv1.KubernetesWatchTriggerList) []fv1.KubernetesWatchTrigger { return l.Items },
+		func(o *fv1.KubernetesWatchTrigger) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.KubernetesWatchTrigger) bool {
 			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		create: func(ctx context.Context, t *fv1.KubernetesWatchTrigger) (*metav1.ObjectMeta, error) {
-			n, err := watches(t.Namespace).Create(ctx, t, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		update: func(ctx context.Context, _, d *fv1.KubernetesWatchTrigger) (*metav1.ObjectMeta, error) {
-			n, err := util.UpdateOnConflict(ctx, watches(d.Namespace), d.Name, func(cur *fv1.KubernetesWatchTrigger) {
-				d.ResourceVersion = cur.ResourceVersion
-				*cur = *d
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return watches(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+	), delete, specAllowConflicts, dryRun)
 }
 
 func applyTimeTriggers(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	triggers := func(ns string) typedv1.TimeTriggerInterface {
-		return fclient.FissionClientSet.CoreV1().TimeTriggers(ns)
-	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.TimeTrigger, *fv1.TimeTrigger]{
-		items: func(fr *FissionResources) []fv1.TimeTrigger { return fr.TimeTriggers },
-		list: func(ctx context.Context) ([]fv1.TimeTrigger, error) {
-			l, err := triggers(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(t *fv1.TimeTrigger) *metav1.ObjectMeta { return &t.ObjectMeta },
-		equal: func(e, d *fv1.TimeTrigger) bool {
+	return applyResourceType(ctx, fr, standardOps(
+		fclient.FissionClientSet.CoreV1().TimeTriggers,
+		func(fr *FissionResources) []fv1.TimeTrigger { return fr.TimeTriggers },
+		func(l *fv1.TimeTriggerList) []fv1.TimeTrigger { return l.Items },
+		func(o *fv1.TimeTrigger) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.TimeTrigger) bool {
 			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		create: func(ctx context.Context, t *fv1.TimeTrigger) (*metav1.ObjectMeta, error) {
-			n, err := triggers(t.Namespace).Create(ctx, t, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
+	), delete, specAllowConflicts, dryRun)
+}
+
+func applyWorkflows(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
+	return applyResourceType(ctx, fr, standardOps(
+		fclient.FissionClientSet.CoreV1().Workflows,
+		func(fr *FissionResources) []fv1.Workflow { return fr.Workflows },
+		func(l *fv1.WorkflowList) []fv1.Workflow { return l.Items },
+		func(o *fv1.Workflow) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.Workflow) bool {
+			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		update: func(ctx context.Context, _, d *fv1.TimeTrigger) (*metav1.ObjectMeta, error) {
-			n, err := util.UpdateOnConflict(ctx, triggers(d.Namespace), d.Name, func(cur *fv1.TimeTrigger) {
-				d.ResourceVersion = cur.ResourceVersion
-				*cur = *d
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return triggers(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+	), delete, specAllowConflicts, dryRun)
 }
 
 func applyMessageQueueTriggers(ctx context.Context, fclient cmd.Client, fr *FissionResources, delete bool, specAllowConflicts bool, dryRun bool) (map[string]metav1.ObjectMeta, *ResourceApplyStatus, error) {
-	triggers := func(ns string) typedv1.MessageQueueTriggerInterface {
-		return fclient.FissionClientSet.CoreV1().MessageQueueTriggers(ns)
-	}
-	return applyResourceType(ctx, fr, resourceOps[fv1.MessageQueueTrigger, *fv1.MessageQueueTrigger]{
-		items: func(fr *FissionResources) []fv1.MessageQueueTrigger { return fr.MessageQueueTriggers },
-		list: func(ctx context.Context) ([]fv1.MessageQueueTrigger, error) {
-			l, err := triggers(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return l.Items, nil
-		},
-		meta: func(t *fv1.MessageQueueTrigger) *metav1.ObjectMeta { return &t.ObjectMeta },
-		equal: func(e, d *fv1.MessageQueueTrigger) bool {
+	return applyResourceType(ctx, fr, standardOps(
+		fclient.FissionClientSet.CoreV1().MessageQueueTriggers,
+		func(fr *FissionResources) []fv1.MessageQueueTrigger { return fr.MessageQueueTriggers },
+		func(l *fv1.MessageQueueTriggerList) []fv1.MessageQueueTrigger { return l.Items },
+		func(o *fv1.MessageQueueTrigger) *metav1.ObjectMeta { return &o.ObjectMeta },
+		func(e, d *fv1.MessageQueueTrigger) bool {
 			return isObjectMetaEqual(e.ObjectMeta, d.ObjectMeta) && reflect.DeepEqual(e.Spec, d.Spec)
 		},
-		create: func(ctx context.Context, t *fv1.MessageQueueTrigger) (*metav1.ObjectMeta, error) {
-			n, err := triggers(t.Namespace).Create(ctx, t, metav1.CreateOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		update: func(ctx context.Context, _, d *fv1.MessageQueueTrigger) (*metav1.ObjectMeta, error) {
-			n, err := util.UpdateOnConflict(ctx, triggers(d.Namespace), d.Name, func(cur *fv1.MessageQueueTrigger) {
-				d.ResourceVersion = cur.ResourceVersion
-				*cur = *d
-			})
-			if err != nil {
-				return nil, err
-			}
-			return &n.ObjectMeta, nil
-		},
-		delete: func(ctx context.Context, ns, name string) error {
-			return triggers(ns).Delete(ctx, name, metav1.DeleteOptions{})
-		},
-	}, delete, specAllowConflicts, dryRun)
+	), delete, specAllowConflicts, dryRun)
 }
 
 func isObjectMetaEqual(existingObj, newObj metav1.ObjectMeta) bool {

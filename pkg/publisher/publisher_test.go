@@ -61,6 +61,27 @@ func TestPublisherSubpath(t *testing.T) {
 	time.Sleep(time.Second * 1)
 }
 
+// TestPublisherEmptyTargetPostsToBaseURL: eventhook's url mode publishes
+// with no target; the request must hit the configured URL exactly, not the
+// URL with a trailing slash (a strict router returns 404 for that - seen
+// with graphql-server-lambdas' /webhooks/fission-events, 2026-11-04).
+func TestPublisherEmptyTargetPostsToBaseURL(t *testing.T) {
+	paths := make(chan string, 1)
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths <- r.URL.Path
+	}))
+	defer s.Close()
+
+	wp := MakeWebhookPublisher(logr.Discard(), s.URL+"/webhooks/fission-events")
+	wp.Publish(t.Context(), "{}", nil, http.MethodPost, "")
+	select {
+	case got := <-paths:
+		require.Equal(t, "/webhooks/fission-events", got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the publisher never called the receiver")
+	}
+}
+
 // countingSink is a logr.LogSink that counts error-level log calls; all
 // other LogSink behavior is no-op. Used to assert that retried 404s do not
 // flood the error log (they log at V(1) until the final give-up).
@@ -118,6 +139,40 @@ func TestWebhookPublisherRetriesNotFound(t *testing.T) {
 
 	require.Zero(t, sink.errorCount(),
 		"retried 404s that eventually succeed must not produce error-level logs")
+}
+
+// TestWebhookPublisherRetriesServerErrors verifies that a 5xx from the
+// target (e.g. a newdeploy pod the router picked before it finished
+// specializing, returning a transient 500) is retried instead of being
+// dropped on the first attempt — previously a single 500 gave up
+// immediately with no retry at all, silently discarding the event.
+func TestWebhookPublisherRetriesServerErrors(t *testing.T) {
+	var mu sync.Mutex
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		hits++
+		if hits < 3 {
+			http.Error(w, "not specialized yet", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	sink := &countingSink{}
+	p := MakeWebhookPublisher(logr.New(sink), srv.URL)
+	p.Publish(t.Context(), "", map[string]string{}, http.MethodPost, "test-fn")
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits >= 3
+	}, 15*time.Second, 100*time.Millisecond, "publisher should retry past transient 5xx responses")
+
+	require.Zero(t, sink.errorCount(),
+		"retried 5xx responses that eventually succeed must not produce error-level logs")
 }
 
 // TestWebhookPublisherDoesNotRetryOtherClientErrors verifies that a 4xx

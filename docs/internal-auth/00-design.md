@@ -76,12 +76,25 @@ Service identifiers are part of the HKDF info string and must remain stable acro
 | `fetcher` | in-pod `cmd/fetcher` `/fetch`, `/upload`, `/clean`, `/specialize` (port 8000) | buildermgr (build → fetcher), executor (specialization → fetcher) | Phase 2 (PR-α) |
 | `builder` | in-pod `cmd/builder` `/build` (port 8001) | buildermgr | Phase 2 (PR-α) |
 | `executor` | `pkg/executor` HTTP API: `/v2/getServiceForFunction`, `/v2/tap`, `/v2/error`, etc. | router, kubewatcher, timer, mqt-fission-kafka, canaryconfig | Phase 2 (PR-β) |
-| `router-internal` | router's internal listener that hosts `/fission-function/<ns>/<name>` | executor, kubewatcher, timer, mqt-fission-kafka, mqt-keda connectors | Advisory 4 (separate PR) |
+| `router-internal` | router's internal listener that hosts `/fission-function/<ns>/<name>` | executor, kubewatcher, timer, mqt-fission-kafka, mqt-keda connectors, `fission` CLI (`fn test`, `fn test --async`) | Advisory 4 (separate PR) |
 
 Out of scope:
 - **Webhook server** — already authenticated by the kube-apiserver's CA on the admission path.
 - **`/healthz`, `/metrics`** — kubelet / Prometheus probes have no signing path; bypass is mandatory.
 - **MQT-KEDA connector → router-internal** — upstream `fission/kafka-http-connector` images don't sign; they need an upstream image change or a deploy-time NetworkPolicy-only acceptance.
+
+### CLI direct invocation (`fission fn test`)
+
+`fission fn test` (and `fission fn test --async`) invoke a function directly via `/fission-function/<ns>/<name>` on the router **internal** listener (port 8889, `svc/router-internal`) — not the public listener (8888), which no longer serves that path after GHSA-3g33-6vg6-27m8. The CLI port-forwards to `svc/router-internal` and HMAC-signs the request with the `ServiceRouterInternal` key when `FISSION_INTERNAL_AUTH_SECRET` is set.
+
+**When internal auth is enabled** (`internalAuth.enabled=true`, the chart default), the operator must export `FISSION_INTERNAL_AUTH_SECRET` in the shell before running `fission fn test`:
+
+```bash
+export FISSION_INTERNAL_AUTH_SECRET="$(kubectl get secret fission-internal-auth -n fission -o jsonpath='{.data.secret}' | base64 -d)"
+fission fn test --name my-fn
+```
+
+Without it the router's internal verifier rejects the request with `401`/`403`. When internal auth is disabled (pass-through mode, `internalAuth.enabled=false`), no env var is needed — the verifier short-circuits and accepts unsigned requests.
 
 ## Design
 
@@ -281,12 +294,18 @@ The complexity is not justified when HKDF gives the same isolation from one mast
 The scheme has known limitations operators should plan around.
 
 **Maximum body size.**
-The verifier reads the entire request body into memory before computing the signature so the body bytes can be re-injected for downstream handlers (multipart parsers, etc.).
-That cost is bounded by `VerifierOpts.MaxBodyBytes` (default 256 MiB, set on each registration).
-Bodies that exceed the cap are rejected with `413 Request Entity Too Large` *before* signature verification — i.e. an unauthenticated attacker cannot use a giant unsigned body to DoS a signed service.
+The verifier must drain the entire request body before computing the signature so the body bytes can be re-injected for downstream handlers (multipart parsers, etc.).
+The size of a body it accepts is bounded by `VerifierOpts.MaxBodyBytes` (default 256 MiB, set on each registration).
+Bodies that exceed the cap are rejected with `413 Request Entity Too Large` *before* signature verification, so an unauthenticated sender cannot push more than the cap through a signed service per request.
+Bodies *under* the cap are still drained in full before the signature check — the hash needs every byte — so an unauthenticated sender with a fresh timestamp can spend up to the cap of transient resource (memory, or ephemeral disk where spooling is enabled) per in-flight request before its 401; the NetworkPolicy fencing of the internal listeners is what bounds who can spend it.
 Operators that legitimately need to upload archives larger than 256 MiB should bump the cap rather than disable enforcement; the cap is the largest archive size we expect to see in practice.
-For the one bulk-data endpoint, `storagesvc /v1/archive`, the cap is operator-tunable: set the Helm value `storagesvc.maxArchiveSizeMib` (env var `STORAGE_MAX_ARCHIVE_SIZE_MIB`), and size the storagesvc memory request/limit to match, since the body is held in memory during verification.
-The other registrations (fetcher, builder, executor, router-internal) carry small control-plane payloads and keep the 256 MiB default.
+For the one bulk-data endpoint, `storagesvc /v1/archive`, the cap is operator-tunable: set the Helm value `storagesvc.maxArchiveSizeMib` (env var `STORAGE_MAX_ARCHIVE_SIZE_MIB`).
+Whether the drained body is *held in memory* is a separate knob: with `VerifierOpts.SpoolThresholdBytes` set (storagesvc sets 4 MiB), over-threshold bodies are hashed while streaming to a temp file and re-read from it, so verifier memory is bounded by the threshold — raising the archive cap no longer requires raising the storagesvc memory request/limit to match.
+Spool files go to the container's temp dir, and storagesvc's multipart parsing writes its own temp copy of the same body, so a max-size upload transiently occupies up to ~2× the cap on the node's ephemeral storage; size the pod's ephemeral-storage request for `2 × cap × expected concurrent uploads`.
+A spool failure (full or read-only temp dir) is answered `500`, never `401`, so a disk fault is distinguishable from an auth failure in both status codes and logs.
+The classification happens during the pre-verification drain, so during a disk fault the 500s (and their error-level log lines) are produced for any allowlisted peer's over-threshold request, signed or not — expect the 5xx rate and error-log volume to track total traffic on that listener, which is the loud signal a broken disk should produce.
+Clients that retry on 5xx will re-stream their bodies against a persistently broken spool; the repo's internal clients that front spooling listeners do not retry on 5xx today, and any future pairing should keep that property or bound the retries.
+The other registrations (fetcher, builder, executor, router-internal) carry small or latency-sensitive payloads and stay fully in-memory with the 256 MiB default cap (the router internal listener caps at 64 MiB).
 For very large packages, OCI-native delivery (`packageRegistry`) is the better-managed alternative to raising the cap — the code is pulled and mounted from a registry rather than buffered through storagesvc.
 
 **Replay within the skew window.**

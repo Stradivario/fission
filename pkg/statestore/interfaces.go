@@ -1,0 +1,195 @@
+// SPDX-FileCopyrightText: The Fission Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+package statestore
+
+import (
+	"context"
+	"time"
+)
+
+// KVStore is keyed durable state with compare-and-swap and TTL.
+type KVStore interface {
+	// Get returns the value for key, or ErrNotFound if it is absent or expired.
+	Get(ctx context.Context, s Scope, key string) (Value, error)
+	// Set writes val for key subject to the concurrency and TTL semantics in o.
+	// A failed CAS returns ErrVersionConflict.
+	Set(ctx context.Context, s Scope, key string, val []byte, o SetOptions) error
+	// Delete removes key. ifVersion <= 0 deletes unconditionally; a positive
+	// ifVersion is a CAS delete that returns ErrVersionConflict on mismatch.
+	Delete(ctx context.Context, s Scope, key string, ifVersion int64) error
+	// List returns a page of keys under prefix, ordered lexicographically.
+	List(ctx context.Context, s Scope, prefix string, page Page) (KeyPage, error)
+}
+
+// CountedKV is an optional KVStore capability: a "set with live-key budget"
+// where the budget check and the write are ONE atomic step inside the driver
+// (RFC-0023 S3 / quota.tla — never read-check-then-write, whose overshoot the
+// AtomicQuota=FALSE config traces). SetCounted behaves exactly like Set with o,
+// except that a write which would CREATE a live key (target absent or expired)
+// in a scope already holding >= maxKeys live keys returns ErrQuotaExceeded.
+// Overwrites of live keys never consume budget, and because the driver counts
+// live keys directly the budget is TTL-exact: expired keys free their slot the
+// moment they expire, with no external counter to drift.
+//
+// A scope whose MaxKeys quota is enforced must funnel all its writes through
+// SetCounted (scopedKV does); mixing plain Set into such a scope bypasses the
+// budget. maxKeys <= 0 means no budget (identical to Set).
+type CountedKV interface {
+	SetCounted(ctx context.Context, s Scope, key string, val []byte, o SetOptions, maxKeys int64) error
+}
+
+// AppendAny is the sentinel expectedSeq for EventLog.Append that appends
+// unconditionally at the stream's current head — an atomic server-side
+// increment, not a compare-and-swap. Topic publishers use it (RFC-0027): topic
+// events are independent, so serializing publishers through client-side CAS
+// retries would self-inflict contention under fan-in (the eventlogsub.tla
+// model's premise). CAS callers (the RFC-0022 fold, where interleave prevention
+// is the point) keep passing a real head — and their streams' consumers rely on
+// it: AppendAny on a CAS-disciplined stream silently defeats its interleave
+// protection (the wire cannot tell stream kinds apart), so it belongs ONLY on
+// independent-event streams such as topic/*.
+const AppendAny int64 = -1
+
+// EventLog is an append-only, ordered, replayable stream with optimistic
+// concurrency: Append succeeds only when expectedSeq equals the stream head, so
+// concurrent appenders get ErrVersionConflict instead of interleaving —
+// unless the caller opts out of the CAS with AppendAny.
+type EventLog interface {
+	// Append atomically appends events when expectedSeq equals the current head
+	// sequence, returning the new head sequence. A mismatch returns
+	// ErrVersionConflict and appends nothing (use Head to resynchronize).
+	// expectedSeq = AppendAny skips the head check and appends unconditionally
+	// at the current head. The returned head is meaningful only when err is nil
+	// or ErrVersionConflict; on any other error it is 0.
+	Append(ctx context.Context, stream string, expectedSeq int64, events []Event) (int64, error)
+	// Read returns up to limit events with Seq > fromSeq, in order.
+	Read(ctx context.Context, stream string, fromSeq int64, limit int) ([]Event, error)
+	// Head returns the stream's current head sequence (0 for an absent stream),
+	// with no side effects. It backs start-at-head topic subscription and the
+	// consumer-lag gauge (RFC-0027), and lets a CAS caller resynchronize after
+	// ErrVersionConflict without walking the log.
+	Head(ctx context.Context, stream string) (int64, error)
+	// Trim drops events with Seq < belowSeq (history GC).
+	Trim(ctx context.Context, stream string, belowSeq int64) error
+}
+
+// BoundedEventLog is an optional EventLog extension: ReadBounded is Read with
+// a payload-byte budget, so a caller can bound what one page materializes —
+// in the store, not only on the wire — regardless of how large the stored
+// events are (a keyspace may have lowered its per-event quota after appending
+// larger events, so no count derived from the current quota can bound bytes).
+//
+// Contract: events are returned in order until either limit is reached or
+// adding the next event would push the summed payload bytes over maxBytes.
+// At least one event is returned whenever any matches — a single event larger
+// than the budget is still delivered — so a reader paging by Seq never
+// stalls. maxBytes <= 0 means unbounded (identical to Read).
+//
+// Every shipped driver implements it; ReadBoundedFallback serves a driver
+// that does not, at the cost of materializing the full page first.
+type BoundedEventLog interface {
+	EventLog
+	ReadBounded(ctx context.Context, stream string, fromSeq int64, limit int, maxBytes int64) ([]Event, error)
+}
+
+// ReadBounded reads a page under a payload-byte budget through el's
+// BoundedEventLog implementation when it has one, and through
+// ReadBoundedFallback otherwise.
+func ReadBounded(ctx context.Context, el EventLog, stream string, fromSeq int64, limit int, maxBytes int64) ([]Event, error) {
+	if b, ok := el.(BoundedEventLog); ok {
+		return b.ReadBounded(ctx, stream, fromSeq, limit, maxBytes)
+	}
+	return ReadBoundedFallback(ctx, el, stream, fromSeq, limit, maxBytes)
+}
+
+// ReadBoundedFallback implements the ReadBounded contract on top of plain
+// Read: the store still materializes up to limit events, and the page is
+// trimmed to the budget afterwards. It bounds the response, not the store.
+func ReadBoundedFallback(ctx context.Context, el EventLog, stream string, fromSeq int64, limit int, maxBytes int64) ([]Event, error) {
+	evs, err := el.Read(ctx, stream, fromSeq, limit)
+	if err != nil {
+		return nil, err
+	}
+	return TrimToBudget(evs, maxBytes), nil
+}
+
+// TrimToBudget cuts evs (in order) to the longest prefix whose summed payload
+// bytes fit maxBytes, always keeping the first event. maxBytes <= 0 returns
+// evs unchanged.
+func TrimToBudget(evs []Event, maxBytes int64) []Event {
+	if maxBytes <= 0 {
+		return evs
+	}
+	var total int64
+	for i, ev := range evs {
+		total += int64(len(ev.Payload))
+		if total > maxBytes && i > 0 {
+			return evs[:i]
+		}
+	}
+	return evs
+}
+
+// Queue is an at-least-once work queue with visibility-timeout leases and a
+// dead-letter table.
+//
+// The settle methods (Ack/Nack/Kill) take the lease Receipt, not the durable
+// message id. This is the one deliberate rename from the RFC-0021 sketch's
+// Ack(id) so the epoch-guard correspondence (queue.tla invariant I2 / RFC-0021
+// invariant Q2) is legible in the type system: a Receipt is valid only for the
+// lease that produced it. DeadLetters and Redrive operate on durable ids.
+type Queue interface {
+	// Enqueue adds msg and returns its durable id. With o.DedupKey set, an
+	// existing not-yet-settled message with the same key collapses the enqueue
+	// and its id is returned.
+	Enqueue(ctx context.Context, queue string, msg Message, o EnqueueOptions) (string, error)
+	// Lease atomically leases up to n currently-visible messages for leaseFor,
+	// making them invisible until the lease expires or they are settled.
+	Lease(ctx context.Context, queue string, n int, leaseFor time.Duration) ([]LeasedMessage, error)
+	// Ack settles a delivery as succeeded. A stale or malformed receipt returns
+	// ErrInvalidReceipt and changes nothing.
+	Ack(ctx context.Context, receipt string) error
+	// Nack settles a delivery as failed and requeues it after retryAfter, unless
+	// the attempt budget is spent, in which case the message is dead-lettered.
+	Nack(ctx context.Context, receipt string, retryAfter time.Duration) error
+	// Kill dead-letters the current delivery immediately with reason. Unlike the
+	// retry path (Nack and lease expiry, which dead-letter only once the attempt
+	// budget is spent — invariant Q3), Kill is a permanent-failure escape hatch:
+	// it dead-letters regardless of remaining attempts, so RFC-0024 can drop a
+	// message on a permanent 4xx without burning retries. It is deliberately
+	// outside the retry protocol modeled in queue.tla.
+	Kill(ctx context.Context, receipt string, reason string) error
+	// DeadLetters returns a page of dead-lettered messages for queue.
+	DeadLetters(ctx context.Context, queue string, page Page) ([]DeadMessage, error)
+	// Redrive re-enqueues dead-lettered messages by durable id with attempts
+	// reset, returning the number actually re-enqueued — ids that are not currently
+	// dead-lettered are skipped, so the count can be less than len(ids).
+	Redrive(ctx context.Context, queue string, ids []string) (int64, error)
+	// Purge permanently deletes every dead-lettered message for queue and returns
+	// the number removed. It touches only the dead set (never queued/leased/acked
+	// work), so it drops the conservation Enqueued and Dead counts equally and the
+	// T1 drift invariant is preserved by construction.
+	Purge(ctx context.Context, queue string) (int64, error)
+	// Stats returns a point-in-time snapshot of queue's backlog (visible / leased
+	// / dead counts and the oldest visible message's age), for the RFC-0024 async
+	// depth/oldest-age metrics and DLQ dashboards. It does not reap expired leases.
+	Stats(ctx context.Context, queue string) (QueueStats, error)
+}
+
+// Capabilities is the driver set a component opens once at start. A consumer asks
+// for exactly the capabilities it needs and fails fast at startup if one is not
+// configured.
+type Capabilities interface {
+	// KV returns the KVStore capability or ErrCapabilityUnavailable.
+	KV() (KVStore, error)
+	// EventLog returns the EventLog capability or ErrCapabilityUnavailable.
+	EventLog() (EventLog, error)
+	// Queue returns the Queue capability or ErrCapabilityUnavailable.
+	Queue() (Queue, error)
+	// Ping is a health affordance for a consumer's /readyz gate.
+	Ping(ctx context.Context) error
+	// Close releases the driver's resources.
+	Close() error
+}

@@ -34,7 +34,9 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apitypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -103,7 +105,7 @@ func TestCELFunctionValidation(t *testing.T) {
 
 	fn := func(name string, mut func(*fv1.Function)) *fv1.Function {
 		f := &fv1.Function{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Name: name, Namespace: ns,
 			Spec: fv1.FunctionSpec{
 				Environment:    fv1.EnvironmentReference{Name: "env", Namespace: ns},
 				InvokeStrategy: fv1.InvokeStrategy{ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypePoolmgr}},
@@ -147,8 +149,8 @@ func TestCELEnvironmentValidation(t *testing.T) {
 
 	env := func(name string, mut func(*fv1.Environment)) *fv1.Environment {
 		e := &fv1.Environment{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       fv1.EnvironmentSpec{Version: 1, Runtime: fv1.Runtime{Image: "img"}},
+			Name: name, Namespace: ns,
+			Spec: fv1.EnvironmentSpec{Version: 1, Runtime: fv1.Runtime{Image: "img"}},
 		}
 		if mut != nil {
 			mut(e)
@@ -188,8 +190,8 @@ func TestCELEnvironmentVersionImmutable(t *testing.T) {
 
 	created, err := fc.CoreV1().Environments(ns).Create(t.Context(),
 		&fv1.Environment{
-			ObjectMeta: metav1.ObjectMeta{Name: "e-immutable", Namespace: ns},
-			Spec:       fv1.EnvironmentSpec{Version: 1, Runtime: fv1.Runtime{Image: "img"}},
+			Name: "e-immutable", Namespace: ns,
+			Spec: fv1.EnvironmentSpec{Version: 1, Runtime: fv1.Runtime{Image: "img"}},
 		}, metav1.CreateOptions{})
 	require.NoError(t, err)
 
@@ -207,7 +209,7 @@ func TestCELReferenceNamePatterns(t *testing.T) {
 
 	fn := func(name string, mut func(*fv1.Function)) *fv1.Function {
 		f := &fv1.Function{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Name: name, Namespace: ns,
 			Spec: fv1.FunctionSpec{
 				Environment:    fv1.EnvironmentReference{Name: "env", Namespace: ns},
 				InvokeStrategy: fv1.InvokeStrategy{ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypePoolmgr}},
@@ -259,8 +261,8 @@ func TestCELPackageEnvironmentName(t *testing.T) {
 	fc := client(t)
 	pkg := func(name, envName string) *fv1.Package {
 		return &fv1.Package{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       fv1.PackageSpec{Environment: fv1.EnvironmentReference{Name: envName, Namespace: ns}},
+			Name: name, Namespace: ns,
+			Spec: fv1.PackageSpec{Environment: fv1.EnvironmentReference{Name: envName, Namespace: ns}},
 		}
 	}
 	_, err := fc.CoreV1().Packages(ns).Create(t.Context(), pkg("pkg-env-ok", "env"), metav1.CreateOptions{})
@@ -275,7 +277,7 @@ func TestCELKubernetesWatchTriggerNamespace(t *testing.T) {
 	fc := client(t)
 	kwt := func(name, specNs string) *fv1.KubernetesWatchTrigger {
 		return &fv1.KubernetesWatchTrigger{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Name: name, Namespace: ns,
 			Spec: fv1.KubernetesWatchTriggerSpec{
 				Namespace:         specNs,
 				Type:              "POD",
@@ -304,12 +306,136 @@ func TestCELKubernetesWatchTriggerNamespace(t *testing.T) {
 	}
 }
 
+// TestCELFunctionVersionAndAliasInstall is the RFC-0025 early CEL-cost check
+// (Task 1, Step 3b): FunctionVersionSpec embeds a full FunctionSpec one level
+// deeper than Function itself (Function.spec vs FunctionVersion.spec.snapshot),
+// carrying every one of FunctionSpec's XValidation rules and its PodSpec along
+// for the ride. TestMain's envtest.Environment.Start already proves both new
+// CRDs installed cleanly (an over-budget or non-compiling
+// x-kubernetes-validations rule fails CRD apply, which fails Start, which
+// os.Exit(1)s before any test runs) — this test additionally exercises actual
+// Create calls against both types, including the FunctionAliasSpec CEL rules,
+// so a schema that "installs" but silently drops/miscompiles a rule is still
+// caught.
+func TestCELFunctionVersionAndAliasInstall(t *testing.T) {
+	fc := client(t)
+
+	fv := &fv1.FunctionVersion{
+		Name: "fv-valid", Namespace: ns,
+		Spec: fv1.FunctionVersionSpec{
+			FunctionName:       "fn",
+			FunctionUID:        apitypes.UID("fn-uid"),
+			FunctionGeneration: 1,
+			Sequence:           1,
+			Snapshot: fv1.FunctionSpec{
+				Environment:    fv1.EnvironmentReference{Name: "env", Namespace: ns},
+				InvokeStrategy: fv1.InvokeStrategy{ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypePoolmgr}},
+			},
+			PackageDigest: "sha256:" + strings.Repeat("a", 64),
+			PublishedAt:   metav1.Now(),
+		},
+	}
+	_, err := fc.CoreV1().FunctionVersions(ns).Create(t.Context(), fv, metav1.CreateOptions{})
+	require.NoError(t, err, "valid FunctionVersion (embedded FunctionSpec) should be accepted")
+
+	alias := func(name string, mut func(*fv1.FunctionAlias)) *fv1.FunctionAlias {
+		a := &fv1.FunctionAlias{
+			Name: name, Namespace: ns,
+			Spec: fv1.FunctionAliasSpec{FunctionName: "fn", Version: "fv-valid"},
+		}
+		if mut != nil {
+			mut(a)
+		}
+		return a
+	}
+
+	weight := 50
+	cases := []struct {
+		name    string
+		alias   *fv1.FunctionAlias
+		wantErr string // empty => expect accept
+	}{
+		{"valid version-pinned", alias("fa-valid", nil), ""},
+		{"valid digest-pinned", alias("fa-digest", func(a *fv1.FunctionAlias) {
+			a.Spec.Version = ""
+			a.Spec.PackageDigest = "sha256:" + strings.Repeat("b", 64)
+		}), ""},
+		{"valid weighted rollout", alias("fa-weighted", func(a *fv1.FunctionAlias) {
+			a.Spec.Weight = &weight
+			a.Spec.SecondaryVersion = "fv-other"
+		}), ""},
+		{"neither version nor digest set", alias("fa-neither", func(a *fv1.FunctionAlias) {
+			a.Spec.Version = ""
+		}), "exactly one of version and packageDigest"},
+		{"both version and digest set", alias("fa-both", func(a *fv1.FunctionAlias) {
+			a.Spec.PackageDigest = "sha256:" + strings.Repeat("c", 64)
+		}), "exactly one of version and packageDigest"},
+		{"weight without secondaryVersion", alias("fa-weight-nosecondary", func(a *fv1.FunctionAlias) {
+			a.Spec.Weight = &weight
+		}), "weight requires secondaryVersion"},
+		{"secondaryVersion equals version", alias("fa-secondary-same", func(a *fv1.FunctionAlias) {
+			a.Spec.Weight = &weight
+			a.Spec.SecondaryVersion = "fv-valid"
+		}), "secondaryVersion must differ from version"},
+		{"bad packageDigest pattern", alias("fa-bad-digest", func(a *fv1.FunctionAlias) {
+			a.Spec.Version = ""
+			a.Spec.PackageDigest = "not-a-digest"
+		}), "packageDigest"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fc.CoreV1().FunctionAliases(ns).Create(t.Context(), tc.alias, metav1.CreateOptions{})
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "apiserver should reject")
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+
+	// Function.Spec.Versioning.Retain has a GC floor of 1 (CRD Minimum=1):
+	// a Function cannot opt into retaining zero unaliased versions.
+	retainFn := func(name string, retain int) *fv1.Function {
+		return &fv1.Function{
+			Name: name, Namespace: ns,
+			Spec: fv1.FunctionSpec{
+				Environment:    fv1.EnvironmentReference{Name: "env", Namespace: ns},
+				InvokeStrategy: fv1.InvokeStrategy{ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypePoolmgr}},
+				Versioning:     &fv1.VersioningConfig{Retain: &retain},
+			},
+		}
+	}
+
+	retainCases := []struct {
+		name    string
+		fn      *fv1.Function
+		wantErr string // empty => expect accept
+	}{
+		{"retain below minimum rejected", retainFn("f-retain-zero", 0), "retain"},
+		{"retain at valid value accepted", retainFn("f-retain-ten", 10), ""},
+	}
+
+	for _, tc := range retainCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fc.CoreV1().Functions(ns).Create(t.Context(), tc.fn, metav1.CreateOptions{})
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "apiserver should reject")
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
 func TestCELHTTPTriggerRouteConfig(t *testing.T) {
 	fc := client(t)
 
 	ht := func(name string, mut func(*fv1.HTTPTrigger)) *fv1.HTTPTrigger {
 		h := &fv1.HTTPTrigger{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Name: name, Namespace: ns,
 			Spec: fv1.HTTPTriggerSpec{
 				RelativeURL:       "/" + name,
 				Methods:           []string{"GET"},
@@ -362,4 +488,174 @@ func TestCELHTTPTriggerRouteConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCELFunctionReferenceAliasVersion verifies the RFC-0025 CEL rules on the
+// FunctionReference type — alias/version mutual exclusion, the
+// type=='name'-only gate, AND the DNS-1123 label pattern on each (added as a
+// follow-up: MaxLength alone does not reject bad characters) — are enforced
+// by the API server itself. HTTPTrigger has no admission webhook (CEL is its
+// only admission-time gate for functionref shape, see
+// pkg/webhook/service.go), so these cases exercise the rule where it matters
+// most. A successful envtest install of every CRD (TestMain's env.Start(),
+// which fails the whole package if any CRD's CEL blows the apiserver cost
+// estimator's budget) is itself the empirical proof that the two new
+// self.alias.matches(...) / self.version.matches(...) rules stay in budget
+// even embedded under WorkflowSpec.States' map — the known cost-budget hot
+// spot flagged on FunctionReference.Name's own rule.
+func TestCELFunctionReferenceAliasVersion(t *testing.T) {
+	fc := client(t)
+
+	ht := func(name string, ref fv1.FunctionReference) *fv1.HTTPTrigger {
+		return &fv1.HTTPTrigger{
+			Name: name, Namespace: ns,
+			Spec: fv1.HTTPTriggerSpec{
+				RelativeURL:       "/" + name,
+				Methods:           []string{"GET"},
+				FunctionReference: ref,
+			},
+		}
+	}
+
+	cases := []struct {
+		name    string
+		ht      *fv1.HTTPTrigger
+		wantErr string // empty => expect accept
+	}{
+		{"alias and version both set rejected", ht("fr-both", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Alias: "prod", Version: "fn-v1",
+		}), "mutually exclusive"},
+		{"alias with type function-weights rejected", ht("fr-weights-alias", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionWeights, FunctionWeights: map[string]int{"fn": 100}, Alias: "prod",
+		}), "only valid when type is 'name'"},
+		{"version with type function-weights rejected", ht("fr-weights-version", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionWeights, FunctionWeights: map[string]int{"fn": 100}, Version: "fn-v1",
+		}), "only valid when type is 'name'"},
+		{"valid alias accepted", ht("fr-valid-alias", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Alias: "prod",
+		}), ""},
+		{"valid version accepted", ht("fr-valid-version", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Version: "fn-v1",
+		}), ""},
+		{"neither alias nor version accepted", ht("fr-neither", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn",
+		}), ""},
+		{"malformed alias rejected", ht("fr-bad-alias", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Alias: "Bad_Alias!",
+		}), "must be a valid DNS1123 label"},
+		{"malformed version rejected", ht("fr-bad-version", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Version: "Bad_Version!",
+		}), "must be a valid DNS1123 label"},
+		{"valid kebab-case alias accepted", ht("fr-kebab-alias", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Alias: "prod-canary-2",
+		}), ""},
+		{"valid kebab-case version accepted", ht("fr-kebab-version", fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeFunctionName, Name: "fn", Version: "fn-v1-2",
+		}), ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fc.CoreV1().HTTPTriggers(ns).Create(t.Context(), tc.ht, metav1.CreateOptions{})
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "apiserver should reject")
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestCELToolConfigAlias verifies the RFC-0025 DNS-1123 pattern CEL rule on
+// ToolConfig.Alias (added as a follow-up: MaxLength alone does not reject bad
+// characters). Function's admission webhook does not reach ToolConfig.Validate
+// (it calls ValidateForAdmission, a deliberately narrower CEL-complementary
+// method — see pkg/webhook/function.go), so CEL is the only admission-time
+// gate for this field's format today.
+func TestCELToolConfigAlias(t *testing.T) {
+	fc := client(t)
+
+	fn := func(name string, alias string) *fv1.Function {
+		return &fv1.Function{
+			Name: name, Namespace: ns,
+			Spec: fv1.FunctionSpec{
+				Environment:    fv1.EnvironmentReference{Name: "env", Namespace: ns},
+				InvokeStrategy: fv1.InvokeStrategy{ExecutionStrategy: fv1.ExecutionStrategy{ExecutorType: fv1.ExecutorTypePoolmgr}},
+				Tool:           &fv1.ToolConfig{Description: "a tool", Alias: alias},
+			},
+		}
+	}
+
+	cases := []struct {
+		name    string
+		fn      *fv1.Function
+		wantErr string // empty => expect accept
+	}{
+		{"malformed ToolConfig.Alias rejected", fn("tool-bad-alias", "Bad_Alias!"), "must be a valid DNS1123 label"},
+		{"valid kebab-case ToolConfig.Alias accepted", fn("tool-valid-alias", "prod-canary-2"), ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fc.CoreV1().Functions(ns).Create(t.Context(), tc.fn, metav1.CreateOptions{})
+			if tc.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err, "apiserver should reject")
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestCELWorkflowTriggerTarget: functionref.type "workflow" (start a
+// WorkflowRun instead of calling a function) is admitted on HTTP and time
+// triggers with a DNS-1123 workflow name, and refused on the triggers that
+// can only call functions (message queue, kubewatcher).
+func TestCELWorkflowTriggerTarget(t *testing.T) {
+	fc := client(t)
+	wf := func(name string) fv1.FunctionReference {
+		return fv1.FunctionReference{Type: fv1.FunctionReferenceTypeWorkflow, Name: name}
+	}
+
+	t.Run("http trigger accepted", func(t *testing.T) {
+		_, err := fc.CoreV1().HTTPTriggers(ns).Create(t.Context(), &fv1.HTTPTrigger{
+			Name: "wf-http", Namespace: ns,
+			Spec: fv1.HTTPTriggerSpec{RelativeURL: "/wf-http", Methods: []string{"POST"}, FunctionReference: wf("order-flow")},
+		}, metav1.CreateOptions{})
+		assert.NoError(t, err)
+	})
+	t.Run("http trigger with a bad workflow name rejected", func(t *testing.T) {
+		_, err := fc.CoreV1().HTTPTriggers(ns).Create(t.Context(), &fv1.HTTPTrigger{
+			Name: "wf-http-bad", Namespace: ns,
+			Spec: fv1.HTTPTriggerSpec{RelativeURL: "/wf-http-bad", Methods: []string{"POST"}, FunctionReference: wf("Bad_Name")},
+		}, metav1.CreateOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a valid DNS1123 label")
+	})
+	t.Run("time trigger with workflowInput accepted", func(t *testing.T) {
+		tt := &fv1.TimeTrigger{Name: "wf-tt", Namespace: ns}
+		tt.Spec.Cron = "@hourly"
+		tt.Spec.FunctionReference = wf("report")
+		tt.Spec.WorkflowInput = &apiextensionsv1.JSON{Raw: []byte(`{"day":"mon"}`)}
+		_, err := fc.CoreV1().TimeTriggers(ns).Create(t.Context(), tt, metav1.CreateOptions{})
+		assert.NoError(t, err)
+	})
+	t.Run("message queue trigger rejected", func(t *testing.T) {
+		_, err := fc.CoreV1().MessageQueueTriggers(ns).Create(t.Context(), &fv1.MessageQueueTrigger{
+			Name: "wf-mqt", Namespace: ns,
+			Spec: fv1.MessageQueueTriggerSpec{FunctionReference: wf("order-flow"), MessageQueueType: "kafka", Topic: "orders"},
+		}, metav1.CreateOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot target a workflow")
+	})
+	t.Run("kubewatcher rejected", func(t *testing.T) {
+		_, err := fc.CoreV1().KubernetesWatchTriggers(ns).Create(t.Context(), &fv1.KubernetesWatchTrigger{
+			Name: "wf-kwt", Namespace: ns,
+			Spec: fv1.KubernetesWatchTriggerSpec{Namespace: "default", Type: "POD", FunctionReference: wf("order-flow")},
+		}, metav1.CreateOptions{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot target a workflow")
+	})
 }

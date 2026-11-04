@@ -66,6 +66,18 @@ var (
 		"fission_router_endpointcache_fallbacks_total",
 		"Warm-path requests routed to the executor instead of the endpoint index, by reason.",
 	)
+	// stickyTeleports counts sticky admits where the key's HRW owner changed
+	// since the key's last owner-served admit — the "teleports/sec" an
+	// operator watches during pod churn. Best-effort, biased to UNDERcount:
+	// bucket contention between keys suppresses counting (fingerprint guard,
+	// see noteStickyPick), saturation overflow to a non-owner pod is load
+	// shedding and not counted, and only warm-path index admits are observed
+	// — requests served via the executor fallback (e.g. a mass-quarantine
+	// episode) record nothing until warm admits resume.
+	stickyTeleports = metrics.Int64Counter(
+		"fission_router_sticky_teleports_total",
+		"Sticky admits whose key moved to a different HRW-owner endpoint since the key's last owner-served admit (best-effort, undercounts under bucket contention; overflow and executor-fallback traffic not observed).",
+	)
 	// modeInfo is the always-1 info gauge whose labels carry the requested and
 	// effective cache modes (see RegisterModeInfo).
 	modeInfo = metrics.Int64Gauge(
@@ -94,6 +106,20 @@ func RecordQuarantine() { quarantines.Add(context.Background(), 1) }
 // RecordDialTimeoutStrike counts one soft (timeout) dial-failure strike.
 func RecordDialTimeoutStrike() { dialTimeoutStrikes.Add(context.Background(), 1) }
 
+// RecordStickyTeleport counts one sticky-pick change for a function's warm
+// pool. version is the RFC-0025 warm-pool selector ("" for the unversioned
+// pool) — empty surfaces as an absent label on the Prometheus bridge, so
+// unversioned series are unchanged, and a canary's versioned-pool churn stays
+// attributable. Teleports are churn-driven and rare, so the attribute set is
+// built inline rather than cached like the per-request paths.
+func RecordStickyTeleport(namespace, name, version string) {
+	stickyTeleports.Add(context.Background(), 1, metric.WithAttributes(
+		attribute.String("function_namespace", namespace),
+		attribute.String("function_name", name),
+		attribute.String("function_version", version),
+	))
+}
+
 // RegisterModeInfo publishes the constant info gauge exposing the requested and
 // effective endpointslice cache modes. Recorded for EVERY mode (including off)
 // so a fail-soft degrade (e.g. missing RBAC flipping on->off at startup) is
@@ -107,8 +133,10 @@ func RegisterModeInfo(requested, effective string, endpointLB bool) {
 }
 
 var (
-	sizeIndex     atomic.Pointer[Index]
-	sizeGaugeOnce sync.Once
+	sizeIndex          atomic.Pointer[Index]
+	sizeGaugeOnce      sync.Once
+	informersManager   atomic.Pointer[NamespaceInformers]
+	informersGaugeOnce sync.Once
 )
 
 // RegisterSizeGauge publishes an observable gauge reporting the number of
@@ -126,6 +154,25 @@ func RegisterSizeGauge(ix *Index) {
 			func(_ context.Context, o metric.Int64Observer) error {
 				if ix := sizeIndex.Load(); ix != nil {
 					o.Observe(int64(ix.Size()))
+				}
+				return nil
+			},
+		)
+	})
+}
+
+// RegisterInformersGauge publishes an observable gauge reporting the number of
+// running per-namespace informers. It registers the callback exactly once and
+// points later registrations at the newest NamespaceInformers instance.
+func RegisterInformersGauge(nsi *NamespaceInformers) {
+	informersManager.Store(nsi)
+	informersGaugeOnce.Do(func() {
+		metrics.Int64ObservableGauge(
+			"fission_router_endpointcache_informers",
+			"Number of running per-namespace EndpointSlice informers.",
+			func(_ context.Context, o metric.Int64Observer) error {
+				if nsi := informersManager.Load(); nsi != nil {
+					o.Observe(nsi.informerCount.Load())
 				}
 				return nil
 			},
