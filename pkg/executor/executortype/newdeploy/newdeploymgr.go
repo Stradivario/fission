@@ -507,6 +507,10 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 	svc, err := deploy.createOrGetSvc(ctx, fn, deployLabels, deployAnnotations, objName, ns)
 	if err != nil {
 		deploy.logger.Error(err, "error creating service", "service", objName)
+		// visible outside this log (describe function, event watchers ->
+		// Lambforge project notifications), e.g. a namespace quota that
+		// refuses the Service
+		executorUtils.RecordCreateFailure(ctx, deploy.kubernetesClient, deploy.logger, fn, "service", err)
 		if destroyOnCreateError(err) {
 			go cleanupFunc(context.Background(), ns, objName)
 		}
@@ -520,6 +524,7 @@ func (deploy *NewDeploy) fnCreate(ctx context.Context, fn *fv1.Function) (*fscac
 	depl, err := deploy.createOrGetDeployment(ctx, fn, env, objName, deployLabels, deployAnnotations, ns)
 	if err != nil {
 		deploy.logger.Error(err, "error creating deployment", "deployment", objName)
+		executorUtils.RecordCreateFailure(ctx, deploy.kubernetesClient, deploy.logger, fn, "deployment", err)
 		if destroyOnCreateError(err) {
 			go cleanupFunc(context.Background(), ns, objName)
 		}
