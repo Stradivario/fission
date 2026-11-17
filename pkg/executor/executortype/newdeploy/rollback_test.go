@@ -110,7 +110,7 @@ func TestAssessRollout(t *testing.T) {
 		{"new pod still starting", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{Name: "fetcher"})}, rolloutPending},
 		{"crash loop", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
 			Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
-		})}, rolloutFailed},
+		})}, rolloutFailing}, // may be an outage of what it depends on: waited out
 		{"image cannot be pulled (retried by the kubelet)", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
 			Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "ImagePullBackOff"}},
 		})}, rolloutFailing},
@@ -121,7 +121,7 @@ func TestAssessRollout(t *testing.T) {
 		{"invalid image name", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{
 			Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "InvalidImageName"}},
 		})}, rolloutFailed},
-		{"restarting over and over", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{Name: "api", RestartCount: crashRestarts})}, rolloutFailed},
+		{"restarting over and over", deployment(2, rolling), []apiv1.Pod{podWith(apiv1.ContainerStatus{Name: "api", RestartCount: crashRestarts})}, rolloutFailing},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -160,6 +160,8 @@ func TestGuardRollsBackACrashLoopingPackage(t *testing.T) {
 		Name: "api", State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
 	}), appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 3, UpdatedReplicas: 1, AvailableReplicas: 2})
 
+	// a crash loop that LASTS (the confirm window) is a broken package
+	deploy.rolloutGuard.confirm = 20 * time.Millisecond
 	deploy.guardRollout(t.Context(), ns, fnName, broken, &old, ns, deplName, time.Minute)
 
 	got, err := fission.CoreV1().Functions(ns).Get(t.Context(), fnName, metav1.GetOptions{})
@@ -167,6 +169,27 @@ func TestGuardRollsBackACrashLoopingPackage(t *testing.T) {
 	assert.Equal(t, old, got.Spec.Package.PackageRef, "back on the last ready package")
 	assert.Equal(t, "api-bbbbbb", got.Annotations[AnnotationRolledBackFrom])
 	assert.Contains(t, got.Annotations[AnnotationRolledBackReason], "CrashLoopBackOff")
+}
+
+// A crash loop is also what a good package looks like while its database or
+// broker is down: inside the confirm window nothing is rolled back.
+func TestGuardWaitsOutACrashLoop(t *testing.T) {
+	t.Parallel()
+	old, fresh := pkgRef("api-aaaaaa"), pkgRef("api-bbbbbb")
+	fn := function(fresh, &old)
+	deploy, fission := guardFixture(t, fn, podWith(apiv1.ContainerStatus{
+		Name: "api", RestartCount: crashRestarts + 4,
+		State: apiv1.ContainerState{Waiting: &apiv1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+	}), appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 3, UpdatedReplicas: 1, AvailableReplicas: 2})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	deploy.guardRollout(ctx, ns, fnName, fresh, &old, ns, deplName, time.Hour)
+
+	got, err := fission.CoreV1().Functions(ns).Get(t.Context(), fnName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, fresh, got.Spec.Package.PackageRef, "not rolled back while the crash loop may still clear")
+	assert.Empty(t, got.Annotations[AnnotationRolledBackFrom])
 }
 
 func TestGuardRecordsAReadyPackage(t *testing.T) {

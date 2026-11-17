@@ -23,17 +23,29 @@ context - the reconcile is not held):
 - all replicas updated and available -> the package is recorded on the
   Function as `fission.io/last-ready-package` (JSON PackageRef) and the
   guard ends;
-- a new pod's container waits with `CrashLoopBackOff` or
-  `InvalidImageName`, or restarted 3 times, or waits with an error the
-  kubelet retries itself (`ErrImagePull`, `ImagePullBackOff`,
-  `CreateContainerConfigError`, `CreateContainerError`,
-  `RunContainerError`) for `confirmSeconds` in a row, or the rollout is still not available after the grace period
-  (`max(graceSeconds, 2 x specializationTimeout)`) -> the guard merge-patches
-  `spec.package.packageref` back to the last ready package, stamps
-  `fission.io/rolled-back-from` / `-reason` / `-at`, and fires
-  `function.deploy.rolledback` on the deploy event hook
+- a new pod's container waits with `InvalidImageName` (nothing can fix
+  that without a new spec) -> rolled back at once;
+- a new pod's container keeps crashing (`CrashLoopBackOff`, or restarted 3
+  times) or waits with an error the kubelet retries itself (`ErrImagePull`,
+  `ImagePullBackOff`, `CreateContainerConfigError`, `CreateContainerError`,
+  `RunContainerError`) for `confirmSeconds` in a row (default **1800**), or
+  the rollout is still not available after the grace period
+  (`max(graceSeconds, 2 x specializationTimeout)`, default **1800**) -> the
+  guard merge-patches `spec.package.packageref` back to the last ready
+  package, stamps `fission.io/rolled-back-from` / `-reason` / `-at`, and
+  fires `function.deploy.rolledback` on the deploy event hook
   ([build-deploy-webhooks](build-deploy-webhooks.md)) with `package` (the
   failed one), `rollbackPackage` and `reason`.
+
+**Why 30 minutes (since 1.29.2).** Until 1.29.1 a crash loop rolled back at
+once and "not available" after ~4 minutes. A crash loop is also what a good
+package looks like while something it needs is down (its database, its
+broker, DNS during a node change): a deploy made during an outage was
+reverted to a version that could not have started either (owner,
+2026-11-17, after a RabbitMQ pod was evicted twice: "the problem may not be
+on the servers themselves"). Waiting costs little: the rolling update never
+removes the previous version's pods before the new ones are ready, so the
+function keeps serving on the old package the whole time.
 
 Rollback target: the recorded last ready package; before anything was
 recorded, the package the Function ran before this update - only when its

@@ -66,10 +66,10 @@ type rolloutGuardConfig struct {
 }
 
 // rolloutGuardConfigFromEnv: AUTO_ROLLBACK_ENABLED (default true),
-// AUTO_ROLLBACK_GRACE_SECONDS (default 180), AUTO_ROLLBACK_CONFIRM_SECONDS
+// AUTO_ROLLBACK_GRACE_SECONDS (default 1800), AUTO_ROLLBACK_CONFIRM_SECONDS
 // (default 60).
 func rolloutGuardConfigFromEnv(logger logr.Logger) rolloutGuardConfig {
-	cfg := rolloutGuardConfig{enabled: true, grace: 180 * time.Second, confirm: 60 * time.Second, poll: 5 * time.Second}
+	cfg := rolloutGuardConfig{enabled: true, grace: 1800 * time.Second, confirm: 1800 * time.Second, poll: 5 * time.Second}
 	if v := os.Getenv("AUTO_ROLLBACK_ENABLED"); v != "" {
 		on, err := strconv.ParseBool(v)
 		if err != nil {
@@ -165,9 +165,23 @@ const (
 )
 
 // containerFailureReasons can never fix themselves without a new spec.
+//
+// CrashLoopBackOff is NOT one of them (it was until 1.29.1): a container
+// that keeps exiting is also what a perfectly good package looks like while
+// something it needs is down - its database, its broker, DNS during a node
+// change. A deploy made during such an outage was rolled back within a
+// minute or two, although the previous package could not have started
+// either. Crashes are now waited out like every other error that may clear
+// (rolloutFailing + the confirm window, 30 minutes by default); the previous
+// version keeps serving meanwhile, the rolling update never removes it
+// before the new pods are ready.
 var containerFailureReasons = map[string]bool{
-	"CrashLoopBackOff": true,
 	"InvalidImageName": true,
+}
+
+// crashReasons: the container exits again and again.
+var crashReasons = map[string]bool{
+	"CrashLoopBackOff": true,
 }
 
 // retryableReasons are errors the kubelet retries on its own and that often
@@ -210,8 +224,11 @@ func assessRollout(depl *appsv1.Deployment, newPods []apiv1.Pod) (rolloutVerdict
 			if w := cs.State.Waiting; w != nil && containerFailureReasons[w.Reason] {
 				return rolloutFailed, fmt.Sprintf("pod %s container %s: %s", pod.Name, cs.Name, w.Reason)
 			}
-			if cs.RestartCount >= crashRestarts {
-				return rolloutFailed, fmt.Sprintf("pod %s container %s restarted %d times", pod.Name, cs.Name, cs.RestartCount)
+			if w := cs.State.Waiting; w != nil && crashReasons[w.Reason] && failing == "" {
+				failing = fmt.Sprintf("pod %s container %s: %s", pod.Name, cs.Name, w.Reason)
+			}
+			if cs.RestartCount >= crashRestarts && failing == "" {
+				failing = fmt.Sprintf("pod %s container %s restarted %d times", pod.Name, cs.Name, cs.RestartCount)
 			}
 			if w := cs.State.Waiting; w != nil && retryableReasons[w.Reason] && failing == "" {
 				failing = fmt.Sprintf("pod %s container %s: %s", pod.Name, cs.Name, w.Reason)

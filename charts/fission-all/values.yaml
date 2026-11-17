@@ -366,18 +366,21 @@ executor:
   ## This is applicable to Pool Manager executor type only.
   ##
   podReadyTimeout: 300s
-  ## autoRollback: a newdeploy function whose new package cannot start
-  ## (crash loop, image / container errors, or not available within
-  ## graceSeconds - at least twice its specializationTimeout) is moved back
-  ## to its last ready package automatically and fires
+  ## autoRollback: a newdeploy function whose new package cannot start is
+  ## moved back to its last ready package automatically and fires
   ## function.deploy.rolledback. See docs/features/auto-rollback.md.
-  ## Errors the kubelet retries itself (CreateContainerConfigError such as a
-  ## new node's unsynced secret cache, ErrImagePull, ...) must last
-  ## confirmSeconds before they count.
+  ## Patient on purpose (30 minutes): a crash loop, an image / container
+  ## error or "not available yet" is also what a GOOD package looks like
+  ## while something it needs is down (its database, its broker, a node
+  ## change) - a deploy made during an outage must not be reverted. The
+  ## previous version keeps serving meanwhile. graceSeconds: how long "not
+  ## available" may last (at least twice the specializationTimeout);
+  ## confirmSeconds: how long a crash loop or a container error must last.
+  ## Only an invalid image name rolls back at once.
   autoRollback:
     enabled: true
-    graceSeconds: 180
-    confirmSeconds: 60
+    graceSeconds: 1800
+    confirmSeconds: 1800
 
   ## Pod resources as:
   ##  resources:
