@@ -1194,5 +1194,7 @@ func podTemplateChanged(oldFn, newFn *fv1.Function) bool {
 		!apiequality.Semantic.DeepEqual(oldFn.Spec.ConfigMaps, newFn.Spec.ConfigMaps) ||
 		// RFC-0030 per-function env lands in the pod template too.
 		!apiequality.Semantic.DeepEqual(oldFn.Spec.Env, newFn.Spec.Env) ||
-		!apiequality.Semantic.DeepEqual(oldFn.Spec.EnvFrom, newFn.Spec.EnvFrom)
+		!apiequality.Semantic.DeepEqual(oldFn.Spec.EnvFrom, newFn.Spec.EnvFrom) ||
+		// Spread across machines (plan 33) is a pod template constraint.
+		spreadChanged(oldFn, newFn)
 }

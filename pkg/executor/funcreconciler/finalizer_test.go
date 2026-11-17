@@ -263,3 +263,18 @@ func TestDeletionTimestampPredicate(t *testing.T) {
 	assert.False(t, deletionTimestampPredicate.Update(event.UpdateEvent{ObjectNew: live}),
 		"must not pass a normal update on its own — GenerationChangedPredicate handles those")
 }
+
+func TestSpreadAnnotationsPredicate(t *testing.T) {
+	off := &fv1.Function{Name: "fn"}
+	on := &fv1.Function{Name: "fn", Annotations: map[string]string{fv1.FunctionSpreadAnnotation: "machines"}}
+	strict := &fv1.Function{Name: "fn", Annotations: map[string]string{
+		fv1.FunctionSpreadAnnotation: "machines", fv1.FunctionSpreadStrictAnnotation: "true"}}
+	other := &fv1.Function{Name: "fn", Annotations: map[string]string{"note": "x"}}
+
+	assert.True(t, spreadAnnotationsPredicate.Update(event.UpdateEvent{ObjectOld: off, ObjectNew: on}),
+		"turning spread on must reach the reconciler although Generation does not move")
+	assert.True(t, spreadAnnotationsPredicate.Update(event.UpdateEvent{ObjectOld: on, ObjectNew: strict}))
+	assert.True(t, spreadAnnotationsPredicate.Update(event.UpdateEvent{ObjectOld: on, ObjectNew: off}))
+	assert.False(t, spreadAnnotationsPredicate.Update(event.UpdateEvent{ObjectOld: off, ObjectNew: other}),
+		"other metadata changes stay filtered")
+}

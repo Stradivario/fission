@@ -473,3 +473,18 @@ const (
 	BuilderLabelOwner              = "owner"
 	BuilderOwnerBuilderMgr         = "buildermgr"
 )
+
+// Spreading a newdeploy function's replicas across failure domains (Lambforge
+// plan 33): set on the Function's metadata, read by the newdeploy executor.
+// Metadata, not spec, so older executors simply ignore them. A change rolls
+// the function's Deployment (the executor's Function watch passes changes to
+// these annotations although Generation does not move).
+const (
+	// "machines" (kubernetes.io/hostname) or "zones" (topology.kubernetes.io/zone)
+	FunctionSpreadAnnotation = "lambforge.io/spread"
+	// "true" = DoNotSchedule (a replica waits rather than doubling up)
+	FunctionSpreadStrictAnnotation = "lambforge.io/spread-strict"
+)
+
+// FunctionSpreadAnnotations are the annotations whose change re-renders the pod template.
+var FunctionSpreadAnnotations = []string{FunctionSpreadAnnotation, FunctionSpreadStrictAnnotation}

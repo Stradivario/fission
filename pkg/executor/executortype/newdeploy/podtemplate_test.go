@@ -49,6 +49,12 @@ func TestPodTemplateChanged(t *testing.T) {
 			f.Spec.Env = append(f.Spec.Env, apiv1.EnvVar{Name: "LOG_LEVEL", Value: "debug"})
 		}, true},
 		{"envFrom removed", func(f *fv1.Function) { f.Spec.EnvFrom = nil }, true},
+		{"spread turned on", func(f *fv1.Function) {
+			f.Annotations = map[string]string{AnnotationSpread: "machines"}
+		}, true},
+		{"other annotation is not a pod-template field", func(f *fv1.Function) {
+			f.Annotations = map[string]string{"note": "x"}
+		}, false},
 		{"idle timeout is not a pod-template field", func(f *fv1.Function) {
 			idle := 42
 			f.Spec.IdleTimeout = &idle

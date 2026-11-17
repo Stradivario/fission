@@ -95,6 +95,25 @@ var deletionTimestampPredicate = predicate.Funcs{
 	},
 }
 
+// spreadAnnotationsPredicate passes Update events that change a Function's
+// spread annotations (plan 33). They live in metadata, so Generation does not
+// move and GenerationChangedPredicate would drop the change: turning spread on
+// for a running function would wait for its next deploy.
+var spreadAnnotationsPredicate = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		if e.ObjectOld == nil || e.ObjectNew == nil {
+			return false
+		}
+		before, after := e.ObjectOld.GetAnnotations(), e.ObjectNew.GetAnnotations()
+		for _, key := range fv1.FunctionSpreadAnnotations {
+			if before[key] != after[key] {
+				return true
+			}
+		}
+		return false
+	},
+}
+
 // funcReconcileConcurrency is the shared Function reconciler's worker count. A
 // reconcile can block for up to the specialization timeout: createFunction
 // (first sight, or recreating a drifted-away workload) waits in waitForDeploy for
@@ -321,7 +340,7 @@ func RegisterReconciler(mgr ctrl.Manager, logger logr.Logger, executorTypes map[
 	// (dynamic OR cluster mode) the membership predicate is ANDed on so the
 	// cluster-wide cache only reconciles Functions in live tenant namespaces (no-op
 	// in static mode, where the cache is already namespace-scoped).
-	funcPredicate := predicate.Or(predicate.GenerationChangedPredicate{}, deletionTimestampPredicate)
+	funcPredicate := predicate.Or(predicate.GenerationChangedPredicate{}, deletionTimestampPredicate, spreadAnnotationsPredicate)
 	if utils.CrdWatchClusterWide() {
 		funcPredicate = predicate.And(funcPredicate, controller.MembershipPredicate(utils.DefaultNSResolver()))
 	}

@@ -39,6 +39,7 @@ func adoptDeployment(existing, desired *appsv1.Deployment) {
 	existing.Spec.Template.Spec.NodeSelector = desired.Spec.Template.Spec.NodeSelector
 	existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
 	existing.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
+	existing.Spec.Template.Spec.TopologySpreadConstraints = desired.Spec.Template.Spec.TopologySpreadConstraints
 }
 
 func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment,
@@ -349,6 +350,10 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 	if err := util.ApplyFunctionEnv(&deployment.Spec.Template.Spec, mainContainerName, deployNamespace, fn, platformEnv); err != nil {
 		return nil, err
 	}
+
+	// Spread across machines (plan 33): after every pod spec merge, so the
+	// function's own choice wins over an environment-wide constraint.
+	applySpread(&deployment.Spec.Template.Spec, fn)
 
 	// Re-mount the fission-fetcher SA token at the canonical Kubernetes
 	// path on the fetcher container only. The pod-level
