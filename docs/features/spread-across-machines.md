@@ -20,16 +20,18 @@ them, no CRD change):
 | `lambforge.io/spread-strict` | `"true"` | `DoNotSchedule` instead of `ScheduleAnyway` |
 
 `pkg/executor/executortype/newdeploy/spread.go` — `applySpread` adds one
-`topologySpreadConstraint` to the Deployment's pod template, after every
-pod spec merge (the function's choice replaces an environment constraint on
+`topologySpreadConstraint` to the Deployment's pod template, last, when the
+template is complete (the function's choice replaces an environment constraint on
 the same key; others are kept):
 
 ```yaml
 maxSkew: 1
 topologyKey: kubernetes.io/hostname
 whenUnsatisfiable: ScheduleAnyway      # DoNotSchedule when strict
-labelSelector: { matchLabels: { functionUid: <uid> } }
-matchLabelKeys: [pod-template-hash]    # a rollout does not count the old pods
+labelSelector:                         # a rollout does not count the old pods:
+  matchLabels:                         #   the pods carry a hash of their template
+    functionUid: <uid>
+    lambforge.io/spread-rev: <hash>
 nodeTaintsPolicy: Honor                # tainted / unreachable machines and
 nodeAffinityPolicy: Honor              #   machines the pod cannot use don't count
 ```
@@ -42,7 +44,18 @@ nodeAffinityPolicy: Honor              #   machines the pod cannot use don't cou
   Function reconciler's predicate also passes changes to these annotations
   (`spreadAnnotationsPredicate`, `pkg/executor/funcreconciler`), and
   `podTemplateChanged` treats them as pod template fields (`spreadChanged`).
-- Adopting an orphan Deployment carries `TopologySpreadConstraints`.
+- Adopting an orphan Deployment carries `TopologySpreadConstraints` and the
+  `lambforge.io/spread-rev` pod label.
+- **Why not `matchLabelKeys: [pod-template-hash]`** (1.29.0 did that): a
+  virtual cluster cannot run it. Its API server merges the key into the
+  label selector (Kubernetes >= 1.34), and the copy of the pod on the host
+  is refused: `"pod-template-hash": exists in both matchLabelKeys and
+  labelSelector` - the new pod stays Pending with a `SyncError` event and
+  the rollout hangs (old pods keep serving). Seen 2026-11-17, vCluster 0.37
+  on Kubernetes 1.35. Since 1.29.1 the executor labels the pod template
+  with a hash of the template (`spreadRevision`, 12 hex of sha256 over the
+  template without the label and the constraint) and selects on it - the
+  same effect on every cluster.
 
 Constants: `fv1.FunctionSpreadAnnotation`, `fv1.FunctionSpreadStrictAnnotation`.
 

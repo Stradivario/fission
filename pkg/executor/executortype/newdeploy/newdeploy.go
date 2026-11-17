@@ -40,6 +40,15 @@ func adoptDeployment(existing, desired *appsv1.Deployment) {
 	existing.Spec.Template.Spec.Affinity = desired.Spec.Template.Spec.Affinity
 	existing.Spec.Template.Spec.Tolerations = desired.Spec.Template.Spec.Tolerations
 	existing.Spec.Template.Spec.TopologySpreadConstraints = desired.Spec.Template.Spec.TopologySpreadConstraints
+	// the spread constraint selects on this label (spread.go)
+	if rev, ok := desired.Spec.Template.Labels[LabelSpreadRevision]; ok {
+		if existing.Spec.Template.Labels == nil {
+			existing.Spec.Template.Labels = map[string]string{}
+		}
+		existing.Spec.Template.Labels[LabelSpreadRevision] = rev
+	} else {
+		delete(existing.Spec.Template.Labels, LabelSpreadRevision)
+	}
 }
 
 func (deploy *NewDeploy) createOrGetDeployment(ctx context.Context, fn *fv1.Function, env *fv1.Environment,
@@ -351,10 +360,6 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		return nil, err
 	}
 
-	// Spread across machines (plan 33): after every pod spec merge, so the
-	// function's own choice wins over an environment-wide constraint.
-	applySpread(&deployment.Spec.Template.Spec, fn)
-
 	// Re-mount the fission-fetcher SA token at the canonical Kubernetes
 	// path on the fetcher container only. The pod-level
 	// AutomountServiceAccountToken=false flag set above suppresses the
@@ -388,6 +393,13 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 			mainContainerName, util.FetcherContainerName); err != nil {
 			return nil, err
 		}
+	}
+
+	// Spread across machines (plan 33): last, so the function's own choice
+	// wins over an environment-wide constraint and the revision label covers
+	// the complete pod template.
+	if err := applySpread(&deployment.Spec.Template, fn); err != nil {
+		return nil, err
 	}
 
 	return deployment, nil
