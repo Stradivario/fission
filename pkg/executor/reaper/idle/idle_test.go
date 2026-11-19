@@ -361,6 +361,63 @@ func TestScaleDownStrategy_Reap(t *testing.T) {
 		assert.Equal(t, int32(0), scaled, "a stuck deployment is still scaled to zero")
 	})
 
+	// fnAt is the live function at generation `gen`; fsvcAt an entry cached
+	// for generation `gen` of it, idle for an hour.
+	fnAt := func(gen int64) *fv1.Function {
+		fn := makeFn(0)
+		fn.UID = "fn-uid"
+		fn.Generation = gen
+		return fn
+	}
+	fsvcAt := func(gen int64, addr string) *fscache.FuncSvc {
+		f := makeFsvc()
+		f.Function = &metav1.ObjectMeta{Name: fnName, Namespace: ns, UID: "fn-uid", Generation: gen}
+		f.Address = addr
+		return f
+	}
+
+	t.Run("an entry of an older generation never scales the live deployment", func(t *testing.T) {
+		// The deployment was just woken for generation 3; the generation-2
+		// entry (left by an update) is hours "idle".
+		kc := k8sfake.NewSimpleClientset(deployWithReplicas(1))
+		var scaled int32 = -1
+		captureScale(kc, &scaled)
+		cache := fscache.MakeFunctionServiceCache(logr.Discard())
+		stale, current := fsvcAt(2, "old:8888"), fsvcAt(3, "new:8888")
+		current.Atime = time.Now()
+		_, err := cache.Add(*stale)
+		require.NoError(t, err)
+		_, err = cache.Add(*current)
+		require.NoError(t, err)
+		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
+			fissionfake.NewClientset(fnAt(3)), cache, kc, 2*time.Minute, 5*time.Second, true)
+
+		require.NoError(t, s.Reap(t.Context(), stale))
+		assert.Equal(t, int32(-1), scaled, "the stale entry scaled nothing")
+		_, err = cache.GetByFunction(stale.Function)
+		assert.Error(t, err, "the stale entry is gone")
+		_, err = cache.GetByFunction(current.Function)
+		assert.NoError(t, err, "the current entry stays")
+	})
+
+	t.Run("an older entry without a current one becomes the current one", func(t *testing.T) {
+		kc := k8sfake.NewSimpleClientset(deployWithReplicas(1))
+		var scaled int32 = -1
+		captureScale(kc, &scaled)
+		cache := fscache.MakeFunctionServiceCache(logr.Discard())
+		stale := fsvcAt(2, "old:8888")
+		_, err := cache.Add(*stale)
+		require.NoError(t, err)
+		live := fnAt(3)
+		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
+			fissionfake.NewClientset(live), cache, kc, 2*time.Minute, 5*time.Second, true)
+
+		require.NoError(t, s.Reap(t.Context(), stale))
+		assert.Equal(t, int32(-1), scaled, "not this tick")
+		_, err = cache.GetByFunction(&live.ObjectMeta)
+		assert.NoError(t, err, "rekeyed to the live generation: still reaped when really idle")
+	})
+
 	t.Run("missing function is not an error", func(t *testing.T) {
 		kc := k8sfake.NewSimpleClientset(deployWithReplicas(3))
 		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,

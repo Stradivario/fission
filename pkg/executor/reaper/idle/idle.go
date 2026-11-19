@@ -145,6 +145,16 @@ func reapLag(idleFor, threshold time.Duration) float64 {
 	return (idleFor - threshold).Seconds()
 }
 
+// staleGeneration reports whether fsvc was cached for an older generation of
+// the live function. Entries of a published version (RFC-0025, FUNCTION_VERSION
+// label) pin their generation on purpose and own their own objects.
+func staleGeneration(fsvc *fscache.FuncSvc, fn *fv1.Function) bool {
+	if fsvc.Function == nil || fsvc.Function.Labels[fv1.FUNCTION_VERSION] != "" {
+		return false
+	}
+	return fsvc.Function.UID == fn.UID && fsvc.Function.Generation < fn.Generation
+}
+
 // specializationWindow is how long the executor waits for a function's
 // deployment to become available (its SpecializationTimeout, floored at the
 // default like WaitForDeployment does).
@@ -529,6 +539,25 @@ func (s *ScaleDownStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) err
 		if _, ok := s.envUIDs[fsvc.Environment.UID]; !ok {
 			s.logger.Info("function environment no longer exists", "environment", fsvc.Environment.Name, "function", fsvc.Name)
 		}
+	}
+
+	// An entry left from an older generation of the function (an update that
+	// did not rekey it) still points at the SAME deployment, with the Atime
+	// of before the update. Reaping it scaled the live deployment to zero
+	// whenever a request woke it: a lambda that had been updated could never
+	// come back from zero (two "scaling down idle deployment" lines in the
+	// same second, 2026-11-19). Such an entry never scales anything: it goes
+	// away when the current generation has its own entry, else it becomes
+	// that entry, so the deployment is still reaped when really idle.
+	if staleGeneration(fsvc, fn) {
+		if _, err := s.fsCache.GetByFunctionVersion(&fn.ObjectMeta); err == nil {
+			s.fsCache.DeleteEntry(fsvc)
+			return nil
+		}
+		if err := s.fsCache.Rekey(fsvc, &fn.ObjectMeta); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	// With MinScale > 0 the function's HPA (minReplicas = MinScale) owns every
