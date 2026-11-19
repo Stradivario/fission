@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	apiv1 "k8s.io/api/core/v1"
 	k8sErrs "k8s.io/apimachinery/pkg/api/errors"
@@ -142,6 +143,33 @@ func idleThreshold(fn *fv1.Function, def time.Duration) time.Duration {
 // second time.Since would then yield a negative lag.
 func reapLag(idleFor, threshold time.Duration) float64 {
 	return (idleFor - threshold).Seconds()
+}
+
+// specializationWindow is how long the executor waits for a function's
+// deployment to become available (its SpecializationTimeout, floored at the
+// default like WaitForDeployment does).
+func specializationWindow(fn *fv1.Function) time.Duration {
+	seconds := fn.Spec.InvokeStrategy.ExecutionStrategy.SpecializationTimeout
+	if seconds < fv1.DefaultSpecializationTimeOut {
+		seconds = fv1.DefaultSpecializationTimeOut
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// scalingUp reports whether the deployment is coming up: fewer available
+// replicas than asked for, and it became unavailable (the scale-up) less
+// than `window` ago. A deployment without an Available condition is not
+// treated as starting.
+func scalingUp(d *appsv1.Deployment, window time.Duration, now time.Time) bool {
+	if d.Spec.Replicas == nil || d.Status.AvailableReplicas >= *d.Spec.Replicas {
+		return false
+	}
+	for _, c := range d.Status.Conditions {
+		if c.Type == appsv1.DeploymentAvailable && c.Status == apiv1.ConditionFalse {
+			return now.Sub(c.LastTransitionTime.Time) < window
+		}
+	}
+	return false
 }
 
 // listEnvUIDs returns the set of Environment UIDs across the Fission resource
@@ -532,6 +560,19 @@ func (s *ScaleDownStrategy) Reap(ctx context.Context, fsvc *fscache.FuncSvc) err
 	// Do nothing if the current replica count is already at or below MinScale.
 	// Not a reap: nothing was released, so it stays out of the metrics.
 	if currentDeploy.Spec.Replicas != nil && *currentDeploy.Spec.Replicas <= minScale {
+		return nil
+	}
+	// A scale-up from zero in progress is not idleness. The executor scales
+	// the deployment up on a request and waits for it, but the function
+	// service's Atime is still the one from before it went idle - so every
+	// tick until the pod is available judged it "idle for hours" and scaled
+	// it straight back to zero: the waiting request timed out, the next one
+	// scaled up again, and a scale-to-zero function never came back after a
+	// long idle (seen 2026-11-19: "scaling deployment 1" and "scaling down
+	// idle deployment 0" in the same second, over and over). Within the
+	// specialization timeout the executor is the one waiting for it; past it
+	// a deployment that never became available is reaped as before.
+	if scalingUp(currentDeploy, specializationWindow(fn), time.Now()) {
 		return nil
 	}
 	if err := scaleDeploymentToMinScale(ctx, s.logger, s.kubeClient, deployObj.Namespace, deployObj.Name, minScale); err != nil {

@@ -324,6 +324,43 @@ func TestScaleDownStrategy_Reap(t *testing.T) {
 		assert.Equal(t, int32(-1), scaled, "no scale issued when already at MinScale")
 	})
 
+	// startingDeploy is a deployment the executor just scaled up from zero:
+	// asked for 1, none available yet, unavailable since `since` ago.
+	startingDeploy := func(since time.Duration) *appsv1.Deployment {
+		d := deployWithReplicas(1)
+		d.Status.Conditions = []appsv1.DeploymentCondition{{
+			Type:               appsv1.DeploymentAvailable,
+			Status:             apiv1.ConditionFalse,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-since)),
+		}}
+		return d
+	}
+
+	t.Run("leaves a scale-up from zero alone while it comes up", func(t *testing.T) {
+		// The function service's Atime is hours old (it went idle), the
+		// executor has just scaled it to 1 for a request: reaping now killed
+		// every cold start after a long idle.
+		kc := k8sfake.NewSimpleClientset(startingDeploy(3 * time.Second))
+		var scaled int32 = -1
+		captureScale(kc, &scaled)
+		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
+			fissionfake.NewClientset(makeFn(0)), fscache.MakeFunctionServiceCache(logr.Discard()), kc, 2*time.Minute, 5*time.Second, true)
+
+		require.NoError(t, s.Reap(t.Context(), makeFsvc()))
+		assert.Equal(t, int32(-1), scaled, "no scale-down during the scale-up")
+	})
+
+	t.Run("reaps a scale-up that never became available within the specialization timeout", func(t *testing.T) {
+		kc := k8sfake.NewSimpleClientset(startingDeploy(10 * time.Minute))
+		var scaled int32 = -1
+		captureScale(kc, &scaled)
+		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
+			fissionfake.NewClientset(makeFn(0)), fscache.MakeFunctionServiceCache(logr.Discard()), kc, 2*time.Minute, 5*time.Second, true)
+
+		require.NoError(t, s.Reap(t.Context(), makeFsvc()))
+		assert.Equal(t, int32(0), scaled, "a stuck deployment is still scaled to zero")
+	})
+
 	t.Run("missing function is not an error", func(t *testing.T) {
 		kc := k8sfake.NewSimpleClientset(deployWithReplicas(3))
 		s := NewScaleDownStrategy(logr.Discard(), fv1.ExecutorTypeNewdeploy,
@@ -461,4 +498,49 @@ func TestReaperMetrics(t *testing.T) {
 		assert.InDelta(t, before+1, sampleCount(errs, prepareFail), 0.001,
 			"a Prepare failure must increment the error counter at stage=prepare")
 	})
+}
+
+func TestScalingUp(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	one := int32(1)
+	deploy := func(available int32, cond *appsv1.DeploymentCondition) *appsv1.Deployment {
+		d := &appsv1.Deployment{Spec: appsv1.DeploymentSpec{Replicas: &one}}
+		d.Status.AvailableReplicas = available
+		if cond != nil {
+			d.Status.Conditions = []appsv1.DeploymentCondition{*cond}
+		}
+		return d
+	}
+	unavailableSince := func(ago time.Duration) *appsv1.DeploymentCondition {
+		return &appsv1.DeploymentCondition{
+			Type:               appsv1.DeploymentAvailable,
+			Status:             apiv1.ConditionFalse,
+			LastTransitionTime: metav1.NewTime(now.Add(-ago)),
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		d    *appsv1.Deployment
+		want bool
+	}{
+		{"just scaled up", deploy(0, unavailableSince(time.Second)), true},
+		{"scaled up past the window", deploy(0, unavailableSince(5*time.Minute)), false},
+		{"already available", deploy(1, unavailableSince(time.Second)), false},
+		{"no Available condition", deploy(0, nil), false},
+		{"no replicas field", &appsv1.Deployment{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, scalingUp(tc.d, 2*time.Minute, now))
+		})
+	}
+}
+
+func TestSpecializationWindow(t *testing.T) {
+	t.Parallel()
+	fn := &fv1.Function{}
+	assert.Equal(t, time.Duration(fv1.DefaultSpecializationTimeOut)*time.Second, specializationWindow(fn), "floored at the default")
+	fn.Spec.InvokeStrategy.ExecutionStrategy.SpecializationTimeout = 300
+	assert.Equal(t, 300*time.Second, specializationWindow(fn))
 }
