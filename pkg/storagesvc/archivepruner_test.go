@@ -111,12 +111,31 @@ func TestArchivePrunerKeepsYoungArchives(t *testing.T) {
 	assert.NotContains(t, f.pruner.LastPlan().Orphans, f.fresh)
 }
 
-func TestArchivePrunerRespectsTheCap(t *testing.T) {
+func TestArchivePrunerDeletesOnlyTheOldestUpToTheCap(t *testing.T) {
 	t.Parallel()
 	f := newPruneFixture(t, false)
-	f.pruner.maxOrphansPerCycle = -1 // any orphan is above the cap
+	older := func() string {
+		id, err := f.pruner.storageClient.backend.put("older-orphan", bytes.NewReader([]byte("x")), 1)
+		require.NoError(t, err)
+		ts := time.Now().Add(-60 * 24 * time.Hour)
+		require.NoError(t, os.Chtimes(id, ts, ts))
+		return id
+	}()
+	f.pruner.maxOrphansPerCycle = 1
+	f.pruner.getOrphanArchives(t.Context())
+
+	assert.Equal(t, []string{older}, drained(f.pruner.archiveChan), "the oldest orphan goes first")
+	plan := f.pruner.LastPlan()
+	assert.Equal(t, 1, plan.Deleted)
+	assert.Equal(t, []string{older, f.old}, plan.Orphans, "the plan still lists every orphan, oldest first")
+}
+
+func TestArchivePrunerSkipsWhenNoPackageReferencesAnything(t *testing.T) {
+	t.Parallel()
+	f := newPruneFixture(t, false)
+	f.pruner.crdClient = fake.NewSimpleClientset() // no packages at all
 	f.pruner.getOrphanArchives(t.Context())
 
 	assert.Empty(t, drained(f.pruner.archiveChan))
-	assert.Equal(t, "orphan count above the per-cycle cap", f.pruner.LastPlan().SkippedReason)
+	assert.Equal(t, "no package references any archive", f.pruner.LastPlan().SkippedReason)
 }

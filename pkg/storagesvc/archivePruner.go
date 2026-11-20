@@ -7,6 +7,7 @@ package storagesvc
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -67,6 +68,9 @@ func (pruner *ArchivePruner) setPlan(p PrunePlan) {
 
 // defaultMinAgeHours: 7 days.
 const defaultMinAgeHours = 168
+
+// firstCycleDelay: the first prune cycle runs this long after start.
+var firstCycleDelay = 2 * time.Minute
 
 const defaultPruneInterval int = 60 // in minutes
 
@@ -190,12 +194,18 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	// out of them, there may be some just created but not referenced by packages yet.
 	// need to filter them out.
 	plan := PrunePlan{At: time.Now(), DryRun: pruner.dryRun, MinAgeHours: pruner.minAge.Hours(), MaxPerCycle: pruner.maxOrphansPerCycle, Referenced: len(archivesRefByPkgs)}
-	archivesInStorage, err := pruner.storageClient.getItemIDsWithFilter(pruner.storageClient.filterItemsNewerThan(time.Now(), pruner.minAge))
+	items, err := pruner.storageClient.getItemsWithFilter(pruner.storageClient.filterItemsNewerThan(time.Now(), pruner.minAge))
 	if err != nil {
 		pruner.logger.Error(err, "error getting items from storage")
 		plan.SkippedReason = "storage listing failed"
 		pruner.setPlan(plan)
 		return
+	}
+	archivesInStorage := make([]string, 0, len(items))
+	lastMod := make(map[string]time.Time, len(items))
+	for _, it := range items {
+		archivesInStorage = append(archivesInStorage, it.id)
+		lastMod[it.id] = it.lastMod
 	}
 	pruner.logger.V(1).Info("archives in storage", "count", len(archivesInStorage))
 	plan.InStorage = len(archivesInStorage)
@@ -209,17 +219,33 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 
 	// difference of the two lists gives us the list of orphan archives. This is just a brute force approach.
 	// need to do something more optimal at scale.
+	// Sanity guard: storage holds archives but no package references any.
+	// That is a broken listing (RBAC, an API outage returning an empty list),
+	// not "everything is orphaned" - skip the cycle.
+	if len(archivesRefByPkgs) == 0 && len(archivesInStorage) > 0 {
+		pruner.logger.Error(nil, "skipping this prune cycle: no package references any archive while storage is not empty",
+			"storage_count", len(archivesInStorage))
+		plan.SkippedReason = "no package references any archive"
+		pruner.setPlan(plan)
+		return
+	}
+
 	orphanedArchives := getDifferenceOfLists(archivesInStorage, archivesRefByPkgs)
+	// oldest first: a cycle that hits the cap deletes the longest-abandoned
+	// archives, and every cycle makes progress on a backlog.
+	sort.SliceStable(orphanedArchives, func(i, j int) bool {
+		return lastMod[orphanedArchives[i]].Before(lastMod[orphanedArchives[j]])
+	})
 	pruner.logger.Info("computed orphan archives for this cycle",
 		"orphan_count", len(orphanedArchives), "referenced_count", len(archivesRefByPkgs), "storage_count", len(archivesInStorage))
 
-	// Safety valve: refuse a sweep that wants to delete an implausibly large
-	// number of archives at once instead of silently carrying it out. See
-	// defaultMaxOrphansPerCycle for why — this is the guardrail that would
-	// have contained the 2026-07 incident regardless of what exactly made
-	// the reference list wrong that cycle. A genuinely large legitimate
-	// backlog can be cleared by raising PRUNE_MAX_ORPHANS_PER_CYCLE once the
-	// operator has confirmed the orphan list is correct.
+	// Rate limit: a cycle deletes at most maxOrphansPerCycle archives (the
+	// oldest). It used to REFUSE the whole cycle above the cap - which kept a
+	// wrong reference list from deleting everything at once (2026-07) but
+	// also meant a legitimate backlog (400 orphans after a cleanup,
+	// 2026-11-20) was never cleared. The reference list is now complete (all
+	// namespaces) and the guards above skip a broken one; the cap bounds the
+	// damage of anything still unforeseen to N archives per interval.
 	plan.Orphans = orphanedArchives
 	if pruner.dryRun {
 		pruner.logger.Info("dry run: archive pruner deletes nothing", "orphan_count", len(orphanedArchives))
@@ -227,19 +253,18 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 		pruner.setPlan(plan)
 		return
 	}
-	if len(orphanedArchives) > pruner.maxOrphansPerCycle {
-		pruner.logger.Error(nil, "refusing to prune: orphan count exceeds the per-cycle safety cap; this usually means the reference list is wrong, not that this many archives are truly abandoned",
+	batch := orphanedArchives
+	if pruner.maxOrphansPerCycle >= 0 && len(batch) > pruner.maxOrphansPerCycle {
+		batch = batch[:pruner.maxOrphansPerCycle]
+		pruner.logger.Info("orphan count above the per-cycle cap; deleting the oldest only",
 			"orphan_count", len(orphanedArchives), "cap", pruner.maxOrphansPerCycle)
-		plan.SkippedReason = "orphan count above the per-cycle cap"
-		pruner.setPlan(plan)
-		return
 	}
 
 	// send each orphan archive away for deletion
-	for _, archiveID := range orphanedArchives {
+	for _, archiveID := range batch {
 		pruner.insertArchive(archiveID)
 	}
-	plan.Deleted = len(orphanedArchives)
+	plan.Deleted = len(batch)
 	pruner.setPlan(plan)
 }
 
@@ -253,8 +278,14 @@ func (pruner *ArchivePruner) Start(ctx context.Context, mgr *errgroup.Group) {
 		pruner.pruneArchives(ctx)
 		return nil
 	})
+	// first cycle shortly after start (not a full interval later), so the
+	// plan (GET /v1/prune/plan) is there right after an upgrade
+	first := time.NewTimer(firstCycleDelay)
+	defer first.Stop()
 	for {
 		select {
+		case <-first.C:
+			pruner.getOrphanArchives(ctx)
 		case <-ticker.C:
 			// This method fetches unused archive IDs and sends them to archiveChannel for deletion
 			// silencing the errors, hoping they go away in next iteration.

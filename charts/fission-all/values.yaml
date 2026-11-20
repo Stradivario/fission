@@ -1095,10 +1095,11 @@ storagesvc:
     minAgeHours: 168
     ## Run prune routine at interval (in minutes)
     interval: 60
-    ## Safety cap: refuse to delete more than this many archives in a single
-    ## sweep (a sweep that wants to delete far more than this is a signal
-    ## the reference list is wrong, not that this many archives are
-    ## genuinely orphaned at once — see pkg/storagesvc/archivePruner.go).
+    ## Rate limit: a sweep deletes at most this many archives, the oldest
+    ## first; a larger backlog is cleared over several intervals. (Until
+    ## 1.29.5 a sweep above the cap was refused entirely, so a real backlog
+    ## was never cleared.) A sweep is skipped when the package listing fails
+    ## or references nothing - see pkg/storagesvc/archivePruner.go.
     maxOrphansPerCycle: 20
 
   ## maxArchiveSizeMib caps the size (in MiB) of a single package archive
