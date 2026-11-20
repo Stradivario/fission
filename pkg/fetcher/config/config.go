@@ -5,7 +5,8 @@
 package container
 
 import (
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -45,7 +46,7 @@ type Config struct {
 }
 
 // internalAuthEnvVars returns the env-var entries that mount the
-// HMAC-shared-secret values from the chart-installed Secret/fission-internal-auth
+// HMAC-shared-secret values from the internal-auth master Secret
 // onto the fetcher sidecar container. Every key is marked optional so a
 // pod still admits when the chart's internalAuth is disabled.
 //
@@ -69,8 +70,16 @@ type Config struct {
 // version-aware-sign it with — closing the stamp-before-key race without 401s.
 // The storage key stays optional even then: storagesvc dual-accepts a
 // master-derived signature, so an unprovisioned fetcher degrades gracefully.
+
+// specializeWireOpts pins the specialize-request CLI payload to exact v1
+// emission; shared with the jsonwire_compat fixture so the byte-golden gates
+// this site. Old fetcher binaries in long-lived pool pods decode it.
+var specializeWireOpts = jsonv1.DefaultOptionsV1()
+
 func internalAuthEnvVars(namespace string) []apiv1.EnvVar {
-	const chartSecret = "fission-internal-auth"
+	// Not necessarily chart-generated: internalAuth.existingSecret points this
+	// at an operator-supplied Secret instead.
+	masterSecret := fv1.InternalAuthSecretName()
 	keysSecret := fv1.TenantAuthKeysSecret
 
 	// Require the fetcher key only where it is guaranteed to be provisioned (a
@@ -80,8 +89,8 @@ func internalAuthEnvVars(namespace string) []apiv1.EnvVar {
 	fetcherKeyRequired := utils.PerNamespaceKeyRequired(namespace)
 
 	return []apiv1.EnvVar{
-		secretKeyEnv("FISSION_INTERNAL_AUTH_SECRET", chartSecret, "secret", true),
-		secretKeyEnv("FISSION_INTERNAL_AUTH_SECRET_OLD", chartSecret, "oldSecret", true),
+		secretKeyEnv("FISSION_INTERNAL_AUTH_SECRET", masterSecret, "secret", true),
+		secretKeyEnv("FISSION_INTERNAL_AUTH_SECRET_OLD", masterSecret, "oldSecret", true),
 		secretKeyEnv("FISSION_FETCHER_KEY", keysSecret, fv1.TenantAuthFetcherKey, !fetcherKeyRequired),
 		secretKeyEnv("FISSION_FETCHER_KEY_OLD", keysSecret, "fetcherKeyOld", true),
 		secretKeyEnv("FISSION_STORAGE_KEY", keysSecret, fv1.TenantAuthStorageKey, true),
@@ -98,9 +107,9 @@ func secretKeyEnv(name, secretName, secretKey string, optional bool) apiv1.EnvVa
 		Name: name,
 		ValueFrom: &apiv1.EnvVarSource{
 			SecretKeyRef: &apiv1.SecretKeySelector{
-				LocalObjectReference: apiv1.LocalObjectReference{Name: secretName},
-				Key:                  secretKey,
-				Optional:             &opt,
+				Name:     secretName,
+				Key:      secretKey,
+				Optional: &opt,
 			},
 		},
 	}
@@ -211,8 +220,31 @@ func (cfg *Config) NewSpecializeRequest(fn *fv1.Function, env *fv1.Environment) 
 			FunctionName:     fn.Spec.Package.FunctionName,
 			FunctionMetadata: &fn.ObjectMeta,
 			EnvVersion:       env.Spec.Version,
+			StateKeyspace:    stateKeyspace(fn, env),
 		},
 	}
+}
+
+// stateKeyspace resolves the RFC-0023 keyspace for a stateful function
+// ("" = no token is delivered). Only this non-secret name travels in the
+// specialize request; the fetcher derives the actual token pod-locally.
+//
+// This is the single specialize-time enforcement point for the "no state on
+// an allowedFunctionsPerContainer: infinite environment" invariant (S1): such
+// pods serve many functions from one shared mount, so a single per-pod token
+// file cannot isolate them. The webhook rejects the combination at admission,
+// but this closes the three cases it cannot (a function created before its
+// environment, a transient admission lookup failure, and an environment
+// mutated to infinite after functions opted in) by refusing to mint the
+// token — state calls then fail closed for want of a token, never leak.
+func stateKeyspace(fn *fv1.Function, env *fv1.Environment) string {
+	if fn.Spec.State == nil {
+		return ""
+	}
+	if env.Spec.AllowedFunctionsPerContainer == fv1.AllowedFunctionsPerContainerInfinite {
+		return ""
+	}
+	return fn.Spec.State.EffectiveKeyspace(fn.Name)
 }
 
 // AddFetcherToPodSpec adds the fetcher sidecar to podSpec. namespace is where the
@@ -224,7 +256,12 @@ func (cfg *Config) AddFetcherToPodSpec(podSpec *apiv1.PodSpec, mainContainerName
 
 func (cfg *Config) AddSpecializingFetcherToPodSpec(podSpec *apiv1.PodSpec, mainContainerName, namespace string, fn *fv1.Function, env *fv1.Environment) error {
 	specializeReq := cfg.NewSpecializeRequest(fn, env)
-	specializePayload, err := json.Marshal(specializeReq)
+	// Cross-version compat: this payload is passed as a pod command-line arg
+	// and read by the fetcher sidecar at container startup. Pool pods are not
+	// rolled on a control-plane upgrade (see jsonwire_compat_test.go), so an
+	// OLD fetcher binary running a v1 decoder may read what a NEW (v2)
+	// control plane wrote here — pin exact v1 emission.
+	specializePayload, err := json.Marshal(specializeReq, specializeWireOpts)
 	if err != nil {
 		return err
 	}
@@ -275,28 +312,20 @@ func (cfg *Config) volumesWithMounts() ([]apiv1.Volume, []apiv1.VolumeMount) {
 	dwAPIVol := apiv1.DownwardAPIVolumeSource{Items: items}
 	volumes := []apiv1.Volume{
 		{
-			Name: fv1.SharedVolumeUserfunc,
-			VolumeSource: apiv1.VolumeSource{
-				EmptyDir: &apiv1.EmptyDirVolumeSource{},
-			},
+			Name:     fv1.SharedVolumeUserfunc,
+			EmptyDir: &apiv1.EmptyDirVolumeSource{},
 		},
 		{
-			Name: fv1.SharedVolumeSecrets,
-			VolumeSource: apiv1.VolumeSource{
-				EmptyDir: &apiv1.EmptyDirVolumeSource{},
-			},
+			Name:     fv1.SharedVolumeSecrets,
+			EmptyDir: &apiv1.EmptyDirVolumeSource{},
 		},
 		{
-			Name: fv1.SharedVolumeConfigmaps,
-			VolumeSource: apiv1.VolumeSource{
-				EmptyDir: &apiv1.EmptyDirVolumeSource{},
-			},
+			Name:     fv1.SharedVolumeConfigmaps,
+			EmptyDir: &apiv1.EmptyDirVolumeSource{},
 		},
 		{
-			Name: fv1.PodInfoVolume,
-			VolumeSource: apiv1.VolumeSource{
-				DownwardAPI: &dwAPIVol,
-			},
+			Name:        fv1.PodInfoVolume,
+			DownwardAPI: &dwAPIVol,
 		},
 	}
 	mounts := []apiv1.VolumeMount{
@@ -335,26 +364,22 @@ func (cfg *Config) addFetcherToPodSpecWithCommand(podSpec *apiv1.PodSpec, mainCo
 			InitialDelaySeconds: 1,
 			PeriodSeconds:       1,
 			FailureThreshold:    30,
-			ProbeHandler: apiv1.ProbeHandler{
-				HTTPGet: &apiv1.HTTPGetAction{
-					Path: "/readiness-healthz",
-					Port: intstr.IntOrString{
-						Type:   intstr.Int,
-						IntVal: svcinfo.PortFetcher,
-					},
+			HTTPGet: &apiv1.HTTPGetAction{
+				Path: "/readiness-healthz",
+				Port: intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: svcinfo.PortFetcher,
 				},
 			},
 		},
 		LivenessProbe: &apiv1.Probe{
 			InitialDelaySeconds: 1,
 			PeriodSeconds:       5,
-			ProbeHandler: apiv1.ProbeHandler{
-				HTTPGet: &apiv1.HTTPGetAction{
-					Path: "/healthz",
-					Port: intstr.IntOrString{
-						Type:   intstr.Int,
-						IntVal: svcinfo.PortFetcher,
-					},
+			HTTPGet: &apiv1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.IntOrString{
+					Type:   intstr.Int,
+					IntVal: svcinfo.PortFetcher,
 				},
 			},
 		},
@@ -366,6 +391,18 @@ func (cfg *Config) addFetcherToPodSpecWithCommand(podSpec *apiv1.PodSpec, mainCo
 			Value: cfg.insecureRegistries,
 		})
 	}
+
+	// The OCI keychain must resolve the ACTUAL pod identity: in a builder
+	// pod this sidecar runs as fission-builder, not fission-fetcher, and
+	// resolving the wrong SA either Forbiddens (no RBAC) or reads the wrong
+	// imagePullSecrets. The downward API keeps it correct regardless of who
+	// set podSpec.ServiceAccountName, before or after this call.
+	c.Env = append(c.Env, apiv1.EnvVar{
+		Name: "POD_SERVICE_ACCOUNT",
+		ValueFrom: &apiv1.EnvVarSource{
+			FieldRef: &apiv1.ObjectFieldSelector{FieldPath: "spec.serviceAccountName"},
+		},
+	})
 
 	// Connection-draining preStop hook; see utils.DrainLifecycle. Must be
 	// the kubelet-native sleep action — the fetcher image is distroless

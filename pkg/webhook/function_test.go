@@ -9,9 +9,11 @@ import (
 	"testing"
 
 	apiv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/generated/clientset/versioned/scheme"
 )
 
 // makeValidFunction returns a Function object that satisfies v1.Function.Validate()
@@ -19,10 +21,8 @@ import (
 // override the Environment / PackageRef namespaces to exercise the rejects.
 func makeValidFunction(fnNs, envNs, pkgNs string) *v1.Function {
 	return &v1.Function{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "fn-1",
-			Namespace: fnNs,
-		},
+		Name:      "fn-1",
+		Namespace: fnNs,
 		Spec: v1.FunctionSpec{
 			Environment: v1.EnvironmentReference{
 				Name:      "env-1",
@@ -131,10 +131,8 @@ func TestFunctionWebhook_Validate_RejectsDangerousPodSpec(t *testing.T) {
 			name: "hostPath volume",
 			ps: &apiv1.PodSpec{
 				Volumes: []apiv1.Volume{{
-					Name: "host-root",
-					VolumeSource: apiv1.VolumeSource{
-						HostPath: &apiv1.HostPathVolumeSource{Path: "/"},
-					},
+					Name:     "host-root",
+					HostPath: &apiv1.HostPathVolumeSource{Path: "/"},
 				}},
 			},
 			wantInErr: "hostPath",
@@ -251,4 +249,129 @@ func TestWarningsSurfaceThroughValidate(t *testing.T) {
 			t.Fatalf("warnings must not be gated on Validator, got %v", warnings)
 		}
 	})
+}
+
+func TestFunctionWebhook_Validate_StateOnInfiniteEnv(t *testing.T) {
+	t.Parallel()
+
+	envInfinite := &v1.Environment{
+		Name: "env-1", Namespace: "default",
+		Spec: v1.EnvironmentSpec{Version: 2, AllowedFunctionsPerContainer: v1.AllowedFunctionsPerContainerInfinite},
+	}
+	envSingle := &v1.Environment{
+		Name: "env-1", Namespace: "default",
+		Spec: v1.EnvironmentSpec{Version: 2, AllowedFunctionsPerContainer: v1.AllowedFunctionsPerContainerSingle},
+	}
+	stateFn := func() *v1.Function {
+		fn := makeValidFunction("default", "default", "default")
+		fn.Spec.State = &v1.StateConfig{}
+		return fn
+	}
+
+	tests := []struct {
+		name    string
+		env     *v1.Environment // nil => reader returns NotFound
+		reader  bool            // false => nil reader (fail-open)
+		wantErr bool
+	}{
+		{"infinite env rejected", envInfinite, true, true},
+		{"single env allowed", envSingle, true, false},
+		{"env not found: fail open", nil, true, false},
+		{"no reader: fail open", nil, false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			b := fake.NewClientBuilder().WithScheme(scheme.Scheme)
+			if tc.env != nil {
+				b = b.WithObjects(tc.env)
+			}
+			r := &Function{}
+			if tc.reader {
+				r.reader = b.Build()
+			}
+			err := r.Validate(stateFn())
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "infinite") {
+					t.Fatalf("expected infinite-env rejection, got: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestFunctionWebhook_Validate_MountPathOnInfiniteEnv mirrors the state check
+// for RFC-0030 §4's file projections.
+//
+// Without a redirect, each referenced object lands under its own
+// <namespace>/<name> directory, so two functions sharing an infinite-env pod
+// cannot collide. MountPath removes that separation: both write into the same
+// directory and whichever specializes second overwrites the first's files. The
+// per-function duplicate rule cannot see it, because the colliding references
+// live on different Functions.
+func TestFunctionWebhook_Validate_MountPathOnInfiniteEnv(t *testing.T) {
+	t.Parallel()
+
+	// Built per subtest, not shared: the fake client builder mutates the object
+	// it is handed (it stamps a ResourceVersion), so a single instance reused by
+	// two parallel subtests is a data race — caught by -race.
+	envWith := func(policy v1.AllowedFunctionsPerContainer) func() *v1.Environment {
+		return func() *v1.Environment {
+			return &v1.Environment{
+				Name: "env-1", Namespace: "default",
+				Spec: v1.EnvironmentSpec{Version: 2, AllowedFunctionsPerContainer: policy},
+			}
+		}
+	}
+	envInfinite := envWith(v1.AllowedFunctionsPerContainerInfinite)
+	envSingle := envWith(v1.AllowedFunctionsPerContainerSingle)
+	mountFn := func() *v1.Function {
+		fn := makeValidFunction("default", "default", "default")
+		fn.Spec.Secrets = []v1.SecretReference{{Namespace: "default", Name: "s", MountPath: "app"}}
+		return fn
+	}
+	// A reference with no MountPath keeps the per-object layout, so the rule
+	// must not fire for it even on an infinite env.
+	plainFn := func() *v1.Function {
+		fn := makeValidFunction("default", "default", "default")
+		fn.Spec.Secrets = []v1.SecretReference{{Namespace: "default", Name: "s"}}
+		return fn
+	}
+
+	tests := []struct {
+		name    string
+		fn      func() *v1.Function
+		env     func() *v1.Environment
+		reader  bool
+		wantErr bool
+	}{
+		{"mountPath on infinite env rejected", mountFn, envInfinite, true, true},
+		{"mountPath on single env allowed", mountFn, envSingle, true, false},
+		{"no mountPath on infinite env allowed", plainFn, envInfinite, true, false},
+		{"env not found: fail open", mountFn, nil, true, false},
+		{"no reader: fail open", mountFn, nil, false, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			b := fake.NewClientBuilder().WithScheme(scheme.Scheme)
+			if tc.env != nil {
+				b = b.WithObjects(tc.env())
+			}
+			r := &Function{}
+			if tc.reader {
+				r.reader = b.Build()
+			}
+			err := r.Validate(tc.fn())
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "infinite") {
+					t.Fatalf("expected infinite-env rejection, got: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
 }

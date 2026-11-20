@@ -13,6 +13,24 @@ package v1
 type SecretReferenceApplyConfiguration struct {
 	Namespace *string `json:"namespace,omitempty"`
 	Name      *string `json:"name,omitempty"`
+	// MountPath redirects this secret's file projection from the default
+	// /secrets/<namespace>/<name> to the given path, which is relative to
+	// the /secrets root (RFC-0030 §4): generic pool pods share a fixed
+	// volume set frozen at pool creation, so an arbitrary absolute path is
+	// not materializable there, and the container executor applies the
+	// same constraint for cross-executor consistency. Empty keeps today's
+	// <namespace>/<name> layout, so functions that do not set it are
+	// unaffected. No two secrets on one function may RESOLVE to the same
+	// directory (an explicit path colliding with another reference's
+	// default counts): the final segment written is the object's data
+	// key and keys are mutable after admission, so sharing a directory
+	// would let one object's later-added key collide with the other's
+	// file; the fetcher refuses such a write rather than truncating.
+	// Honoured on every executor: poolmgr and newdeploy via the fetcher,
+	// the container executor via a native projected volume. Not supported
+	// on an allowedFunctionsPerContainer:infinite environment, whose pods
+	// share one secrets tree across functions.
+	MountPath *string `json:"mountPath,omitempty"`
 }
 
 // SecretReferenceApplyConfiguration constructs a declarative configuration of the SecretReference type for use with
@@ -34,5 +52,13 @@ func (b *SecretReferenceApplyConfiguration) WithNamespace(value string) *SecretR
 // If called multiple times, the Name field is set to the value of the last call.
 func (b *SecretReferenceApplyConfiguration) WithName(value string) *SecretReferenceApplyConfiguration {
 	b.Name = &value
+	return b
+}
+
+// WithMountPath sets the MountPath field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the MountPath field is set to the value of the last call.
+func (b *SecretReferenceApplyConfiguration) WithMountPath(value string) *SecretReferenceApplyConfiguration {
+	b.MountPath = &value
 	return b
 }

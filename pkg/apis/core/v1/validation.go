@@ -6,7 +6,8 @@ package v1
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -101,7 +102,6 @@ func AggregateValidationErrors(objName string, err error) error {
 			}
 		} else {
 			if level > 0 {
-
 				errMsg.WriteString(strings.Repeat("  ", level-1))
 			}
 			fmt.Fprintf(&errMsg, "* %v\n", err.Error())
@@ -113,7 +113,7 @@ func AggregateValidationErrors(objName string, err error) error {
 	return errors.New(errMsg.String())
 }
 
-func MakeValidationErr(errType ValidationErrorType, field string, val any, detail ...string) ValidationError {
+func MakeValidationErr[T any](errType ValidationErrorType, field string, val T, detail ...string) ValidationError {
 	return ValidationError{
 		Type:     errType,
 		Field:    field,
@@ -275,6 +275,31 @@ func (archive Archive) Validate() error {
 		errs = errors.Join(errs, archive.Checksum.Validate())
 	}
 
+	errs = errors.Join(errs, archive.validateSecretRef())
+
+	return errs
+}
+
+// validateSecretRef enforces the RFC-0031 credential rules. Keyed on CONTENT,
+// not the Type string: the enum allows an empty Type, and type/content
+// agreement is not otherwise enforced for url archives. The literal
+// combination is excluded transitively by the one-content-source rule.
+// Narrow on purpose: Package.ValidateForAdmission runs exactly this (and not
+// the full historic Validate, which existing stored objects have never been
+// held to), so the storagesvc exclusion holds for hand-authored objects too.
+func (archive Archive) validateSecretRef() error {
+	if archive.SecretRef == nil {
+		return nil
+	}
+	var errs error
+	errs = errors.Join(errs, ValidateKubeName("Archive.SecretRef.Name", archive.SecretRef.Name))
+	if len(archive.URL) == 0 || archive.OCI != nil {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Archive.SecretRef", archive.SecretRef.Name, "secretref requires a url archive"))
+	} else if IsStorageServiceURL(archive.URL) {
+		// Internal HMAC and external credentials must never mix on one
+		// request; storagesvc URLs are signed, not credentialed.
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "Archive.SecretRef", archive.SecretRef.Name, "secretref cannot be used with internal storage service URLs"))
+	}
 	return errs
 }
 
@@ -299,12 +324,6 @@ func (spec PackageSpec) Validate() error {
 		if !r.IsEmpty() {
 			errs = errors.Join(errs, r.Validate())
 		}
-	}
-
-	// OCI delivery applies to deployment archives only: source archives feed
-	// the builder, which has no OCI pull path.
-	if spec.Source.OCI != nil {
-		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "PackageSpec.Source", spec.Source.Type, "oci archives are supported on the deployment archive only"))
 	}
 
 	return errs
@@ -365,12 +384,25 @@ func (spec FunctionSpec) Validate() error {
 		errs = errors.Join(errs, spec.Streaming.Validate())
 	}
 
-	if spec.Tool != nil {
-		errs = errors.Join(errs, spec.Tool.Validate())
+	// spec.Tool is validated in validateForAdmission (called below): the MCP
+	// SDK panics on a schema it dislikes, so that check must bind kubectl and
+	// GitOps writers, not only the CLI path.
+
+	if spec.State != nil {
+		errs = errors.Join(errs, spec.State.Validate())
+		if spec.InvokeStrategy.ExecutionStrategy.ExecutorType == ExecutorTypeContainer {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.State", "", "the state API requires the poolmgr or newdeploy executor (the container executor has no fetcher sidecar to deliver a scoped token)"))
+		}
+	}
+
+	if spec.Versioning != nil {
+		errs = errors.Join(errs, spec.Versioning.Validate())
 	}
 
 	// Non-CEL admission check (pod-spec security). Kept in Validate() so the
 	// CLI checks it client-side; the webhook runs it via ValidateForAdmission().
+	// validateForAdmission also runs ProvisionedConcurrency.Validate(), so the
+	// Target/Windows checks are covered without a duplicate call here.
 	errs = errors.Join(errs, spec.validateForAdmission())
 
 	// TODO Add below validation warning
@@ -383,9 +415,217 @@ func (spec FunctionSpec) Validate() error {
 
 // validateForAdmission returns the FunctionSpec checks the API server cannot
 // enforce via CEL and the admission webhook must still run: pod-spec security
-// (iterating an embedded PodSpec exceeds the CEL cost budget; GHSA-v455-mv2v-5g92).
+// (iterating an embedded PodSpec exceeds the CEL cost budget; GHSA-v455-mv2v-5g92)
+// and the RFC-0024 async invocation bounds (metav1.Duration CEL rules are unproven
+// in this CRD, so the ordering/positivity checks live in Go and run at admission)
+// and provisioned-concurrency Windows-emptiness (RFC-0026 PR 1 limitation)
+// and the RFC-0030 env rules (iterating env sources likewise exceeds the CEL
+// cost budget; these MUST live here rather than in Validate(), which the
+// webhook does not call — a rule only Validate() runs is enforced on the CLI
+// path alone and bypassed by kubectl/GitOps writers)
+// and the MCP ToolConfig rules (the InputSchema is opaque JSON that CEL
+// cannot parse, and the MCP SDK PANICS on a schema it dislikes, so a
+// GitOps-written Function must be refused here, not only by the CLI).
 func (spec FunctionSpec) validateForAdmission() error {
-	return ValidatePodSpecSafety("Function.spec.podspec", spec.PodSpec)
+	var errs error
+	errs = errors.Join(errs, ValidatePodSpecSafety("Function.spec.podspec", spec.PodSpec))
+	if spec.Tool != nil {
+		errs = errors.Join(errs, spec.Tool.Validate())
+	}
+	if spec.Invocation != nil {
+		errs = errors.Join(errs, spec.Invocation.Validate())
+	}
+	if spec.ProvisionedConcurrency != nil {
+		errs = errors.Join(errs, spec.ProvisionedConcurrency.Validate())
+	}
+	errs = errors.Join(errs, spec.validateEnvForAdmission())
+	return errs
+}
+
+// validateEnvForAdmission holds the RFC-0030 admission rules: the env source
+// narrowing, the reserved-name denylist, the file-projection path rules, and
+// the remaining "not implemented yet" gate, which must reject rather than
+// silently ignore.
+func (spec FunctionSpec) validateEnvForAdmission() error {
+	var errs error
+
+	errs = errors.Join(errs, spec.validateMountPaths())
+
+	if len(spec.Env) == 0 && len(spec.EnvFrom) == 0 {
+		return errs
+	}
+
+	errs = errors.Join(errs, validateFunctionEnv(spec.Env, spec.EnvFrom))
+
+	// Poolmgr injection rides the specialize payload and needs the
+	// capability-gated runtime contract (RFC-0030 §3); until that phase
+	// lands, reject rather than deploy a function whose DATABASE_URL
+	// would be silently empty. Empty executor type defaults to poolmgr.
+	if et := spec.InvokeStrategy.ExecutionStrategy.ExecutorType; et == ExecutorTypePoolmgr || et == "" {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.Env", "", "env/envFrom are not supported on the poolmgr executor yet (lands with RFC-0030 phase 2); use the newdeploy or container executor"))
+	}
+
+	// On the container executor the legacy name-only references are
+	// synthesized into EnvFrom by the executor; when the function declares
+	// EnvFrom itself that synthesis is skipped (one source of truth), so
+	// carrying both would silently drop the legacy projection. Reject the
+	// combination instead of dropping it.
+	if spec.InvokeStrategy.ExecutionStrategy.ExecutorType == ExecutorTypeContainer &&
+		len(spec.EnvFrom) > 0 && (len(spec.Secrets) > 0 || len(spec.ConfigMaps) > 0) {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionSpec.EnvFrom", "", "on the container executor, envFrom replaces the secrets/configmaps projection: declare the objects in envFrom instead of alongside it"))
+	}
+
+	return errs
+}
+
+const (
+	// MaxAsyncAttempts bounds RetryPolicy.MaxAttempts. It matches the statestore
+	// queue's fixed attempt budget (statestore.DefaultMaxAttempts): the async
+	// dispatcher clamps to the same value, and a larger MaxAttempts would be
+	// silently capped (the store dead-letters at its budget), so it is rejected at
+	// admission instead. Raising it requires a per-message store budget (an
+	// RFC-0024 follow-up).
+	MaxAsyncAttempts = 3
+	// MaxAsyncMaxAge bounds InvocationConfig.MaxAge — a platform ceiling so one
+	// namespace cannot park work on the shared async queue indefinitely.
+	MaxAsyncMaxAge = 7 * 24 * time.Hour
+)
+
+// Validate checks the async invocation config (only reached when
+// FunctionSpec.Invocation is non-nil): an attempt budget in [1, MaxAsyncAttempts],
+// a non-negative and well-ordered backoff schedule, and a max age in
+// (0, MaxAsyncMaxAge]. These bounds keep the dispatcher's retry loop well-defined
+// (a zero attempt budget or max age would mean "accepted but never deliverable")
+// and keep one tenant from setting absurd values on the shared queue.
+// validateBackoffBounds checks the ordering rules every RetryPolicy consumer
+// shares (base >= 0, cap >= 0, cap >= base). Attempt budgets stay at the
+// callers — async delivery clamps to MaxAsyncAttempts, workflows to
+// MaxWorkflowAttempts — because they bound different things.
+func (r *RetryPolicy) validateBackoffBounds(field string) error {
+	var errs error
+	if r.BackoffBase != nil && r.BackoffBase.Duration < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, field+".BackoffBase", r.BackoffBase.Duration, "must be >= 0"))
+	}
+	if r.BackoffCap != nil && r.BackoffCap.Duration < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, field+".BackoffCap", r.BackoffCap.Duration, "must be >= 0"))
+	}
+	if r.BackoffBase != nil && r.BackoffCap != nil && r.BackoffCap.Duration < r.BackoffBase.Duration {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, field+".BackoffCap", r.BackoffCap.Duration, "must be >= BackoffBase"))
+	}
+	return errs
+}
+
+func (ic *InvocationConfig) Validate() error {
+	var errs error
+	r := ic.Retry
+	if r.MaxAttempts != nil && *r.MaxAttempts < 1 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Invocation.Retry.MaxAttempts", *r.MaxAttempts, "must be >= 1"))
+	}
+	if r.MaxAttempts != nil && *r.MaxAttempts > MaxAsyncAttempts {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Invocation.Retry.MaxAttempts", *r.MaxAttempts, fmt.Sprintf("must be <= %d (the platform async attempt budget)", MaxAsyncAttempts)))
+	}
+	errs = errors.Join(errs, r.validateBackoffBounds("FunctionSpec.Invocation.Retry"))
+	if ic.MaxAge != nil && ic.MaxAge.Duration <= 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Invocation.MaxAge", ic.MaxAge.Duration, "must be > 0"))
+	}
+	if ic.MaxAge != nil && ic.MaxAge.Duration > MaxAsyncMaxAge {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Invocation.MaxAge", ic.MaxAge.Duration, fmt.Sprintf("must be <= %s", MaxAsyncMaxAge)))
+	}
+	if ic.OnSuccess != nil {
+		errs = errors.Join(errs, ic.OnSuccess.Validate("FunctionSpec.Invocation.OnSuccess"))
+	}
+	if ic.OnFailure != nil {
+		errs = errors.Join(errs, ic.OnFailure.Validate("FunctionSpec.Invocation.OnFailure"))
+	}
+	return errs
+}
+
+// Validate checks a destination reference: exactly one of Function/Topic, a
+// function destination that references a single named function (weights make no
+// sense for a destination), and a topic destination on a supported provider —
+// the built-in statestore (RFC-0027); broker types are rejected honestly until
+// the egress phase lands rather than accepted and dropped.
+func (d *DestinationRef) Validate(field string) error {
+	switch {
+	case d.Function == nil && d.Topic == nil:
+		return MakeValidationErr(ErrorInvalidObject, field, "", "exactly one of function or topic must be set")
+	case d.Function != nil && d.Topic != nil:
+		return MakeValidationErr(ErrorInvalidObject, field, "", "only one of function or topic may be set")
+	case d.Topic != nil:
+		return d.Topic.Validate(field + ".topic")
+	}
+	if d.Function.Type != FunctionReferenceTypeFunctionName {
+		return MakeValidationErr(ErrorInvalidValue, field+".function.type", d.Function.Type, fmt.Sprintf("must be %q", FunctionReferenceTypeFunctionName))
+	}
+	if strings.TrimSpace(d.Function.Name) == "" {
+		return MakeValidationErr(ErrorInvalidValue, field+".function.name", d.Function.Name, "must not be empty")
+	}
+	return nil
+}
+
+// topicNameRegexp bounds statestore topic names to a stream-safe charset.
+var topicNameRegexp = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// topicDestinationTypes are the MQ types a topic destination may target: the
+// built-in statestore provider (direct EventLog publish) and the broker types
+// whose classic heads run an RFC-0027 egress consumer. KEDA-only types (e.g.
+// aws-sqs-queue) have no classic head and therefore no egress loop — rejected.
+var topicDestinationTypes = map[MessageQueueType]struct{}{
+	MessageQueueTypeStatestore: {},
+	MessageQueueTypeKafka:      {},
+}
+
+// kafkaDestinationTopicRegexp mirrors the kafka provider's trigger-side topic
+// grammar (alphanumeric first/last character), which is stricter than the
+// statestore grammar: kafka rejects "." and ".." outright, and leading "_"
+// names collide with broker-internal topics — admitting them would create
+// destinations the broker refuses forever (retry churn straight to the DLQ).
+var kafkaDestinationTopicRegexp = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$`)
+
+// Validate checks a topic destination: the MQ type must have a publish path
+// (statestore direct, or a broker egress consumer), and the topic name must be
+// safe in the namespaced stream mapping topic/<ns>/<topic>.
+//
+// Broker topics, like kafka MessageQueueTriggers, are CLUSTER-FLAT: a topic
+// destination writes to the named broker topic as-is, with no per-namespace
+// prefixing — isolation between tenants on the broker side is the broker's
+// ACLs on the egress producer's principal. Whether a broker type's egress head
+// is actually deployed is an install property admission cannot see; the router
+// rejects publishes for undeployed types (EVENTING_EGRESS_TYPES).
+func (tr *TopicRef) Validate(field string) error {
+	if _, ok := topicDestinationTypes[tr.MessageQueueType]; !ok {
+		return MakeValidationErr(ErrorInvalidValue, field+".messageQueueType", tr.MessageQueueType,
+			fmt.Sprintf("topic destinations support %q (built-in) and %q (broker egress)", MessageQueueTypeStatestore, MessageQueueTypeKafka))
+	}
+	return ValidateTopicNameForMQType(field+".topic", string(tr.MessageQueueType), tr.Topic)
+}
+
+// ValidateTopicNameForMQType applies the base topic grammar plus the target
+// type's own restrictions (kafka's stricter rule for kafka). Exported so every
+// layer that handles a typed topic — admission, the mqpub publishers, the
+// egress consumer sink, the topic admin API — applies the SAME rule and a name
+// the broker refuses forever is rejected up front instead of churning retries
+// into the DLQ.
+func ValidateTopicNameForMQType(field, mqType, topic string) error {
+	if err := ValidateTopicName(field, topic); err != nil {
+		return err
+	}
+	if mqType == MessageQueueTypeKafka && !kafkaDestinationTopicRegexp.MatchString(topic) {
+		return MakeValidationErr(ErrorInvalidValue, field, topic,
+			"kafka topics must start and end with an alphanumeric character")
+	}
+	return nil
+}
+
+// ValidateTopicName bounds a statestore topic name: non-empty, at most 249
+// characters (kafka parity), and [a-zA-Z0-9._-] only — critically excluding "/"
+// so the topic/<ns>/<topic> stream mapping cannot alias across namespaces.
+// Exported for the mqtrigger statestore provider's trigger validation.
+func ValidateTopicName(field, topic string) error {
+	if topic == "" || len(topic) > 249 || !topicNameRegexp.MatchString(topic) {
+		return MakeValidationErr(ErrorInvalidValue, field, topic, "must be 1-249 characters of [a-zA-Z0-9._-]")
+	}
+	return nil
 }
 
 // Validate checks the streaming config: a known protocol, non-negative timeouts,
@@ -415,10 +655,12 @@ func (sc *StreamingConfig) Validate() error {
 
 // Validate checks the MCP tool config (only reached when FunctionSpec.Tool is
 // non-nil, i.e. the function is advertised): a description is required, and a
-// supplied InputSchema must parse as a JSON object carrying a "type" key (a
+// supplied InputSchema must parse as a JSON object whose "type" is "object" (a
 // cheap structural check — full JSON-Schema meta-validation is the agent's job,
-// and CEL cannot parse arbitrary schemas). The ToolName pattern is enforced by
-// the CRD kubebuilder marker.
+// and CEL cannot parse arbitrary schemas). The type check is load-bearing, not
+// cosmetic: the MCP SDK's AddTool panics on a non-object input schema, so
+// admitting one would let a single Function crash-loop every MCP replica's
+// reconciler. The ToolName pattern is enforced by the CRD kubebuilder marker.
 func (tc *ToolConfig) Validate() error {
 	var errs error
 
@@ -427,15 +669,144 @@ func (tc *ToolConfig) Validate() error {
 	}
 
 	if tc.InputSchema != nil && len(tc.InputSchema.Raw) > 0 {
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(tc.InputSchema.Raw, &obj); err != nil {
+		// ADMISSION LENIENCY: this must NOT get stricter than v1 — stored
+		// objects and GitOps manifests the apiserver already accepted have to
+		// keep validating, so duplicate JSON member names and invalid UTF-8
+		// are explicitly allowed on both probes below rather than newly
+		// rejected.
+		var obj map[string]jsontext.Value
+		if err := json.Unmarshal(tc.InputSchema.Raw, &obj, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)); err != nil {
 			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Tool.InputSchema", string(tc.InputSchema.Raw), "must be a JSON object"))
-		} else if _, ok := obj["type"]; !ok {
+		} else if typRaw, ok := obj["type"]; !ok {
 			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Tool.InputSchema", string(tc.InputSchema.Raw), `must be a JSON Schema object with a "type" key`))
+		} else if typ := ""; json.Unmarshal(typRaw, &typ, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)) != nil || typ != "object" {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Tool.InputSchema", string(tc.InputSchema.Raw), `"type" must be "object" (MCP tool arguments are always an object)`))
+		}
+	}
+
+	if tc.Alias != "" {
+		errs = errors.Join(errs, ValidateKubeName("FunctionSpec.Tool.Alias", tc.Alias))
+	}
+
+	return errs
+}
+
+// stateKeyspaceRegexp mirrors the StateConfig.Keyspace kubebuilder marker.
+// The charset deliberately excludes ':' (token-derivation info-string
+// separator) and '#' (the platform-reserved "<keyspace>#meta" quota sibling).
+var stateKeyspaceRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+
+// runtimeClassNameRegexp mirrors the EnvironmentSpec.RuntimeClassName
+// struct-level CEL marker. It is deliberately a DNS1123-label CHARSET but with
+// the subdomain LENGTH bound (253, not a label's 63): the RuntimeClasses Fission
+// targets (gvisor, kata, runc) are labels, so dots are intentionally excluded,
+// while the generous length keeps this from ever being the tighter of the two
+// bounds. It must agree with the apiserver CEL rule so the CLI's pre-flight
+// Validate() never rejects a value the API server would admit — hence not
+// validation.IsDNS1123Label (which would cap at 63) nor IsDNS1123Subdomain.
+var runtimeClassNameRegexp = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+// Validate checks the keyed-state config (only reached when FunctionSpec.State
+// is non-nil): keyspace charset/length, non-negative quotas and TTL, and a
+// well-formed sticky declaration. Re-checked in Go so the CLI validates
+// client-side; the CRD markers enforce the same bounds at the API server.
+func (sc *StateConfig) Validate() error {
+	var errs error
+
+	if sc.Keyspace != "" && (len(sc.Keyspace) > 63 || !stateKeyspaceRegexp.MatchString(sc.Keyspace)) {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.State.Keyspace", sc.Keyspace, "must be 1-63 characters matching ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"))
+	}
+	if sc.MaxValueBytes < 0 || sc.MaxValueBytes > MaxStateMaxValueBytes {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.State.MaxValueBytes", sc.MaxValueBytes, fmt.Sprintf("must be between 0 and %d (0 = platform default)", MaxStateMaxValueBytes)))
+	}
+	if sc.MaxKeys < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.State.MaxKeys", sc.MaxKeys, "must be >= 0"))
+	}
+	if sc.DefaultTTL != nil && sc.DefaultTTL.Duration < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.State.DefaultTTL", sc.DefaultTTL.Duration.String(), "must be >= 0"))
+	}
+	if sc.Sticky != nil {
+		switch sc.Sticky.Source {
+		case StickySourceHeader, StickySourceQueryParam:
+			// ok
+		default:
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.State.Sticky.Source", sc.Sticky.Source, "must be one of: header, queryparam"))
+		}
+		if sc.Sticky.Name == "" {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.State.Sticky.Name", sc.Sticky.Name, "a header or query-parameter name is required"))
 		}
 	}
 
 	return errs
+}
+
+// Validate checks the provisioned concurrency config.
+func (pc *ProvisionedConcurrencyConfig) Validate() error {
+	var errs error
+	if pc.Target < 1 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Target", pc.Target, "must be >= 1"))
+	}
+
+	// Bound the window count: each window costs an independent cron parse plus
+	// a schedule walk on every executor reconcile pass, held under the
+	// per-function reconcile lock inside a 10-slot semaphore, so an unbounded
+	// list is a cross-tenant starvation vector for the provisioner.
+	const maxProvisionedWindows = 32
+	if len(pc.Windows) > maxProvisionedWindows {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", len(pc.Windows),
+			fmt.Sprintf("must not exceed %d windows", maxProvisionedWindows)))
+	}
+
+	windows := make(map[string]struct{})
+	for i, window := range pc.Windows {
+		if len(window.Name) == 0 {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", i, "name is required"))
+		}
+		if err := IsValidCronSpec(window.Start); err != nil {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", i, "start is invalid: "+err.Error(), "window name: "+window.Name))
+		}
+		if d, err := time.ParseDuration(window.Duration); err != nil {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", i, "duration is invalid: "+err.Error(), "window name: "+window.Name))
+		} else if d <= 0 {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", i, "duration must be > 0", "window name: "+window.Name))
+		}
+		if _, ok := windows[window.Name]; ok {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", i, "name must be unique", "window name: "+window.Name))
+		}
+		if window.Target < 0 {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.ProvisionedConcurrency.Windows", i, "window target must be >= 0", "window name: "+window.Name))
+		}
+		if window.Name != "" {
+			windows[window.Name] = struct{}{}
+		}
+	}
+	return errs
+}
+
+// EffectiveKeyspace resolves the keyspace, defaulting to the function name.
+func (sc *StateConfig) EffectiveKeyspace(fnName string) string {
+	if sc.Keyspace != "" {
+		return sc.Keyspace
+	}
+	return fnName
+}
+
+// EffectiveMaxValueBytes resolves the per-value size cap, applying the
+// platform default when unset.
+func (sc *StateConfig) EffectiveMaxValueBytes() int64 {
+	if sc.MaxValueBytes > 0 {
+		return sc.MaxValueBytes
+	}
+	return DefaultStateMaxValueBytes
+}
+
+// EffectiveMaxKeys resolves the live-key cap, applying the platform default
+// when unset.
+func (sc *StateConfig) EffectiveMaxKeys() int64 {
+	if sc.MaxKeys > 0 {
+		return sc.MaxKeys
+	}
+	return DefaultStateMaxKeys
 }
 
 func (is InvokeStrategy) Validate() error {
@@ -486,6 +857,28 @@ func (es ExecutionStrategy) Validate() error {
 	return errs
 }
 
+// Validate checks a FunctionReference: Type is a supported value, Name is a
+// kube name when Type is "name", and the optional Alias/Version pins
+// (RFC-0025) are each a kube name, mutually exclusive, and valid only when
+// Type is "name" — mirroring the CRD's CEL rules on this type so the CLI
+// validates client-side. This is FORMAT validation only: whether the named
+// alias/version actually exists is not checked here (aliases are eventually
+// consistent, and existence-at-admission would break apply-before-publish
+// ordering); router-side resolution enforces existence at request time.
+// ValidateTriggerTarget is Validate for the triggers that may also target a
+// workflow (HTTPTrigger, TimeTrigger): type "workflow" needs a kube name and
+// takes no alias / version.
+func (ref FunctionReference) ValidateTriggerTarget() error {
+	if ref.Type != FunctionReferenceTypeWorkflow {
+		return ref.Validate()
+	}
+	errs := ValidateKubeName("FunctionReference.Name", ref.Name)
+	if ref.Alias != "" || ref.Version != "" {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionReference", "", "alias and version are not valid for a workflow target"))
+	}
+	return errs
+}
+
 func (ref FunctionReference) Validate() error {
 	var errs error
 
@@ -498,6 +891,25 @@ func (ref FunctionReference) Validate() error {
 
 	if ref.Type == FunctionReferenceTypeFunctionName {
 		errs = errors.Join(errs, ValidateKubeName("FunctionReference.Name", ref.Name))
+	}
+
+	hasAlias := ref.Alias != ""
+	hasVersion := ref.Version != ""
+
+	if hasAlias && hasVersion {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionReference", "", "alias and version are mutually exclusive"))
+	}
+	if hasAlias {
+		errs = errors.Join(errs, ValidateKubeName("FunctionReference.Alias", ref.Alias))
+		if ref.Type != FunctionReferenceTypeFunctionName {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionReference.Alias", ref.Alias, "alias is only valid when type is 'name'"))
+		}
+	}
+	if hasVersion {
+		errs = errors.Join(errs, ValidateKubeName("FunctionReference.Version", ref.Version))
+		if ref.Type != FunctionReferenceTypeFunctionName {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionReference.Version", ref.Version, "version is only valid when type is 'name'"))
+		}
 	}
 
 	return errs
@@ -547,8 +959,16 @@ func (spec EnvironmentSpec) Validate() error {
 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "EnvironmentSpec.Poolsize", spec.Poolsize, "must be greater than or equal to 0"))
 	}
 
-	if spec.TerminationGracePeriod < 0 {
-		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "EnvironmentSpec.TerminationGracePeriod", spec.TerminationGracePeriod, "must be greater than or equal to 0"))
+	if spec.TerminationGracePeriod != nil && *spec.TerminationGracePeriod < 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "EnvironmentSpec.TerminationGracePeriod", *spec.TerminationGracePeriod, "must be greater than or equal to 0"))
+	}
+
+	if spec.RuntimeClassName != nil {
+		val := *spec.RuntimeClassName
+		if len(val) > 253 || !runtimeClassNameRegexp.MatchString(val) {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "EnvironmentSpec.RuntimeClassName", val,
+				"must be lowercase alphanumeric or '-', start and end alphanumeric, at most 253 characters"))
+		}
 	}
 
 	return errs
@@ -576,7 +996,7 @@ func (spec HTTPTriggerSpec) Validate() error {
 		errs = checkMethod(spec.Method, errs)
 	}
 
-	errs = errors.Join(errs, spec.FunctionReference.Validate())
+	errs = errors.Join(errs, spec.FunctionReference.ValidateTriggerTarget())
 
 	if len(spec.Host) > 0 {
 		e := validation.IsDNS1123Subdomain(spec.Host)
@@ -750,9 +1170,9 @@ func (config IngressConfig) Validate() error {
 		for _, msg := range validation.IsQualifiedName(strings.ToLower(k)) {
 			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.IngressConfig.Annotations.key", k, msg))
 		}
-		totalSize += (int64)(len(k)) + (int64)(len(v))
+		totalSize += int64(len(k)) + int64(len(v))
 	}
-	if totalSize > (int64)(totalAnnotationSizeLimitB) {
+	if totalSize > int64(totalAnnotationSizeLimitB) {
 		msg := fmt.Sprintf("must have at most %v characters", totalSize)
 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.IngressConfig.Annotations.value", totalAnnotationSizeLimitB, msg))
 	}
@@ -802,9 +1222,9 @@ func (config RouteConfig) Validate() error {
 		for _, msg := range validation.IsQualifiedName(strings.ToLower(k)) {
 			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Annotations.key", k, msg))
 		}
-		totalSize += (int64)(len(k)) + (int64)(len(v))
+		totalSize += int64(len(k)) + int64(len(v))
 	}
-	if totalSize > (int64)(totalAnnotationSizeLimitB) {
+	if totalSize > int64(totalAnnotationSizeLimitB) {
 		msg := fmt.Sprintf("must have at most %v characters", totalSize)
 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "HTTPTriggerSpec.RouteConfig.Annotations.value", totalAnnotationSizeLimitB, msg))
 	}
@@ -859,15 +1279,22 @@ func (spec MessageQueueTriggerSpec) Validate() error {
 func (spec MessageQueueTriggerSpec) validateForAdmission() error {
 	var errs error
 
-	if !validator.IsValidMessageQueue((string)(spec.MessageQueueType), spec.MqtKind) {
+	if !validator.IsValidMessageQueue(string(spec.MessageQueueType), spec.MqtKind) {
 		errs = errors.Join(errs, MakeValidationErr(ErrorUnsupportedType, "MessageQueueTriggerSpec.MessageQueueType", spec.MessageQueueType, "not a supported message queue type"))
 	} else {
-		if !validator.IsValidTopic((string)(spec.MessageQueueType), spec.Topic, spec.MqtKind) {
+		if !validator.IsValidTopic(string(spec.MessageQueueType), spec.Topic, spec.MqtKind) {
 			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "MessageQueueTriggerSpec.Topic", spec.Topic, "not a valid topic"))
 		}
 
-		if len(spec.ResponseTopic) > 0 && !validator.IsValidTopic((string)(spec.MessageQueueType), spec.ResponseTopic, spec.MqtKind) {
+		if len(spec.ResponseTopic) > 0 && !validator.IsValidTopic(string(spec.MessageQueueType), spec.ResponseTopic, spec.MqtKind) {
 			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "MessageQueueTriggerSpec.ResponseTopic", spec.ResponseTopic, "not a valid topic"))
+		}
+
+		// An invalid ErrorTopic is worse than an invalid ResponseTopic: the
+		// consumer refuses to advance past a poison event whose error-topic
+		// publish keeps failing (E5), so the trigger wedges re-delivering it.
+		if len(spec.ErrorTopic) > 0 && !validator.IsValidTopic((string)(spec.MessageQueueType), spec.ErrorTopic, spec.MqtKind) {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "MessageQueueTriggerSpec.ErrorTopic", spec.ErrorTopic, "not a valid topic"))
 		}
 	}
 
@@ -882,7 +1309,7 @@ func (spec TimeTriggerSpec) Validate() error {
 		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "TimeTriggerSpec.Cron", spec.Cron, "not a valid cron spec"))
 	}
 
-	errs = errors.Join(errs, spec.FunctionReference.Validate())
+	errs = errors.Join(errs, spec.FunctionReference.ValidateTriggerTarget())
 
 	return errs
 }
@@ -903,12 +1330,16 @@ func (p *Package) Validate() error {
 }
 
 // ValidateForAdmission runs the Package checks the API server cannot enforce
-// via CEL. There are none on the spec itself (archive/checksum/build-status are
-// CEL-covered, reference names are CEL-covered); the webhook additionally
-// enforces the archive literal-size limit and the cross-namespace environment
-// check inline. Defined for a uniform webhook switch.
+// via CEL. Archive/checksum/build-status enums and reference names are
+// CEL-covered, and the webhook enforces the archive literal-size limit and
+// the cross-namespace environment check inline; what remains here is the
+// RFC-0031 SecretRef rule set — its storagesvc-path exclusion needs URL
+// parsing, which CEL cannot do.
 func (p *Package) ValidateForAdmission() error {
-	return nil
+	return errors.Join(
+		p.Spec.Source.validateSecretRef(),
+		p.Spec.Deployment.validateSecretRef(),
+	)
 }
 
 func (pl *PackageList) Validate() error {
@@ -1081,5 +1512,176 @@ func (ml *MessageQueueTriggerList) Validate() error {
 	for _, m := range ml.Items {
 		errs = errors.Join(errs, m.Validate())
 	}
+	return errs
+}
+
+//
+// Function versions & aliases (RFC-0025)
+//
+
+// Validate checks a VersioningConfig: Mode must be one of the recognized
+// values (empty defaults to auto at the reconciler), and Retain, when set,
+// must be a positive GC floor — CEL already enforces this Minimum=1 marker at
+// the API server, but the Go-side check keeps the CLI's client-side validation
+// and Snapshot's nested re-check (see FunctionVersionSpec.Validate) honest.
+func (vc *VersioningConfig) Validate() error {
+	var errs error
+
+	switch vc.Mode {
+	case "", VersioningModeAuto, VersioningModeManual: // no op
+	default:
+		errs = errors.Join(errs, MakeValidationErr(ErrorUnsupportedType, "FunctionSpec.Versioning.Mode", vc.Mode, "not a valid versioning mode"))
+	}
+
+	if vc.Retain != nil && *vc.Retain < 1 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionSpec.Versioning.Retain", *vc.Retain, "must be >= 1"))
+	}
+
+	return errs
+}
+
+// Validate checks a FunctionVersionSpec: the identity fields that pin this
+// snapshot to a Function generation are required and well-formed, and the
+// embedded Snapshot must itself validate (the same spec-level check
+// Function.Validate runs) but must not carry its own Versioning config — a
+// version is a versioning-config-free leaf, so a nested config would beg the
+// question of what publishing that snapshot means and is rejected instead of
+// silently ignored.
+func (spec FunctionVersionSpec) Validate() error {
+	var errs error
+
+	errs = errors.Join(errs, ValidateKubeName("FunctionVersionSpec.FunctionName", spec.FunctionName))
+
+	if len(spec.FunctionUID) == 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionVersionSpec.FunctionUID", spec.FunctionUID, "must not be empty"))
+	}
+
+	if spec.FunctionGeneration < 1 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionVersionSpec.FunctionGeneration", spec.FunctionGeneration, "must be >= 1"))
+	}
+
+	if spec.Sequence < 1 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionVersionSpec.Sequence", spec.Sequence, "must be >= 1"))
+	}
+
+	if len(spec.PackageDigest) == 0 {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionVersionSpec.PackageDigest", spec.PackageDigest, "must not be empty"))
+	}
+
+	if spec.Snapshot.Versioning != nil {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionVersionSpec.Snapshot.Versioning", "", "snapshot must zero versioning to avoid recursion"))
+	}
+
+	errs = errors.Join(errs, spec.Snapshot.Validate())
+
+	return errs
+}
+
+// Validate checks a FunctionAliasSpec: FunctionName is a kube name, exactly
+// one of Version (name-pinned) or PackageDigest (declarative, eventually
+// resolved) targets the alias — mirroring the CRD's CEL XOR rule so the CLI
+// validates client-side — and, when Weight is set for a split rollout,
+// SecondaryVersion is required, is itself a kube name, and differs from
+// Version (a split against itself is not a rollout).
+func (spec FunctionAliasSpec) Validate() error {
+	var errs error
+
+	errs = errors.Join(errs, ValidateKubeName("FunctionAliasSpec.FunctionName", spec.FunctionName))
+
+	hasVersion := spec.Version != ""
+	hasDigest := spec.PackageDigest != ""
+	switch {
+	case !hasVersion && !hasDigest:
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionAliasSpec", "", "exactly one of version or packageDigest must be set"))
+	case hasVersion && hasDigest:
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionAliasSpec", "", "only one of version or packageDigest may be set"))
+	}
+
+	if hasVersion {
+		errs = errors.Join(errs, ValidateKubeName("FunctionAliasSpec.Version", spec.Version))
+	}
+	// ociDigestRegexp mirrors FunctionAliasSpec.PackageDigest's kubebuilder
+	// Pattern marker in types.go — the same grammar as OCIArchive.Digest,
+	// since both fields accept a "sha256:" + 64-hex-char digest.
+	if hasDigest && !ociDigestRegexp.MatchString(spec.PackageDigest) {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionAliasSpec.PackageDigest", spec.PackageDigest, "must be 'sha256:' followed by 64 hex characters"))
+	}
+
+	if spec.Weight != nil {
+		if *spec.Weight < 0 || *spec.Weight > 100 {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionAliasSpec.Weight", *spec.Weight, "must be 0-100"))
+		}
+		if spec.SecondaryVersion == "" {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidObject, "FunctionAliasSpec.SecondaryVersion", "", "weight requires secondaryVersion"))
+		}
+	}
+
+	if spec.SecondaryVersion != "" {
+		errs = errors.Join(errs, ValidateKubeName("FunctionAliasSpec.SecondaryVersion", spec.SecondaryVersion))
+		if spec.SecondaryVersion == spec.Version {
+			errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionAliasSpec.SecondaryVersion", spec.SecondaryVersion, "must differ from version"))
+		}
+	}
+
+	return errs
+}
+
+// Validate checks a FunctionVersion: the object name must be exactly
+// "<functionName>-v<sequence>" (the version-control loop and `fission fn
+// publish` both mint names this way; a mismatch here means the object was
+// hand-authored or corrupted, and the name-derived lookup every consumer
+// relies on — GC, alias resolution — would silently miss it), plus the
+// embedded spec.
+func (fv *FunctionVersion) Validate() error {
+	var errs error
+
+	wantName := fmt.Sprintf("%s-v%d", fv.Spec.FunctionName, fv.Spec.Sequence)
+	if fv.Name != wantName {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionVersion.ObjectMeta.Name", fv.Name, fmt.Sprintf("must be %q (<functionName>-v<sequence>)", wantName)))
+	}
+	errs = errors.Join(errs, validateNS("FunctionVersion.ObjectMeta.Namespace", fv.Namespace))
+
+	errs = errors.Join(errs, fv.Spec.Validate())
+
+	return errs
+}
+
+// aliasNameShadowsVersionScheme reports whether name matches the
+// FunctionVersion naming scheme minted FOR functionName —
+// "<functionName>-v<sequence>" (versioning.Publish; enforced on the
+// FunctionVersion side by FunctionVersion.Validate above). An alias with
+// such a name would materialize to the IDENTICAL internal-listener route as
+// one of that function's own published versions
+// (/fission-function/[<ns>/]<functionName>:<name> — see pkg/router's
+// internalRouteExactURLs/routetable.InternalKey, which has no alias-vs-
+// version discriminant beyond the shared Suffix string), so whichever event
+// (alias repoint vs. a new publish) lands last would silently overwrite the
+// other's route. The check is scoped to functionName specifically — an
+// alias named e.g. "hello-v3" is fine for any function OTHER than "hello".
+func aliasNameShadowsVersionScheme(name, functionName string) bool {
+	suffix, ok := strings.CutPrefix(name, functionName+"-v")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (fa *FunctionAlias) Validate() error {
+	var errs error
+
+	errs = errors.Join(errs,
+		validateMetadata("FunctionAlias", fa.ObjectMeta),
+		fa.Spec.Validate())
+
+	if aliasNameShadowsVersionScheme(fa.Name, fa.Spec.FunctionName) {
+		errs = errors.Join(errs, MakeValidationErr(ErrorInvalidValue, "FunctionAlias.ObjectMeta.Name", fa.Name,
+			fmt.Sprintf("collides with the FunctionVersion naming scheme for function %q (<functionName>-v<sequence>); choose a different alias name", fa.Spec.FunctionName)))
+	}
+
 	return errs
 }

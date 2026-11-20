@@ -29,7 +29,21 @@ func TestToolConfigValidate(t *testing.T) {
 		{"valid object schema", ToolConfig{Description: "d", InputSchema: rawSchema(`{"type":"object","properties":{"q":{"type":"string"}}}`)}, false},
 		{"schema not an object", ToolConfig{Description: "d", InputSchema: rawSchema(`["type"]`)}, true},
 		{"schema missing type", ToolConfig{Description: "d", InputSchema: rawSchema(`{"properties":{}}`)}, true},
+		// The MCP SDK's AddTool panics on a non-object schema; admission must
+		// refuse it so one Function can't crash-loop the MCP reconciler.
+		{"schema type not object", ToolConfig{Description: "d", InputSchema: rawSchema(`{"type":"string"}`)}, true},
+		{"schema type not a string", ToolConfig{Description: "d", InputSchema: rawSchema(`{"type":["object","null"]}`)}, true},
 		{"schema not json", ToolConfig{Description: "d", InputSchema: rawSchema(`{bad`)}, true},
+		// ADMISSION LENIENCY (see validation.go): stored objects and GitOps
+		// manifests the apiserver already accepted must keep validating, so
+		// the probe must not get stricter than v1 about duplicate keys or
+		// invalid UTF-8. If the Allow options are dropped, these rows fail.
+		{"duplicate keys accepted", ToolConfig{Description: "d", InputSchema: rawSchema(`{"type":"object","a":1,"a":2}`)}, false},
+		{"invalid UTF-8 accepted", ToolConfig{Description: "d", InputSchema: rawSchema("{\"type\":\"object\",\"note\":\"x\xff\"}")}, false},
+		// RFC-0025: Alias is a format-only kube-name check (no existence check
+		// — aliases are eventually consistent).
+		{"valid alias ok", ToolConfig{Description: "d", Alias: "prod"}, false},
+		{"malformed alias rejected", ToolConfig{Description: "d", Alias: "Bad_Alias"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,4 +86,37 @@ func TestFunctionSpecValidateTool(t *testing.T) {
 			t.Fatalf("expected error for exposed tool without description")
 		}
 	})
+
+	t.Run("invalid tool alias surfaced", func(t *testing.T) {
+		t.Parallel()
+		spec := base()
+		spec.Tool = &ToolConfig{Description: "d", Alias: "Bad_Alias"}
+		if err := spec.Validate(); err == nil {
+			t.Fatalf("expected error for malformed tool alias")
+		}
+	})
+}
+
+// TestToolConfigOnAdmissionPath pins that ToolConfig rules bind kubectl and
+// GitOps writers, not only the CLI: the webhook calls
+// Function.ValidateForAdmission (NOT Validate), and the MCP SDK panics on a
+// schema it dislikes, so a rule reachable only via Validate() would leave the
+// reconciler exposed to any non-CLI writer.
+func TestToolConfigOnAdmissionPath(t *testing.T) {
+	t.Parallel()
+	bad := &Function{Spec: FunctionSpec{Tool: &ToolConfig{
+		Description: "d",
+		InputSchema: rawSchema(`{"type":"string"}`),
+	}}}
+	err := bad.ValidateForAdmission()
+	if err == nil {
+		t.Fatal("ValidateForAdmission must reject a non-object tool input schema (this is the webhook's path)")
+	}
+	good := &Function{Spec: FunctionSpec{Tool: &ToolConfig{
+		Description: "d",
+		InputSchema: rawSchema(`{"type":"object"}`),
+	}}}
+	if err := good.ValidateForAdmission(); err != nil {
+		t.Fatalf("valid tool config must pass admission: %v", err)
+	}
 }

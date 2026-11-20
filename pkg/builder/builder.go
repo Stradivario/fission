@@ -7,7 +7,8 @@ package builder
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/fission/fission/pkg/info"
 	"github.com/fission/fission/pkg/utils"
+	"github.com/fission/fission/pkg/utils/httpx"
 	otelUtils "github.com/fission/fission/pkg/utils/otel"
 )
 
@@ -60,13 +62,23 @@ type (
 	Builder struct {
 		logger           logr.Logger
 		sharedVolumePath string
+		// sem bounds the number of builds that may run concurrently inside this
+		// pod. cap(sem) == maxParallelBuilds; an empty token is pushed on build
+		// start and popped on completion.
+		sem chan struct{}
 	}
 )
 
-func MakeBuilder(logger logr.Logger, sharedVolumePath string) *Builder {
+func MakeBuilder(logger logr.Logger, sharedVolumePath string, maxParallelBuilds int) *Builder {
+	// Guard against a non-positive value: an unbuffered semaphore channel would
+	// block every build forever. At least one build must always be allowed.
+	if maxParallelBuilds < 1 {
+		maxParallelBuilds = 1
+	}
 	return &Builder{
 		logger:           logger.WithName("builder"),
 		sharedVolumePath: sharedVolumePath,
+		sem:              make(chan struct{}, maxParallelBuilds),
 	}
 }
 
@@ -129,6 +141,21 @@ func (builder *Builder) Handler(w http.ResponseWriter, r *http.Request) {
 		logger.Info("build request complete", "elapsed_time", elapsed)
 	}()
 
+	// Bound the number of builds running concurrently inside this pod. When the
+	// pod is already at capacity the request blocks here until a slot frees up.
+	if queued := len(builder.sem); queued > 0 {
+		logger.Info("build queued - waiting for semaphore",
+			"queued_builds", queued, "max_parallel_builds", cap(builder.sem))
+	}
+	builder.sem <- struct{}{}
+	logger.Info("build started - semaphore acquired",
+		"active_builds", len(builder.sem), "max_parallel_builds", cap(builder.sem))
+	defer func() {
+		<-builder.sem
+		logger.Info("build finished - semaphore released",
+			"remaining_builds", len(builder.sem), "max_parallel_builds", cap(builder.sem))
+	}()
+
 	// parse request
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -138,6 +165,8 @@ func (builder *Builder) Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req PackageBuildRequest
+	// Decode of JSON produced by our own client marshaler (pkg/builder/client);
+	// plain v2 Unmarshal is safe (strict decoding, no RawMessage fields here).
 	err = json.Unmarshal(body, &req)
 	if err != nil {
 		e := "error parsing json body"
@@ -231,18 +260,16 @@ func (builder *Builder) reply(ctx context.Context, w http.ResponseWriter, pkgFil
 		BuildLogs:        buildLogs,
 	}
 
-	rBody, err := json.Marshal(resp)
-	if err != nil {
+	// WriteJSON marshals before it commits the status line, so an ErrEncode
+	// leaves the response untouched and the 500 fallback below still lands —
+	// the client must not receive HTTP 200 with a failed body.
+	err := httpx.WriteJSON(w, statusCode, resp)
+	if errors.Is(err, httpx.ErrEncode) {
 		e := fmt.Errorf("error encoding response body: %w", err)
-		rBody = fmt.Appendf(nil, `{"buildLogs": "%s"}`, e.Error())
-		statusCode = http.StatusInternalServerError
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, err = w.Write(fmt.Appendf(nil, `{"buildLogs": "%s"}`, e.Error()))
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	// should write header before writing the body,
-	// or client will receive HTTP 200 regardless the real status code
-	w.WriteHeader(statusCode)
-	_, err = w.Write(rBody)
 	if err != nil {
 		logger.Error(err,
 			"error writing response")

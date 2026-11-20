@@ -6,19 +6,21 @@ package app
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/go-logr/logr"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	hmacauth "github.com/fission/fission/pkg/auth/hmac"
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/fetcher"
@@ -42,6 +44,11 @@ func Run(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger log
 	if flag.NArg() == 0 {
 		flag.Usage()
 		return errors.New("missing arguments")
+	}
+	// Fail closed on a present-but-empty internal-auth key before the
+	// specialize/fetch verifier is constructed from it.
+	if err := fv1.ValidateInternalAuthEnv(); err != nil {
+		return err
 	}
 
 	dir := flag.Arg(0)
@@ -71,6 +78,16 @@ func Run(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger log
 		return fmt.Errorf("error making fetcher: %w", err)
 	}
 
+	// Re-specialize the runtime container after the kubelet restarts it
+	// (crash / OOM) - see pkg/fetcher/runtime_watchdog.go.
+	f.EnableRuntimeWatchdog(ctx, func(ready bool) {
+		if ready {
+			readyToServe.Store(1)
+		} else {
+			readyToServe.Store(0)
+		}
+	})
+
 	// do specialization in other goroutine to prevent blocking in newdeploy
 	mgr.Go(func() error {
 		if *specializeOnStart {
@@ -82,11 +99,16 @@ func Run(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger log
 				return nil
 			}
 
-			code, err := f.SpecializePod(ctx, specializeReq.FetchReq, specializeReq.LoadReq)
-			if err != nil {
-				logger.Error(err, "error specializing function pod", "statusCode", code)
+			// A failed specialization (e.g. a federation gateway whose
+			// subgraphs are still starting) used to leave the pod unready
+			// forever with a healthy liveness probe. Keep retrying instead;
+			// the pod stays unready until it works.
+			if !specializeWithRetry(ctx, logger, func(ctx context.Context) (int, error) {
+				return f.SpecializePod(ctx, specializeReq.FetchReq, specializeReq.LoadReq)
+			}, 2*time.Second, 30*time.Second) {
 				return nil
 			}
+			f.WatchRuntime(specializeReq.FetchReq, specializeReq.LoadReq)
 		}
 		readyToServe.Store(1)
 		return nil
@@ -158,4 +180,22 @@ func Run(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger log
 
 func fetcherUsage() {
 	fmt.Println("Usage: fetcher [-specialize-on-startup] [-specialize-request <json>] [-secret-dir <string>] [-cfgmap-dir <string>] <shared volume path>")
+}
+
+// specializeWithRetry runs specialize until it succeeds, waiting `delay`
+// (doubling up to maxDelay) between failures; false = ctx ended first.
+func specializeWithRetry(ctx context.Context, logger logr.Logger, specialize func(context.Context) (int, error), delay, maxDelay time.Duration) bool {
+	for attempt := 1; ; attempt++ {
+		code, err := specialize(ctx)
+		if err == nil {
+			return true
+		}
+		logger.Error(err, "error specializing function pod, retrying", "statusCode", code, "attempt", attempt, "in", delay)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, maxDelay)
+	}
 }

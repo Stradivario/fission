@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.21.0
+    controller-gen.kubebuilder.io/version: v0.22.0
   name: kuberneteswatchtriggers.fission.io
 spec:
   group: fission.io
@@ -45,6 +45,18 @@ spec:
                   The reference to a function for kubewatcher to invoke with
                   when receiving events.
                 properties:
+                  alias:
+                    description: |-
+                      Alias, when set, targets a FunctionAlias by name instead of the live
+                      Function directly (RFC-0025): the alias is a movable pointer that the
+                      router resolves at request time to whatever FunctionVersion it
+                      currently points at, so repointing the alias (e.g. for a canary
+                      rollout or a rollback) redirects traffic without touching this
+                      reference. Valid only when Type is "name"; mutually exclusive with
+                      Version. Empty (the default) preserves today's behavior: route
+                      straight to the live Function.
+                    maxLength: 63
+                    type: string
                   functionweights:
                     additionalProperties:
                       type: integer
@@ -54,7 +66,12 @@ spec:
                     nullable: true
                     type: object
                   name:
-                    description: Name of the function.
+                    description: |-
+                      Name of the function. Bounded to a DNS-1123 label length: the CEL
+                      rule on this type needs the schema bound so the apiserver's cost
+                      estimator can price the regex — without it, embedding the type
+                      under a map (WorkflowSpec.States) blows the per-CRD cost budget.
+                    maxLength: 63
                     type: string
                   type:
                     description: |-
@@ -66,9 +83,21 @@ spec:
                       Available value:
                       - name
                       - function-weights
+                      - workflow (HTTPTrigger / TimeTrigger only: Name is a Workflow, and
+                        firing the trigger starts a WorkflowRun)
                     enum:
                     - name
                     - function-weights
+                    - workflow
+                    type: string
+                  version:
+                    description: |-
+                      Version, when set, pins this reference to one FunctionVersion CR by
+                      name (RFC-0025) — an immutable published snapshot that never moves,
+                      unlike Alias. Valid only when Type is "name"; mutually exclusive
+                      with Alias. Empty (the default) preserves today's behavior: route
+                      straight to the live Function.
+                    maxLength: 63
                     type: string
                 required:
                 - name
@@ -77,8 +106,25 @@ spec:
                 x-kubernetes-validations:
                 - message: functionref.name must be a valid DNS1123 label (lowercase
                     alphanumeric or '-', start/end alphanumeric, max 63 chars) when
-                    type is 'name'
-                  rule: self.type != 'name' || (self.name.size() <= 63 && self.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'))
+                    type is 'name' or 'workflow'
+                  rule: '!(self.type in [''name'', ''workflow'']) || (self.name.size()
+                    <= 63 && self.name.matches(''^[a-z0-9]([-a-z0-9]*[a-z0-9])?$''))'
+                - message: functionref.alias and functionref.version are mutually
+                    exclusive
+                  rule: '!((has(self.alias) && self.alias != '''') && (has(self.version)
+                    && self.version != ''''))'
+                - message: functionref.alias is only valid when type is 'name'
+                  rule: '!(has(self.alias) && self.alias != '''') || self.type ==
+                    ''name'''
+                - message: functionref.version is only valid when type is 'name'
+                  rule: '!(has(self.version) && self.version != '''') || self.type
+                    == ''name'''
+                - message: functionref.alias must be a valid DNS1123 label (lowercase
+                    alphanumeric or '-', start/end alphanumeric, max 63 chars)
+                  rule: '!(has(self.alias) && self.alias != '''') || self.alias.matches(''^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'')'
+                - message: functionref.version must be a valid DNS1123 label (lowercase
+                    alphanumeric or '-', start/end alphanumeric, max 63 chars)
+                  rule: '!(has(self.version) && self.version != '''') || self.version.matches(''^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'')'
               labelselector:
                 additionalProperties:
                   type: string
@@ -100,6 +146,9 @@ spec:
             - namespace
             - type
             type: object
+            x-kubernetes-validations:
+            - message: a kubernetes watch trigger cannot target a workflow
+              rule: self.functionref.type != 'workflow'
           status:
             description: KubernetesWatchTriggerStatus describes the observed state
               of a KubernetesWatchTrigger.

@@ -39,6 +39,7 @@ import (
 	"github.com/fission/fission/pkg/cache"
 	"github.com/fission/fission/pkg/crd"
 	ferror "github.com/fission/fission/pkg/error"
+	"github.com/fission/fission/pkg/eventhook"
 	"github.com/fission/fission/pkg/executor/executortype"
 	"github.com/fission/fission/pkg/executor/fscache"
 	"github.com/fission/fission/pkg/executor/metrics"
@@ -77,7 +78,7 @@ type (
 		nsResolver       *utils.NamespaceResolver
 
 		fissionClient  versioned.Interface
-		functionEnv    *cache.Cache[crd.CacheKeyUR, *fv1.Environment]
+		functionEnv    *cache.Cache[crd.CacheKeyUG, *fv1.Environment]
 		fsCache        *fscache.FunctionServiceCache
 		instanceID     string
 		requestChannel chan *request
@@ -128,11 +129,33 @@ type (
 		// functions are addressed via Istio services instead.
 		functionServicesEnabled bool
 
-		// fnSvcEnsured debounces ensureFunctionService per function UID (see
-		// maybeEnsureFunctionService): map[types.UID]time.Time of the last
-		// successful-or-in-flight ensure. Entries are dropped on function
-		// delete and on ensure failure (so the next request retries).
+		// fnSvcEnsured debounces ensureFunctionService per (function UID,
+		// version) -- see fnSvcKey: map[fnSvcKey]time.Time keyed on the
+		// struct (uid, versionLabel) pair (unversioned functions get
+		// version==""), holding the last successful-or-in-flight ensure per
+		// key so one version's debounce window never starves another's
+		// (RFC-0025). Entries are dropped on function delete
+		// (deleteFnSvcEnsuredForUID sweeps every version's entry for the
+		// UID) and on ensure failure (so the next request retries).
 		fnSvcEnsured sync.Map
+
+		// provisioner maintains warm specialized pods for functions opted
+		// into ProvisionedConcurrency (RFC-0026). nil if the feature is
+		// disabled (no env var config — see Step 9). Set in
+		// RegisterReconcilers after crClient is available.
+		provisioner *Provisioner
+
+		// retainedFn reports whether a live FunctionAlias still references a
+		// (function UID, generation) pin (RFC-0025 versionretain.View.Retained),
+		// forwarded to the idle reaper's PoolDeleteStrategy so it can exempt
+		// that generation from the "drain everything but the latest" rule. Set
+		// once via SetVersionRetain, from start.go, after the view is
+		// constructed; nil (never set — e.g. in tests) keeps the pre-RFC-0025
+		// behaviour.
+		retainedFn func(uid k8sTypes.UID, gen int64) bool
+
+		deployEventHook *eventhook.Dispatcher
+		deployPending   *deployPendingSet
 	}
 	request struct {
 		requestType
@@ -188,7 +211,7 @@ func MakeGenericPoolManager(ctx context.Context,
 		nsResolver:                 utils.DefaultNSResolver(),
 		metricsClient:              metricsClient,
 		fissionClient:              fissionClient,
-		functionEnv:                cache.MakeCache[crd.CacheKeyUR, *fv1.Environment](10*time.Second, 0),
+		functionEnv:                cache.MakeCache[crd.CacheKeyUG, *fv1.Environment](10*time.Second, 0),
 		fsCache:                    fscache.MakeFunctionServiceCache(gpmLogger),
 		instanceID:                 instanceID,
 		requestChannel:             make(chan *request),
@@ -202,6 +225,8 @@ func MakeGenericPoolManager(ctx context.Context,
 		podReadyTimeout:            podReadyTimeoutFromEnv(gpmLogger),
 		maxPendingSpecializations:  maxPendingSpecializationsFromEnv(gpmLogger),
 		functionServicesEnabled:    functionServicesEnabled() && !enableIstio,
+		deployEventHook:            eventhook.NewFunctionDeployDispatcher(logger),
+		deployPending:              newDeployPendingSet(),
 	}
 
 	gpm.logger.V(1).Info("inside MakeGenericPoolManager")
@@ -239,6 +264,15 @@ func (gpm *GenericPoolManager) Run(ctx context.Context, mgr *errgroup.Group) {
 		gpm.reapIdlePoolsLoop(ctx)
 		return nil
 	})
+
+	// RFC-0026 provisioned-concurrency warmer. No-op when nil (feature
+	// disabled: no env var config provided at startup).
+	if gpm.provisioner != nil {
+		mgr.Go(func() error {
+			gpm.provisioner.Run(ctx)
+			return nil
+		})
+	}
 }
 
 func (gpm *GenericPoolManager) GetTypeName(ctx context.Context) fv1.ExecutorType {
@@ -363,7 +397,7 @@ func maxPendingSpecializationsFromEnv(logger logr.Logger) int {
 // by the specialization's setValue on success or MarkSpecializationFailure on
 // failure. Rejections surface to the router (and client) as 429s.
 func (gpm *GenericPoolManager) ReserveCapacity(ctx context.Context, fnMeta *metav1.ObjectMeta, concurrency int) error {
-	err := gpm.fsCache.ReserveCapacity(crd.CacheKeyURGFromMeta(fnMeta), concurrency, gpm.maxPendingSpecializations)
+	err := gpm.fsCache.ReserveCapacity(crd.CacheKeyUGFromMeta(fnMeta), concurrency, gpm.maxPendingSpecializations)
 	if err != nil {
 		metrics.RecordSpecializationRejected(ctx, fnMeta.Name, fnMeta.Namespace)
 	}
@@ -371,7 +405,7 @@ func (gpm *GenericPoolManager) ReserveCapacity(ctx context.Context, fnMeta *meta
 }
 
 func (gpm *GenericPoolManager) UnTapService(ctx context.Context, fnMeta *metav1.ObjectMeta, svcHost string) {
-	key := crd.CacheKeyURGFromMeta(fnMeta)
+	key := crd.CacheKeyUGFromMeta(fnMeta)
 	otelUtils.SpanTrackEvent(ctx, "UnTapService",
 		attribute.KeyValue{Key: "key", Value: attribute.StringValue(key.String())},
 		attribute.KeyValue{Key: "svcHost", Value: attribute.StringValue(svcHost)})
@@ -389,7 +423,7 @@ func (gpm *GenericPoolManager) TapService(ctx context.Context, svcHost string) e
 }
 
 func (gpm *GenericPoolManager) MarkSpecializationFailure(ctx context.Context, fnMeta *metav1.ObjectMeta) {
-	key := crd.CacheKeyURGFromMeta(fnMeta)
+	key := crd.CacheKeyUGFromMeta(fnMeta)
 	otelUtils.SpanTrackEvent(ctx, "MarkSpecializationFailure",
 		attribute.KeyValue{Key: "key", Value: attribute.StringValue(key.String())})
 	// Mark the active cold-start span errored so a failed specialization shows
@@ -399,7 +433,7 @@ func (gpm *GenericPoolManager) MarkSpecializationFailure(ctx context.Context, fn
 	span.SetStatus(codes.Error, ferror.ReasonSpecializationFailed)
 	span.SetAttributes(attribute.String("coldstart.failure_reason", ferror.ReasonSpecializationFailed))
 	logger := otelUtils.LoggerWithTraceID(ctx, gpm.logger)
-	logger.Info("marking specialization failure", "key", key)
+	logger.Info("marking specialization failure", "key", key.String())
 	gpm.fsCache.MarkSpecializationFailure(key)
 }
 
@@ -431,7 +465,63 @@ func (gpm *GenericPoolManager) IsValid(ctx context.Context, fsvc *fscache.FuncSv
 	return false
 }
 
+// RefreshFuncPods deletes the function's specialized pods — every generation's —
+// so the next request re-specializes a warm pod. This is the ExecutorType
+// interface entry point, reached from the cms Secret/ConfigMap reconcilers on a
+// content change. It deliberately recycles alias-retained (RFC-0025) generations
+// too: Secrets/ConfigMaps are referenced by NAME (their contents are not part of
+// a FunctionVersion snapshot), and retained pods are exempt from the idle reaper
+// (versionretain), so this refresh is the only path that ever gets rotated
+// Secret/ConfigMap data into an alias-pinned version's pods — sparing them here
+// would leave e.g. revoked credentials live indefinitely. The Function
+// reconciler's spec-change refresh instead goes through refreshFuncPods
+// (funchandlers.go), which spares retained generations.
 func (gpm *GenericPoolManager) RefreshFuncPods(ctx context.Context, logger logr.Logger, f fv1.Function) error {
+	return gpm.refreshFuncPodsFiltered(ctx, logger, f, nil)
+}
+
+// refreshSparesPod reports whether a refresh driven by the live Function f must
+// leave a listed specialized pod alone: the pod belongs to a generation OTHER
+// than f's own that a live FunctionAlias still pins (RFC-0025 warm rollback —
+// deleting it would knock out the pinned version's warm capacity and 5xx
+// in-flight alias traffic on every live deploy). retained is
+// versionretain.View.Retained (or nil = spare nothing, the pre-RFC-0025
+// behaviour).
+//
+// Pods of f's OWN generation are never spared, retained or not: the refresh is
+// the only mechanism that recycles the live generation's stale-spec pods (a
+// just-bumped spec, env update, rotated ConfigMap), and a pod labelled with the
+// new live generation re-specializes to an identical spec anyway. A pod with a
+// missing or unparsable fv1.FUNCTION_GENERATION label recycles too: the only
+// path that labels a specialized pod (choosePod's relabel via
+// specializedPodLabels, gp_pod.go) has stamped the generation since RFC-0002,
+// which predates versioning — so a label-less pod is pre-migration legacy and
+// cannot be a pinned version's pod.
+func refreshSparesPod(podLabels map[string]string, f *fv1.Function, retained func(uid k8sTypes.UID, gen int64) bool) bool {
+	if retained == nil {
+		return false
+	}
+	genStr, ok := podLabels[fv1.FUNCTION_GENERATION]
+	if !ok {
+		return false
+	}
+	gen, err := strconv.ParseInt(genStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	if gen == f.Generation {
+		return false
+	}
+	return retained(f.UID, gen)
+}
+
+// refreshFuncPodsFiltered is RefreshFuncPods' body with the RFC-0025 retain
+// filter injected: pods whose generation label names an alias-retained
+// generation other than f's own survive the refresh (see refreshSparesPod).
+// The predicate is a parameter — not read from gpm.retainedFn — so each caller
+// states explicitly whether it spares (Function reconciler) or recycles
+// everything (cms Secret/ConfigMap refresh, nil).
+func (gpm *GenericPoolManager) refreshFuncPodsFiltered(ctx context.Context, logger logr.Logger, f fv1.Function, retained func(uid k8sTypes.UID, gen int64) bool) error {
 
 	env, err := gpm.fissionClient.CoreV1().Environments(f.Spec.Environment.Namespace).Get(ctx, f.Spec.Environment.Name, metav1.GetOptions{})
 	if err != nil {
@@ -465,6 +555,15 @@ func (gpm *GenericPoolManager) RefreshFuncPods(ctx context.Context, logger logr.
 	}
 
 	for _, po := range podList.Items {
+		if refreshSparesPod(po.Labels, &f, retained) {
+			logger.V(1).Info("refresh sparing alias-retained generation's pod",
+				"pod", po.Name,
+				"pod_generation", po.Labels[fv1.FUNCTION_GENERATION],
+				"function", f.Name,
+				"namespace", f.Namespace,
+				"live_generation", f.Generation)
+			continue
+		}
 		err := gpm.kubernetesClient.CoreV1().Pods(po.ObjectMeta.Namespace).Delete(ctx, po.Name, metav1.DeleteOptions{})
 		if k8serrors.IsNotFound(err) {
 			return nil
@@ -527,8 +626,13 @@ func (gpm *GenericPoolManager) adoptPools(ctx context.Context, wg *sync.WaitGrou
 	for _, namespace := range utils.DefaultNSResolver().FissionResourceNamespaces() {
 		envs, err := gpm.fissionClient.CoreV1().Environments(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			gpm.logger.Error(err, "error getting environment list")
-			return envMap
+			// continue, not return: a truncated envMap is not merely
+			// incomplete — every specialized pod whose env is missing from it
+			// fails adoption, goes unstamped, and is DELETED by the cleanup
+			// pass that follows. One namespace's transient list failure must
+			// not cost another namespace its warm pods.
+			gpm.logger.Error(err, "error getting environment list", "namespace", namespace)
+			continue
 		}
 
 		for i := range envs.Items {
@@ -595,19 +699,33 @@ func (gpm *GenericPoolManager) adoptSpecializedPods(ctx context.Context, wg *syn
 		fv1.EXECUTOR_TYPE: string(fv1.ExecutorTypePoolmgr),
 	}
 
-	for _, namespace := range utils.DefaultNSResolver().FissionResourceNamespaces() {
+	// FunctionNamespaces, not FissionResourceNamespaces: pool pods live in the
+	// FUNCTION namespace (GetFunctionNS), and the post-adopt reaper sweeps a
+	// superset of it. Iterating the CR namespaces here meant a split-namespace
+	// install (FISSION_FUNCTION_NAMESPACE set) adopted NOTHING while the
+	// reaper deleted everything — adopt coverage must be ⊇ what cleanup can
+	// reach, and this is the set that makes that hold.
+	for _, namespace := range gpm.nsResolver.FunctionNamespaces() {
 		podList, err := gpm.kubernetesClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: labels.Set(l).AsSelector().String(),
 		})
 
 		if err != nil {
-			gpm.logger.Error(err, "error getting pod list")
-			return
+			gpm.logger.Error(err, "error getting pod list", "namespace", namespace)
+			continue
 		}
 
 		for i := range podList.Items {
 			pod := &podList.Items[i]
-			if !utils.IsReadyPod(pod) {
+			// Active, not Ready: a pod that blips not-Ready during the ≤30s
+			// adopt window must still be adopted — an fsCache entry is what
+			// gives the idle reaper ownership of it, and IsValid already
+			// gates every cached hand-out on live readiness. Skipping it
+			// here meant the post-adopt reaper deleted it instead (the
+			// annotation was never re-stamped), turning a readiness blip
+			// into a killed warm pod. Only terminal or already-deleting
+			// pods are skipped.
+			if !IsPodActive(pod) {
 				continue
 			}
 
@@ -615,18 +733,30 @@ func (gpm *GenericPoolManager) adoptSpecializedPods(ctx context.Context, wg *syn
 				// avoid too many requests arrive Kubernetes API server at the same time.
 				time.Sleep(time.Duration(rand.Intn(30)) * time.Millisecond)
 
-				patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`, fv1.EXECUTOR_INSTANCEID_LABEL, gpm.instanceID)
-				// Locals, not the loop-level pod/err: these goroutines run
-				// concurrently and writes to shared captures would race.
-				pod, perr := gpm.kubernetesClient.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name, k8sTypes.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
-				if perr != nil {
-					// just log the error since it won't affect the function serving
-					gpm.logger.Error(perr, "error patching executor instance ID of pod", "pod", pod.Name, "ns", pod.Namespace)
-					return
+				// stamp re-marks the pod as owned by THIS executor instance,
+				// which is exactly what shields it from CleanupPods. It runs
+				// AFTER the adoption checks below for specialized pods:
+				// stamping first and then failing a check minted a class of
+				// pods that were protected from cleanup but never registered
+				// in fsCache — invisible to the idle reaper, leaked until a
+				// human noticed. An unstamped pod that fails adoption is
+				// recycled by the post-adopt cleanup pass, which is the
+				// correct fate for it.
+				stamp := func(p *apiv1.Pod) (*apiv1.Pod, bool) {
+					patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"}}}`, fv1.EXECUTOR_INSTANCEID_LABEL, gpm.instanceID)
+					claimed, perr := gpm.kubernetesClient.CoreV1().Pods(p.Namespace).Patch(ctx, p.Name, k8sTypes.StrategicMergePatchType, []byte(patch), metav1.PatchOptions{})
+					if perr != nil {
+						// just log the error since it won't affect the function serving
+						gpm.logger.Error(perr, "error patching executor instance ID of pod", "pod", p.Name, "ns", p.Namespace)
+						return nil, false
+					}
+					return claimed, true
 				}
 
-				// for unspecialized pod, we only update its annotations
+				// for unspecialized (warm generic) pod, the annotation is all
+				// there is to adopt.
 				if pod.Labels["managed"] == "true" {
+					stamp(pod)
 					return
 				}
 
@@ -638,14 +768,88 @@ func (gpm *GenericPoolManager) adoptSpecializedPods(ctx context.Context, wg *syn
 				envNS, ok6 := pod.Labels[fv1.ENVIRONMENT_NAMESPACE]
 				svcHost, ok7 := pod.Annotations[fv1.ANNOTATION_SVC_HOST]
 				env, ok8 := envMap[fmt.Sprintf("%s/%s", envNS, envName)]
-
 				if !ok1 || !ok2 || !ok3 || !ok4 || !ok5 || !ok6 || !ok7 || !ok8 {
 					gpm.logger.Info("failed to adopt pod for function due to lack of necessary information",
 						"pod", pod.Name, "labels", pod.Labels, "annotations", pod.Annotations,
 						"env", env.Name)
 					return
 				}
+				// The pod must belong to the LIVE environment on its CURRENT
+				// runtime: adopting across a delete+recreate, or across an
+				// env change that landed while the executor was down,
+				// registers a pod whose runtime predates the CR. Skip (no
+				// stamp) -> the post-adopt reaper recycles it. Shared with
+				// the RS-cleanup path (envLabelsMatchLiveEnv) so the two
+				// cannot disagree about which pods deserve to live.
+				if !envLabelsMatchLiveEnv(pod.Labels, &env) {
+					gpm.logger.Info("not adopting pod: its labels no longer describe the live environment",
+						"pod", pod.Name,
+						"podEnvUID", pod.Labels[fv1.ENVIRONMENT_UID], "liveEnvUID", string(env.UID),
+						"podEnvRuntimeHash", pod.Labels[fv1.ENVIRONMENT_RUNTIME_HASH], "liveEnvRuntimeHash", envRuntimeHash(&env))
+					return
+				}
+				// All label/annotation checks passed: claim the pod, then
+				// read the post-patch object below (fresh ResourceVersion)
+				// exactly as the pre-restructure code did.
+				claimed, ok := stamp(pod)
+				if !ok {
+					return
+				}
+				pod = claimed
 
+				// fsCache keys on (UID, Generation), not ResourceVersion (see
+				// #3596 and functionServiceCache.go's UR->UG migration). A synthetic
+				// ObjectMeta left at the zero-value Generation would key this
+				// entry as (UID, 0), which no live Function (Generation >= 1)
+				// can ever match — GetByFunction would deterministically miss
+				// every adopted pod, leaking stale byFunction/byAddress
+				// entries until TTL reap. Parse it from the pod's
+				// FUNCTION_GENERATION label (stamped at specialization time,
+				// gp_pod.go's specializedPodLabels). When the label is missing
+				// or malformed — a pod specialized by a release predating the
+				// label, still warm during a rolling upgrade — fall back to
+				// the live Function's CURRENT generation instead of skipping:
+				// on a completed rollout there is no old-code replica left to
+				// adopt a skipped pod, so skipping every pre-label pod turns
+				// the upgrade window AdoptExistingResources exists to smooth
+				// into a cluster-wide cold-start spike. The fallback guards on
+				// UID so a pod belonging to a deleted-and-recreated function
+				// of the same name is never adopted against the new Function.
+				var fnGen int64
+				genParsed := false
+				if fnGenStr, ok := pod.Labels[fv1.FUNCTION_GENERATION]; ok {
+					g, perr := strconv.ParseInt(fnGenStr, 10, 64)
+					if perr == nil {
+						fnGen = g
+						genParsed = true
+					} else {
+						gpm.logger.Error(perr, "unparsable function-generation label, falling back to the live Function's generation",
+							"pod", pod.Name, "value", fnGenStr)
+					}
+				}
+				if !genParsed {
+					fn, gerr := gpm.fissionClient.CoreV1().Functions(fnNS).Get(ctx, fnName, metav1.GetOptions{})
+					if gerr != nil {
+						gpm.logger.Error(gerr, "failed to adopt pod for function: no usable function-generation label and live Function lookup failed",
+							"pod", pod.Name, "function", fnName, "ns", fnNS)
+						return
+					}
+					if string(fn.UID) != fnUID {
+						gpm.logger.Info("failed to adopt pod for function: pod's function UID does not match the live Function (name reused)",
+							"pod", pod.Name, "podFunctionUID", fnUID, "liveFunctionUID", string(fn.UID))
+						return
+					}
+					fnGen = fn.Generation
+				}
+
+				// Carry the pod's version label into the synthetic meta:
+				// GetLiveByFunctionUID classifies entries as live by the
+				// ABSENCE of FUNCTION_VERSION, so an adopted versioned pod's
+				// entry must keep the label or it masquerades as live.
+				var fnLabels map[string]string
+				if v := pod.Labels[fv1.FUNCTION_VERSION]; v != "" {
+					fnLabels = map[string]string{fv1.FUNCTION_VERSION: v}
+				}
 				fsvc := fscache.FuncSvc{
 					Name: pod.Name,
 					Function: &metav1.ObjectMeta{
@@ -653,6 +857,8 @@ func (gpm *GenericPoolManager) adoptSpecializedPods(ctx context.Context, wg *syn
 						Namespace:       fnNS,
 						UID:             k8sTypes.UID(fnUID),
 						ResourceVersion: fnRV,
+						Generation:      fnGen,
+						Labels:          fnLabels,
 					},
 					Environment: &env,
 					Address:     svcHost,
@@ -671,13 +877,21 @@ func (gpm *GenericPoolManager) adoptSpecializedPods(ctx context.Context, wg *syn
 					Atime:    time.Now(),
 				}
 
-				if _, aerr := gpm.fsCache.Add(fsvc); aerr != nil {
-					// If fsvc already exists we just skip the duplicate one. And let reaper to recycle the duplicate pods.
-					// This is for the case that there are multiple function pods for the same function due to unknown reason.
-					if !fscache.IsNameExistError(aerr) {
-						gpm.logger.Error(aerr, "failed to adopt pod for function", "pod", pod.Name)
-					}
-
+				existing, aerr := gpm.fsCache.Add(fsvc)
+				if aerr != nil {
+					gpm.logger.Error(aerr, "failed to adopt pod for function", "pod", pod.Name)
+					return
+				}
+				if existing != nil {
+					// Add DEDUPS by (function UID, generation) and returns the
+					// incumbent with a NIL error — the old IsNameExistError
+					// branch here was dead code. This pod is stamped (shielded
+					// from cleanup) but has no cache identity, so no reaper
+					// owns it; it is recycled only by a Function update or an
+					// env change. Pre-existing behaviour, now at least said
+					// out loud instead of silently minted.
+					gpm.logger.Info("adopt: duplicate specialized pod for function generation; pod has no cache identity",
+						"pod", pod.Name, "incumbent", existing.Name)
 					return
 				}
 
@@ -764,7 +978,7 @@ func (gpm *GenericPoolManager) handleGetPool(req *request) {
 		pool = MakeGenericPool(gpm.logger, gpm.fissionClient, gpm.kubernetesClient,
 			gpm.metricsClient, req.env, ns, gpm.fsCache,
 			gpm.fetcherConfig, gpm.instanceID, gpm.enableIstio, gpm.podSpecPatch, gpm.crClient, req.oci,
-			gpm.podReadyTimeout)
+			gpm.podReadyTimeout, gpm.deployEventHook, gpm.deployPending)
 		err = pool.setup(req.ctx)
 		if err != nil {
 			req.responseChannel <- &response{error: err}
@@ -874,16 +1088,30 @@ func (gpm *GenericPoolManager) cleanupPool(ctx context.Context, env *fv1.Environ
 // markFuncDeleted marks a function's pool service entries deleted in the fsCache
 // so the idle reaper recycles its specialized pods. Driven by the Function
 // reconciler on delete.
-func (gpm *GenericPoolManager) markFuncDeleted(key crd.CacheKeyURG) {
+func (gpm *GenericPoolManager) markFuncDeleted(key crd.CacheKeyUG) {
 	gpm.fsCache.MarkFuncDeleted(key)
-	gpm.fnSvcEnsured.Delete(key.UID)
+	gpm.deleteFnSvcEnsuredForUID(key.UID)
+}
+
+// deleteFnSvcEnsuredForUID drops every fnSvcEnsured debounce entry for a
+// deleted function's UID, across every version -- fnSvcKey composes (UID,
+// version), and a delete only knows the UID (crd.CacheKeyUG carries no
+// version), so a plain Delete(uid) can no longer find every per-version key.
+// Cost is one full Range per function delete, an infrequent path.
+func (gpm *GenericPoolManager) deleteFnSvcEnsuredForUID(uid k8sTypes.UID) {
+	gpm.fnSvcEnsured.Range(func(k, _ any) bool {
+		if key, ok := k.(fnSvcKey); ok && key.uid == uid {
+			gpm.fnSvcEnsured.Delete(k)
+		}
+		return true
+	})
 }
 
 // processReplicaSet reaps a pool's specialized pods when its ReplicaSet has
 // scaled to zero. Driven by the ReplicaSet reconciler; delegates to the pool pod
 // controller, which owns the specialized-pod cleanup queue.
-func (gpm *GenericPoolManager) processReplicaSet(ctx context.Context, rs *appsv1.ReplicaSet) {
-	gpm.poolPodC.processRS(ctx, rs)
+func (gpm *GenericPoolManager) processReplicaSet(ctx context.Context, rs *appsv1.ReplicaSet) error {
+	return gpm.poolPodC.processRS(ctx, rs)
 }
 
 // readyPodEnqueueDelay debounces a warm pod's entry into its readyPodQueue.
@@ -983,7 +1211,10 @@ func (gpm *GenericPoolManager) reconcileEnvPool(ctx context.Context, env *fv1.En
 	if errs != nil {
 		return errs
 	}
-	// Any specialized pods are recycled by the ReplicaSet → cleanup path.
+	// Specialized pods on the OLD template are recycled by the ReplicaSet →
+	// cleanup path — which since RFC-0028 keys on the ENVIRONMENT_GENERATION
+	// template label, so only an env-spec change (this function's trigger)
+	// recycles them; an executor-side template roll leaves them serving.
 	return nil
 }
 
@@ -1012,7 +1243,12 @@ func (gpm *GenericPoolManager) getFunctionEnv(ctx context.Context, fn *fv1.Funct
 
 	// Cached ?
 	// TODO: the cache should be able to search by <env name, fn namespace> instead of function metadata.
-	result, err := gpm.functionEnv.Get(crd.CacheKeyURFromMeta(&fn.ObjectMeta))
+	// Keyed on UID+Generation, not ResourceVersion (see #3596): the
+	// function's environment reference only changes on a spec update, so
+	// keying on RV (which also moves on status-only writes) would miss
+	// this cache on every status update and re-fetch the environment for
+	// no reason.
+	result, err := gpm.functionEnv.Get(crd.CacheKeyUGFromMeta(&fn.ObjectMeta))
 	if err == nil {
 		return result, nil
 	}
@@ -1029,7 +1265,7 @@ func (gpm *GenericPoolManager) getFunctionEnv(ctx context.Context, fn *fv1.Funct
 
 	// cache for future lookups
 	m := fn.ObjectMeta
-	_, err = gpm.functionEnv.Set(crd.CacheKeyURFromMeta(&m), env)
+	_, err = gpm.functionEnv.Set(crd.CacheKeyUGFromMeta(&m), env)
 	if err != nil {
 		gpm.logger.Error(err,
 			"failed to set the key", "function", fn.Name,
@@ -1042,13 +1278,23 @@ func (gpm *GenericPoolManager) getFunctionEnv(ctx context.Context, fn *fv1.Funct
 // pods), run by the shared idle reaper.
 func (gpm *GenericPoolManager) IdleStrategy() idle.Strategy {
 	return idle.NewPoolDeleteStrategy(gpm.logger, gpm.fissionClient, gpm.fsCache, gpm.kubernetesClient,
-		gpm.defaultIdlePodReapTime, gpm.objectReaperIntervalSecond, gpm.functionServicesEnabled)
+		gpm.defaultIdlePodReapTime, gpm.objectReaperIntervalSecond, gpm.functionServicesEnabled, gpm.retainedFn)
+}
+
+// SetVersionRetain wires the RFC-0025 alias-retain view's Retained method (or
+// any equivalent func) into the idle reaper's drain decision — see
+// IdleStrategy and idle.PoolDeleteStrategy.retained. Called once from
+// start.go after both the pool manager and the view exist. Not calling it
+// (e.g. in tests that construct a GenericPoolManager directly) keeps the
+// pre-RFC-0025 behaviour: every non-latest generation drains.
+func (gpm *GenericPoolManager) SetVersionRetain(retained func(uid k8sTypes.UID, gen int64) bool) {
+	gpm.retainedFn = retained
 }
 
 // WebsocketStartEventChecker checks if the pod has emitted a websocket connection start event
 func (gpm *GenericPoolManager) WebsocketStartEventChecker(ctx context.Context, kubeClient kubernetes.Interface) error {
 	var wg wait.Group
-	for _, informer := range utils.GetInformerEventChecker(ctx, kubeClient, "WsConnectionStarted") {
+	for _, informer := range utils.GetInformerEventChecker(kubeClient, "WsConnectionStarted") {
 		_, err := informer.AddEventHandler(k8sCache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj any) {
 				mObj := obj.(metav1.Object)
@@ -1078,7 +1324,7 @@ func (gpm *GenericPoolManager) WebsocketStartEventChecker(ctx context.Context, k
 // NoActiveConnectionEventChecker checks if the pod has emitted an inactive event
 func (gpm *GenericPoolManager) NoActiveConnectionEventChecker(ctx context.Context, kubeClient kubernetes.Interface) error {
 	var wg wait.Group
-	for _, informer := range utils.GetInformerEventChecker(ctx, kubeClient, "NoActiveConnections") {
+	for _, informer := range utils.GetInformerEventChecker(kubeClient, "NoActiveConnections") {
 		_, err := informer.AddEventHandler(k8sCache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj any) {
 				mObj := obj.(metav1.Object)

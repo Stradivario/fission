@@ -32,6 +32,20 @@ type BuilderApplyConfiguration struct {
 	Container *corev1.Container `json:"container,omitempty"`
 	// PodSpec will store the spec of the pod that will be applied to the pod created for the builder
 	PodSpec *corev1.PodSpec `json:"podspec,omitempty"`
+	// IdleTimeout specifies the length of time (in seconds) that a builder is idle
+	// before it is eligible for scaling to zero. If no builds are triggered within
+	// the idle timeout, the builder deployment will be scaled to zero to release resources.
+	// Defaults to 600 seconds (10 minutes) if not set.
+	IdleTimeout *int64 `json:"idleTimeout,omitempty"`
+	// PoolSize is the MAXIMUM number of builder pods for this environment.
+	// Builder pods are provisioned on demand — one dedicated pod per
+	// concurrent package build — and scaled up to this cap as concurrent
+	// builds arrive, then scaled back to zero by the idle reaper once builds
+	// stop. It is a ceiling, not a fixed replica count: building a single
+	// package always uses a single pod regardless of this value. Each pod is
+	// an independent isolation domain, so an OOM in one build does not affect
+	// the others. Defaults to 1 if not set or less than 1.
+	PoolSize *int32 `json:"poolsize,omitempty"`
 }
 
 // BuilderApplyConfiguration constructs a declarative configuration of the Builder type for use with
@@ -69,5 +83,21 @@ func (b *BuilderApplyConfiguration) WithContainer(value corev1.Container) *Build
 // If called multiple times, the PodSpec field is set to the value of the last call.
 func (b *BuilderApplyConfiguration) WithPodSpec(value corev1.PodSpec) *BuilderApplyConfiguration {
 	b.PodSpec = &value
+	return b
+}
+
+// WithIdleTimeout sets the IdleTimeout field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the IdleTimeout field is set to the value of the last call.
+func (b *BuilderApplyConfiguration) WithIdleTimeout(value int64) *BuilderApplyConfiguration {
+	b.IdleTimeout = &value
+	return b
+}
+
+// WithPoolSize sets the PoolSize field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the PoolSize field is set to the value of the last call.
+func (b *BuilderApplyConfiguration) WithPoolSize(value int32) *BuilderApplyConfiguration {
+	b.PoolSize = &value
 	return b
 }

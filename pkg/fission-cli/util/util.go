@@ -6,7 +6,7 @@ package util
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +36,7 @@ import (
 	flagkey "github.com/fission/fission/pkg/fission-cli/flag/key"
 	"github.com/fission/fission/pkg/info"
 	"github.com/fission/fission/pkg/plugin"
+	"github.com/fission/fission/pkg/svcinfo"
 )
 
 const (
@@ -191,7 +192,7 @@ func GetServerInfo(input cli.Input, cmdClient cmd.Client) *info.ServerInfo {
 		return &serverInfo
 	}
 
-	err = json.NewDecoder(resp.Body).Decode(&serverInfo)
+	err = json.UnmarshalRead(resp.Body, &serverInfo)
 	if err != nil {
 		console.Warn(fmt.Sprintf("Error getting Fission API version: %v", err))
 		serverInfo = info.ServerInfo{}
@@ -217,6 +218,39 @@ func GetRouterURL(ctx context.Context, cmdClient cmd.Client) (serverURL *url.URL
 		return serverURL, err
 	}
 	return serverURL, err
+}
+
+// GetRouterInternalURL resolves the router's internal listener — the ClusterIP-only
+// svc/router-internal that serves /fission-function/<ns>/<name>. Requests to it are
+// HMAC-signed (ServiceRouterInternal) when authentication is enabled, so it is used
+// by the RFC-0024 async direct-invocation path (`fission function test --async`).
+// FISSION_ROUTER_INTERNAL_URL overrides it (a hand-managed forward or non-default
+// install); otherwise it port-forwards to the router pods on the internal port,
+// which must be addressed explicitly because the public and internal Services share
+// the application=fission-router selector.
+func GetRouterInternalURL(ctx context.Context, cmdClient cmd.Client) (*url.URL, error) {
+	if u := os.Getenv("FISSION_ROUTER_INTERNAL_URL"); u != "" {
+		return url.Parse(u)
+	}
+	localPort, err := SetupPortForwardToPort(ctx, cmdClient, GetFissionNamespace(), "application=fission-router", svcinfo.PortRouterInternal)
+	if err != nil {
+		return nil, err
+	}
+	return url.Parse(fmt.Sprintf("%s%s", localhostURL, localPort))
+}
+
+// GetStateSvcURL locates the RFC-0023 statesvc head for the `fn state` admin
+// commands: env override first (hand-managed forwards / tests), else an
+// in-process port-forward to a statesvc pod.
+func GetStateSvcURL(ctx context.Context, cmdClient cmd.Client) (*url.URL, error) {
+	if u := os.Getenv("FISSION_STATESVC_URL"); u != "" {
+		return url.Parse(u)
+	}
+	localPort, err := SetupPortForwardToPort(ctx, cmdClient, GetFissionNamespace(), "application=fission-statesvc", svcinfo.PortStateSvc)
+	if err != nil {
+		return nil, err
+	}
+	return url.Parse(fmt.Sprintf("%s%s", localhostURL, localPort))
 }
 
 func GetResourceReqs(input cli.Input, resReqs *v1.ResourceRequirements) (*v1.ResourceRequirements, error) {

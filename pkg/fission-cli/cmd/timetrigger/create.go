@@ -48,8 +48,16 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 	}
 
 	fnName := input.String(flagkey.TtFnName)
-	if len(fnName) == 0 {
-		return errors.New("need a function name to create a trigger, use --function")
+	workflow := input.String(flagkey.TriggerWorkflow)
+	switch {
+	case workflow != "" && fnName != "":
+		return errors.New("use either --workflow or --function, not both")
+	case workflow == "" && fnName == "":
+		return errors.New("need a function name to create a trigger, use --function (or --workflow)")
+	}
+	workflowInput, err := readWorkflowInput(input)
+	if err != nil {
+		return err
 	}
 
 	userProvidedNS, fnNamespace, err := opts.GetResourceNamespace(input)
@@ -62,7 +70,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 		return errors.New("need a cron spec like '30 * * * *', '@every 1h30m', or '@hourly'; use --cron")
 	}
 
-	if input.Bool(flagkey.SpecSave) {
+	if input.Bool(flagkey.SpecSave) && workflow == "" {
 		specDir := util.GetSpecDir(input)
 		specIgnore := util.GetSpecIgnore(input)
 		fr, err := spec.ReadSpecs(specDir, specIgnore, false)
@@ -70,7 +78,7 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 			return fmt.Errorf("error reading spec in '%v': %w", specDir, err)
 		}
 
-		exists, err := fr.ExistsInSpecs(fv1.Function{
+		exists, err := fr.ExistsInSpecs(&fv1.Function{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fnName,
 				Namespace: userProvidedNS,
@@ -109,13 +117,20 @@ func (opts *CreateSubCommand) complete(input cli.Input) (err error) {
 			Subpath: input.String(flagkey.FnSubPath),
 		},
 	}
+	if workflow != "" {
+		opts.trigger.Spec.FunctionReference = fv1.FunctionReference{
+			Type: fv1.FunctionReferenceTypeWorkflow,
+			Name: workflow,
+		}
+		opts.trigger.Spec.WorkflowInput = workflowInput
+	}
 
 	return nil
 }
 
 func (opts *CreateSubCommand) run(input cli.Input) error {
 	// if we're writing a spec, don't call the API; save/print and return.
-	if handled, err := spec.SaveOrDry(input, *opts.trigger, fmt.Sprintf("timetrigger-%v.yaml", opts.trigger.Name)); handled {
+	if handled, err := spec.SaveOrDry(input, opts.trigger, fmt.Sprintf("timetrigger-%v.yaml", opts.trigger.Name)); handled {
 		return err
 	}
 
