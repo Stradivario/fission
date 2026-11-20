@@ -1081,9 +1081,18 @@ storagesvc:
       maxSurge: 25%
       maxUnavailable: 25%
 
-  ## Archive pruner removes archives from storage which are not referenced by any package.
+  ## Archive pruner removes archives from storage which are not referenced by
+  ## any Package in ANY namespace (storagesvc needs cluster-wide `list
+  ## packages`, granted by templates/storagesvc/clusterrole-packages.yaml).
+  ## OFF by default and dry run by default: switch dryRun off only after the
+  ## plan (GET /v1/prune/plan on storagesvc) lists what you expect.
   archivePruner:
-    enabled: true
+    enabled: false
+    ## true = compute + expose the plan, delete nothing
+    dryRun: true
+    ## an unreferenced archive younger than this is never deleted (an upload
+    ## no package references yet)
+    minAgeHours: 168
     ## Run prune routine at interval (in minutes)
     interval: 60
     ## Safety cap: refuse to delete more than this many archives in a single

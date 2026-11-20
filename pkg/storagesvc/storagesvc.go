@@ -45,6 +45,8 @@ type (
 
 	// StorageService is a struct to hold all things for storage service
 	StorageService struct {
+		// pruner is set when the archive pruner runs (GET /v1/prune/plan).
+		pruner        *ArchivePruner
 		logger        logr.Logger
 		storageClient *StorageClient
 		// authSecret, if non-empty, enables HMAC enforcement on /v1/archive.
@@ -59,6 +61,13 @@ type (
 
 	UploadResponse struct {
 		ID string `json:"id"`
+	}
+
+	// ArchiveDetail is one entry of GET /v1/archive?details=true.
+	ArchiveDetail struct {
+		ID           string    `json:"id"`
+		Size         int64     `json:"size"`
+		LastModified time.Time `json:"lastModified"`
 	}
 )
 
@@ -86,6 +95,32 @@ func (ss *StorageService) listItems(w http.ResponseWriter, r *http.Request) {
 	// get all archives on storage
 	// out of them, there may be some just created but not referenced by packages yet.
 	// need to filter them out.
+	// ?details=true: id + size + last-modified per archive (storage per
+	// project for the platform's admin views); same tenant scoping.
+	if r.URL.Query().Get("details") == "true" {
+		items, err := ss.storageClient.getItemsWithFilter(ss.storageClient.filterAllItems)
+		if err != nil {
+			logger.Error(err, "error getting items from storage")
+			http.Error(w, "error listing archives", http.StatusInternalServerError)
+			return
+		}
+		authNS, _ := hmacauth.AuthenticatedNamespace(r.Context())
+		details := make([]ArchiveDetail, 0, len(items))
+		for _, it := range items {
+			if authNS != "" && archiveNamespace(it.id) != authNS {
+				continue
+			}
+			details = append(details, ArchiveDetail{ID: it.id, Size: it.size, LastModified: it.lastMod})
+		}
+		resp, err := json.Marshal(details)
+		if err != nil {
+			http.Error(w, "error marshaling item list", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(resp)
+		return
+	}
 	archivesInStorage, err := ss.storageClient.getItemIDsWithFilter(ss.storageClient.filterAllItems)
 	if err != nil {
 		logger.Error(err, "error getting items from storage")
@@ -389,6 +424,9 @@ func (ss *StorageService) makeHandler() http.Handler {
 	m.HandleFunc("/v1/archive", ss.getOrListHandler).Methods("GET")
 	m.HandleFunc("/v1/archive", ss.deleteHandler).Methods("DELETE")
 	m.HandleFunc("/v1/archive", ss.infoHandler).Methods("HEAD")
+	// what the archive pruner would delete / deleted on its last cycle
+	// (master callers only - the pruner sees every tenant's archives).
+	m.HandleFunc("/v1/prune/plan", ss.prunePlanHandler).Methods("GET")
 	m.HandleFunc("/healthz", ss.healthHandler).Methods("GET")
 
 	// Storagesvc is router/builder/function-pod internal per
@@ -449,10 +487,22 @@ type Options struct {
 
 // Start runs the storage service.
 func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger logr.Logger, storage Storage, mgr *errgroup.Group, opts Options) error {
+	// OFF unless explicitly enabled: an upgrade that drops the variable must
+	// never start deleting archives (it used to default to true).
 	enablePruner, err := strconv.ParseBool(os.Getenv("PRUNE_ENABLED"))
 	if err != nil {
-		logger.Error(err, "PRUNE_ENABLED value not set. Enabling archive pruner by default.")
-		enablePruner = true
+		logger.Info("PRUNE_ENABLED not set - archive pruner disabled")
+		enablePruner = false
+	}
+	// dry run unless explicitly turned off: the pruner computes and exposes
+	// its plan (GET /v1/prune/plan) and deletes nothing.
+	dryRun, err := strconv.ParseBool(os.Getenv("PRUNE_DRY_RUN"))
+	if err != nil {
+		dryRun = true
+	}
+	minAgeHours, err := strconv.Atoi(os.Getenv("PRUNE_MIN_AGE_HOURS"))
+	if err != nil || minAgeHours < 1 {
+		minAgeHours = defaultMinAgeHours
 	}
 	// create a storage client
 	storageClient, err := MakeStorageClient(logger, storage)
@@ -492,6 +542,11 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 		if err != nil {
 			return fmt.Errorf("error creating archivePruner: %w", err)
 		}
+		pruner.dryRun = dryRun
+		pruner.minAge = time.Duration(minAgeHours) * time.Hour
+		storageService.pruner = pruner
+		logger.Info("archive pruner enabled", "dry_run", dryRun, "min_age_hours", minAgeHours,
+			"interval_minutes", pruneInterval, "max_orphans_per_cycle", maxOrphansPerCycle)
 		mgr.Go(func() error {
 			pruner.Start(ctx, mgr)
 			return nil
@@ -500,4 +555,25 @@ func Start(ctx context.Context, clientGen crd.ClientGeneratorInterface, logger l
 
 	logger.Info("storage service started")
 	return nil
+}
+
+// prunePlanHandler returns the archive pruner's last cycle: what it would
+// delete (dry run) or deleted, and why a cycle was skipped. Master callers
+// only - a tenant key must not see other tenants' archive ids.
+func (ss *StorageService) prunePlanHandler(w http.ResponseWriter, r *http.Request) {
+	if authNS, _ := hmacauth.AuthenticatedNamespace(r.Context()); authNS != "" {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if ss.pruner == nil {
+		http.Error(w, "archive pruner disabled (PRUNE_ENABLED=false)", http.StatusNotFound)
+		return
+	}
+	resp, err := json.Marshal(ss.pruner.LastPlan())
+	if err != nil {
+		http.Error(w, "error marshaling prune plan", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(resp)
 }

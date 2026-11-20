@@ -21,6 +21,8 @@ type objectInfo struct {
 	// lastMod is the object's last-modified time, used by the archive pruner
 	// to skip recently created (not-yet-referenced) archives.
 	lastMod time.Time
+	// size in bytes (GET /v1/archive?details=true: storage per project).
+	size int64
 }
 
 // objectStore is an internal abstraction over the two supported storage

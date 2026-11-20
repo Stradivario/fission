@@ -7,6 +7,7 @@ package storagesvc
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/fission/fission/pkg/crd"
 	"github.com/fission/fission/pkg/generated/clientset/versioned"
-	"github.com/fission/fission/pkg/utils"
 )
 
 type ArchivePruner struct {
@@ -26,7 +26,47 @@ type ArchivePruner struct {
 	storageClient      *StorageClient
 	pruneInterval      time.Duration
 	maxOrphansPerCycle int
+	// dryRun: compute the plan, delete nothing (default when PRUNE_DRY_RUN
+	// is unset).
+	dryRun bool
+	// minAge: an unreferenced archive younger than this is never a candidate
+	// (an upload a package does not reference yet).
+	minAge time.Duration
+
+	planMu   sync.Mutex
+	lastPlan PrunePlan
 }
+
+// PrunePlan is the result of the last prune cycle (GET /v1/prune/plan).
+type PrunePlan struct {
+	At            time.Time `json:"at"`
+	DryRun        bool      `json:"dryRun"`
+	MinAgeHours   float64   `json:"minAgeHours"`
+	Referenced    int       `json:"referenced"`
+	InStorage     int       `json:"inStorage"`
+	Orphans       []string  `json:"orphans"`
+	Deleted       int       `json:"deleted"`
+	SkippedReason string    `json:"skippedReason,omitempty"`
+	MaxPerCycle   int       `json:"maxPerCycle"`
+}
+
+// LastPlan returns a copy of the last cycle's plan.
+func (pruner *ArchivePruner) LastPlan() PrunePlan {
+	pruner.planMu.Lock()
+	defer pruner.planMu.Unlock()
+	p := pruner.lastPlan
+	p.Orphans = append([]string(nil), p.Orphans...)
+	return p
+}
+
+func (pruner *ArchivePruner) setPlan(p PrunePlan) {
+	pruner.planMu.Lock()
+	pruner.lastPlan = p
+	pruner.planMu.Unlock()
+}
+
+// defaultMinAgeHours: 7 days.
+const defaultMinAgeHours = 168
 
 const defaultPruneInterval int = 60 // in minutes
 
@@ -58,6 +98,8 @@ func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterfac
 		storageClient:      storageClient,
 		pruneInterval:      pruneInterval,
 		maxOrphansPerCycle: maxOrphansPerCycle,
+		dryRun:             true,
+		minAge:             time.Duration(defaultMinAgeHours) * time.Hour,
 	}, nil
 }
 
@@ -103,11 +145,16 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	// that would make every archive we simply failed to see look orphaned.
 	incomplete := false
 
-	// get all pkgs from kubernetes
-	for _, namespace := range utils.DefaultNSResolver().FissionResourceNamespaces() {
+	// get all pkgs from kubernetes - in EVERY namespace. The resolver's set
+	// (FissionResourceNamespaces) is not kept in sync with the FissionTenants
+	// in this process: under dynamic tenancy it holds only the configured
+	// default namespace, which made every tenant's archive look orphaned
+	// (the 2026-07 incident; 106 archives found missing on 2026-11-20). An
+	// archive any Package anywhere references is kept.
+	for _, namespace := range []string{metav1.NamespaceAll} {
 		pkgList, err := pruner.crdClient.CoreV1().Packages(namespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
-			pruner.logger.Error(err, "error getting package list from kubernetes; skipping this namespace for this cycle", "namespace", namespace)
+			pruner.logger.Error(err, "error listing packages in all namespaces; skipping this cycle", "namespace", namespace)
 			incomplete = true
 			continue
 		}
@@ -142,15 +189,21 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	// get all archives on storage
 	// out of them, there may be some just created but not referenced by packages yet.
 	// need to filter them out.
-	archivesInStorage, err := pruner.storageClient.getItemIDsWithFilter(pruner.storageClient.filterItemsNewerThan(time.Now(), time.Minute))
+	plan := PrunePlan{At: time.Now(), DryRun: pruner.dryRun, MinAgeHours: pruner.minAge.Hours(), MaxPerCycle: pruner.maxOrphansPerCycle, Referenced: len(archivesRefByPkgs)}
+	archivesInStorage, err := pruner.storageClient.getItemIDsWithFilter(pruner.storageClient.filterItemsNewerThan(time.Now(), pruner.minAge))
 	if err != nil {
 		pruner.logger.Error(err, "error getting items from storage")
+		plan.SkippedReason = "storage listing failed"
+		pruner.setPlan(plan)
 		return
 	}
 	pruner.logger.V(1).Info("archives in storage", "count", len(archivesInStorage))
+	plan.InStorage = len(archivesInStorage)
 
 	if incomplete {
 		pruner.logger.Error(nil, "skipping this prune cycle: failed to enumerate every package's referenced archives, refusing to guess which storage archives are orphaned")
+		plan.SkippedReason = "package listing incomplete"
+		pruner.setPlan(plan)
 		return
 	}
 
@@ -167,9 +220,18 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	// the reference list wrong that cycle. A genuinely large legitimate
 	// backlog can be cleared by raising PRUNE_MAX_ORPHANS_PER_CYCLE once the
 	// operator has confirmed the orphan list is correct.
+	plan.Orphans = orphanedArchives
+	if pruner.dryRun {
+		pruner.logger.Info("dry run: archive pruner deletes nothing", "orphan_count", len(orphanedArchives))
+		plan.SkippedReason = "dry run"
+		pruner.setPlan(plan)
+		return
+	}
 	if len(orphanedArchives) > pruner.maxOrphansPerCycle {
 		pruner.logger.Error(nil, "refusing to prune: orphan count exceeds the per-cycle safety cap; this usually means the reference list is wrong, not that this many archives are truly abandoned",
 			"orphan_count", len(orphanedArchives), "cap", pruner.maxOrphansPerCycle)
+		plan.SkippedReason = "orphan count above the per-cycle cap"
+		pruner.setPlan(plan)
 		return
 	}
 
@@ -177,6 +239,8 @@ func (pruner *ArchivePruner) getOrphanArchives(ctx context.Context) {
 	for _, archiveID := range orphanedArchives {
 		pruner.insertArchive(archiveID)
 	}
+	plan.Deleted = len(orphanedArchives)
+	pruner.setPlan(plan)
 }
 
 // Start starts a go routine that listens to a channel for archive IDs that need to deleted.

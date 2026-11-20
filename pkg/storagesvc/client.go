@@ -163,6 +163,22 @@ func (client *StorageClient) getItemIDsWithFilter(exclude filter) ([]string, err
 	return archiveIDList, nil
 }
 
+// getItemsWithFilter is getItemIDsWithFilter with each item's metadata (size,
+// last-modified) - for the details listing.
+func (client *StorageClient) getItemsWithFilter(exclude filter) ([]objectInfo, error) {
+	items, err := client.backend.list(client.config.storage.getSubDir())
+	if err != nil {
+		return nil, fmt.Errorf("error getting items from container: %w", err)
+	}
+	out := make([]objectInfo, 0, len(items))
+	for _, item := range items {
+		if !exclude(item) {
+			out = append(out, item)
+		}
+	}
+	return out, nil
+}
+
 // filterItemsNewerThan returns a filter that excludes items modified less than
 // minAge before now. The archive pruner uses it so an archive that a build is
 // still uploading is never treated as orphaned.
