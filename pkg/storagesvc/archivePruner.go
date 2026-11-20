@@ -72,18 +72,17 @@ const defaultMinAgeHours = 168
 // firstCycleDelay: the first prune cycle runs this long after start.
 var firstCycleDelay = 2 * time.Minute
 
-const defaultPruneInterval int = 60 // in minutes
+const defaultPruneInterval int = 15 // in minutes (was 60)
 
-// defaultMaxOrphansPerCycle bounds how many archives a single sweep may
-// delete. A healthy steady state prunes a handful of genuinely abandoned
-// archives per cycle (leftovers from `fission package delete` or similar); a
-// sweep that wants to delete far more than that is a much stronger signal
-// that the "still referenced" list itself is wrong (an incomplete namespace
-// list, a resolver returning too few tenants, a listing that raced a bulk
-// update, ...) than that this many archives are truly orphaned at once. See
-// the 2026-07 incident where a bad reference list caused ~90 live archives
-// across multiple tenant namespaces to be deleted in one sweep.
-const defaultMaxOrphansPerCycle int = 20
+// defaultMaxOrphansPerCycle bounds how many archives one sweep deletes (the
+// oldest first; a larger backlog continues next interval). It is a damage
+// bound for something unforeseen, not a guess about the backlog: 1000 every
+// 15 minutes clears ~96k archives a day (owner 2026-11-20: 20 an hour "is
+// like nothing for production"). The reference list itself is guarded
+// separately (incomplete listing -> skip; no package references anything ->
+// skip). 2026-07 incident: a wrong list deleted ~90 live archives - the
+// all-namespaces listing (1.29.4) removed that cause.
+const defaultMaxOrphansPerCycle int = 1000
 
 func MakeArchivePruner(logger logr.Logger, clientGen crd.ClientGeneratorInterface, storageClient *StorageClient, pruneInterval time.Duration, maxOrphansPerCycle int) (*ArchivePruner, error) {
 	fissionClient, err := clientGen.GetFissionClient()
