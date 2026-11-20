@@ -1094,13 +1094,14 @@ storagesvc:
     ## no package references yet)
     minAgeHours: 168
     ## Run prune routine at interval (in minutes)
-    interval: 60
+    interval: 15
     ## Rate limit: a sweep deletes at most this many archives, the oldest
     ## first; a larger backlog is cleared over several intervals. (Until
     ## 1.29.5 a sweep above the cap was refused entirely, so a real backlog
     ## was never cleared.) A sweep is skipped when the package listing fails
     ## or references nothing - see pkg/storagesvc/archivePruner.go.
-    maxOrphansPerCycle: 20
+    ## 1000 every 15 minutes clears ~96k archives a day.
+    maxOrphansPerCycle: 1000
 
   ## maxArchiveSizeMib caps the size (in MiB) of a single package archive
   ## uploaded to /v1/archive. With internalAuth enabled, the HMAC verifier
