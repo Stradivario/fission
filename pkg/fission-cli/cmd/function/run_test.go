@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/fetcher"
 	"github.com/fission/fission/pkg/utils/correlation"
 )
@@ -112,7 +114,7 @@ func TestShortID(t *testing.T) {
 // fakeRuntime implements localRuntime without Docker: StartContainer binds a
 // real HTTP server on the requested host port that emulates the env runtime —
 // recording the /v2/specialize body and echoing invocations — so runLocal's
-// real httpx specialize call and DoHTTPRequest invoke path are exercised
+// real httpx specialize call and combinedHTTPRequest invoke path are exercised
 // end-to-end.
 type fakeRuntime struct {
 	echo string // body returned on invoke
@@ -419,6 +421,33 @@ func TestRunLocalPropagatesEnvAndPorts(t *testing.T) {
 	assert.Equal(t, 5005, f.lastSpec.Ports[1].Host)
 }
 
+// requireReSpecialize waits for an edit to path to trigger a re-specialize,
+// rewriting the file on every tick rather than once.
+//
+// serveAndWatch registers the fsnotify watch AFTER the initial specialize —
+// runLocal specializes inside launch(), then calls serveAndWatch, which is
+// where addWatchTree/watcher.Add happen. A caller that writes as soon as it
+// observes that first specialize can therefore land its write in the gap
+// before the watch exists, and inotify has no replay: the event is lost for
+// good and the reload never comes. Rewriting each tick closes the gap.
+//
+// The tick must stay above serveAndWatch's 250ms debounce. A faster rewrite
+// loop would keep restarting drainBurst's quiet period, so the burst would
+// never drain and no reload would fire at all.
+func requireReSpecialize(t *testing.T, f *fakeRuntime, path, content, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		if f.getSpecializePath() == "/v2/specialize" {
+			return true
+		}
+		// Errors are not asserted here: this runs on Eventually's goroutine,
+		// where FailNow is invalid. A failing write simply leaves the
+		// condition unsatisfied and fails with msg below.
+		_ = os.WriteFile(path, []byte(content), 0o644)
+		return false
+	}, 12*time.Second, 500*time.Millisecond, msg)
+}
+
 func TestRunLocalWatchReloadsOnChange(t *testing.T) {
 	f := &fakeRuntime{echo: "ok"}
 	code := writeTempCode(t, "v1")
@@ -441,9 +470,7 @@ func TestRunLocalWatchReloadsOnChange(t *testing.T) {
 	// Wait for the initial specialize, then edit the source and expect a re-specialize.
 	require.Eventually(t, func() bool { return f.getSpecializePath() == "/v2/specialize" }, 3*time.Second, 10*time.Millisecond)
 	f.setSpecializePath("")
-	require.NoError(t, os.WriteFile(code, []byte("v2"), 0o644))
-	require.Eventually(t, func() bool { return f.getSpecializePath() == "/v2/specialize" }, 3*time.Second, 10*time.Millisecond,
-		"editing the source should trigger a re-specialize")
+	requireReSpecialize(t, f, code, "v2", "editing the source should trigger a re-specialize")
 
 	cancel()
 	require.NoError(t, <-done)
@@ -503,9 +530,7 @@ func TestRunLocalWatchDirectoryReloadsOnChange(t *testing.T) {
 
 	require.Eventually(t, func() bool { return f.getSpecializePath() == "/v2/specialize" }, 3*time.Second, 10*time.Millisecond)
 	f.setSpecializePath("")
-	require.NoError(t, os.WriteFile(main, []byte("v2"), 0o644))
-	require.Eventually(t, func() bool { return f.getSpecializePath() == "/v2/specialize" }, 3*time.Second, 10*time.Millisecond,
-		"editing a file inside the source dir should trigger a re-specialize")
+	requireReSpecialize(t, f, main, "v2", "editing a file inside the source dir should trigger a re-specialize")
 
 	cancel()
 	require.NoError(t, <-done)
@@ -560,4 +585,68 @@ func TestRunLocalContainerExecutorSkipsSpecialize(t *testing.T) {
 	// Function-metadata headers are still attached for parity with the cluster.
 	assert.Equal(t, "cfn", f.invokeHeaders.Get("X-Fission-Function-Name"))
 	assert.True(t, f.stopped)
+}
+
+// TestParseMountFlags pins the --secret-mount / --configmap-mount format.
+//
+// RFC-0030 §4 chose a separate flag over extending --secret NAME:PATH because
+// ':' already means "rename to" in --env-from (secret/key:ALIAS); one CLI
+// giving one separator two meanings is a trap.
+func TestParseMountFlags(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no values yields no map", func(t *testing.T) {
+		t.Parallel()
+		got, err := parseMountFlags(nil, "secret-mount")
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("NAME=PATH pairs parse", func(t *testing.T) {
+		t.Parallel()
+		got, err := parseMountFlags([]string{"db-creds=app/creds", "tls=certs"}, "secret-mount")
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"db-creds": "app/creds", "tls": "certs"}, got)
+	})
+
+	t.Run("a missing separator is rejected with the expected form", func(t *testing.T) {
+		t.Parallel()
+		_, err := parseMountFlags([]string{"db-creds"}, "secret-mount")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "NAME=PATH")
+	})
+
+	for _, bad := range []string{"=app/creds", "db-creds=", ""} {
+		t.Run("rejects "+strconv.Quote(bad), func(t *testing.T) {
+			t.Parallel()
+			_, err := parseMountFlags([]string{bad}, "secret-mount")
+			assert.Error(t, err)
+		})
+	}
+
+	// One object cannot be in two places in a single run, and silently keeping
+	// the last would surprise.
+	t.Run("the same name twice is rejected", func(t *testing.T) {
+		t.Parallel()
+		_, err := parseMountFlags([]string{"db=a", "db=b"}, "secret-mount")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "twice")
+	})
+}
+
+// TestParseMountFlagsPathsMatchClusterRules pins that a path run-local accepts
+// is one the cluster accepts: both go through fv1.ObjectSubPath, so an
+// absolute or escaping path is refused in the same terms here as at admission.
+func TestParseMountFlagsPathsMatchClusterRules(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{"/etc/app", "../outside", ".."} {
+		t.Run(bad, func(t *testing.T) {
+			t.Parallel()
+			_, err := fv1.ObjectSubPath(bad, "default", "s")
+			assert.Errorf(t, err, "run-local must refuse %q for the same reason the cluster does", bad)
+		})
+	}
+	sub, err := fv1.ObjectSubPath("app/creds", "default", "s")
+	require.NoError(t, err)
+	assert.Equal(t, "app/creds", sub)
 }

@@ -33,12 +33,10 @@ func TestPoolPodControllerPodCleanup(t *testing.T) {
 	logger := loggerfactory.GetLogger()
 
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-pod",
-			Namespace: metav1.NamespaceDefault,
-			// Real poolmgr pods carry this label; the Manager cache filters on it.
-			Labels: map[string]string{fv1.EXECUTOR_TYPE: string(fv1.ExecutorTypePoolmgr)},
-		},
+		Name:      "test-pod",
+		Namespace: metav1.NamespaceDefault,
+		// Real poolmgr pods carry this label; the Manager cache filters on it.
+		Labels: map[string]string{fv1.EXECUTOR_TYPE: string(fv1.ExecutorTypePoolmgr)},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 
@@ -61,6 +59,7 @@ func TestPoolPodControllerPodCleanup(t *testing.T) {
 		fetcherConfig, executorInstanceID,
 		nil)
 	require.NoError(t, err, "Error creating generic pool manager")
+	// SAFETY: MakeGenericPoolManager returns a *GenericPoolManager behind the executortype interface.
 	gpm := executor.(*GenericPoolManager)
 	gpm.crClient = crClient
 	ppc.InjectGpm(gpm)

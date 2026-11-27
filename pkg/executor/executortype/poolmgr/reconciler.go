@@ -30,7 +30,7 @@ const envResyncPeriod = 30 * time.Minute
 // funcManager is the subset of *GenericPoolManager the Function handlers drive.
 // An interface so the reconcile routing is unit-testable with a fake.
 type funcManager interface {
-	markFuncDeleted(crd.CacheKeyURG)
+	markFuncDeleted(crd.CacheKeyUG)
 	refreshFuncPods(ctx context.Context, fn *fv1.Function) error
 	createIstioServiceForFunction(ctx context.Context, fn *fv1.Function) error
 	deleteIstioServiceForFunction(ctx context.Context, fn *fv1.Function) error
@@ -46,7 +46,7 @@ type poolManager interface {
 
 // rsCleaner is the subset of *GenericPoolManager the ReplicaSet reconciler drives.
 type rsCleaner interface {
-	processReplicaSet(ctx context.Context, rs *appsv1.ReplicaSet)
+	processReplicaSet(ctx context.Context, rs *appsv1.ReplicaSet) error
 }
 
 // replicaSetReconciler reaps a pool's specialized pods when its ReplicaSet scales
@@ -68,8 +68,10 @@ func (r *replicaSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 		return ctrl.Result{}, err
 	}
-	r.cleaner.processReplicaSet(ctx, rs)
-	return ctrl.Result{}, nil
+	// Errors requeue with backoff: a transient API failure inside the
+	// keep-or-clean decision must retry rather than silently drop a
+	// legitimate cleanup (or worse, a legitimate keep).
+	return ctrl.Result{}, r.cleaner.processReplicaSet(ctx, rs)
 }
 
 // poolmgrReplicaSetPredicate keeps the ReplicaSet reconciler to pool-manager
@@ -142,13 +144,47 @@ var poolmgrWarmPodPredicate = predicate.NewPredicateFuncs(func(obj client.Object
 // change (GenerationChangedPredicate), and the istio Service is keyed on the
 // stable function name/uid, so it only needs create/delete.
 func (gpm *GenericPoolManager) ReconcileFunction(ctx context.Context, old, fn *fv1.Function) error {
-	return reconcilePoolmgrFunc(ctx, gpm, gpm.enableIstio, old, fn)
+	// Mark this function as awaiting a deploy-event outcome on both create and
+	// update, mirroring the newdeploy executor's coverage (fnCreate AND
+	// updateFuncDeployment both fire). poolmgr has no per-function Deployment
+	// to wait on here — the mark is consumed at the actual specialize choke
+	// point (GenericPool.getFuncSvc, gp.go) whenever that next happens, which
+	// may be immediately (if the function is already receiving traffic) or
+	// much later (on the next cold start). Gated on Enabled() so this costs
+	// nothing when eventHooks.functionDeploy isn't configured. See
+	// deploypending.go and docs/features/build-deploy-webhooks.md.
+	if gpm.deployEventHook.Enabled() {
+		gpm.deployPending.mark(fn.UID)
+	}
+	err := reconcilePoolmgrFunc(ctx, gpm, gpm.enableIstio, old, fn)
+	if err != nil {
+		return err
+	}
+	if gpm.provisioner != nil {
+		if fn.Spec.ProvisionedConcurrency != nil {
+			gpm.provisioner.reconcileFunction(ctx, fn)
+		} else if old != nil && old.Spec.ProvisionedConcurrency != nil {
+			// Provisioned concurrency was removed (e.g. --provisioned-concurrency 0):
+			// clear labels on any previously-provisioned pods and reset status.
+			gpm.provisioner.disableProvisioning(ctx, fn)
+		}
+	}
+	return nil
 }
 
 // DeleteFunction satisfies executortype.FuncReconciler: it marks the function's
 // fsCache entries deleted (so the reaper recycles its pods) and removes its istio
 // Service (when enabled) or its headless function Service (RFC-0002, when enabled).
 func (gpm *GenericPoolManager) DeleteFunction(ctx context.Context, fn *fv1.Function) error {
+	if gpm.provisioner != nil {
+		// Function is being deleted: clear provisioned labels so the reaper
+		// can recycle the pods, then free per-function map entries to prevent
+		// unbounded growth under function churn. No status write — the Function
+		// object is being removed, so a status update would race with the delete
+		// and is pointless.
+		gpm.provisioner.clearProvisionedLabels(ctx, fn, -1)
+		gpm.provisioner.forget(fn.UID)
+	}
 	return cleanupPoolmgrFunc(ctx, gpm, gpm.enableIstio, gpm.functionServicesEnabled, fn)
 }
 
@@ -166,7 +202,7 @@ func reconcilePoolmgrFunc(ctx context.Context, mgr funcManager, enableIstio bool
 
 // cleanupPoolmgrFunc holds the teardown routing, split out for unit testing.
 func cleanupPoolmgrFunc(ctx context.Context, mgr funcManager, enableIstio, functionServices bool, fn *fv1.Function) error {
-	mgr.markFuncDeleted(crd.CacheKeyURGFromMeta(&fn.ObjectMeta))
+	mgr.markFuncDeleted(crd.CacheKeyUGFromMeta(&fn.ObjectMeta))
 	if enableIstio {
 		return mgr.deleteIstioServiceForFunction(ctx, fn)
 	}
@@ -234,6 +270,19 @@ func (gpm *GenericPoolManager) RegisterReconcilers(mgr ctrl.Manager) error {
 		logger:   gpm.logger.WithName("readypod_reconciler"),
 		client:   mgr.GetClient(),
 		enqueuer: gpm,
+	}
+
+	// RFC-0026 provisioner: construct after crClient is set so it can
+	// list Functions and Pods from the shared cache. Env-var config is
+	// wired in Step 9; defaults are applied in NewProvisioner.
+	cfg, ok, err := ProvisionerConfigFromEnv()
+	if err != nil {
+		gpm.logger.Error(err, "EXECUTOR_PROVISIONED_CONCURRENCY_ENABLED is set but unparseable; provisioned concurrency disabled")
+		gpm.provisioner = nil
+	} else if !ok {
+		gpm.provisioner = nil // feature off
+	} else {
+		gpm.provisioner = NewProvisioner(gpm.logger.WithName("provisioner"), gpm, gpm.fissionClient, gpm.kubernetesClient, gpm.crClient, cfg)
 	}
 	return controller.RegisterWithPredicates(mgr, &apiv1.Pod{}, pr, "poolmgr-readypod", 0,
 		poolmgrWarmPodPredicate)

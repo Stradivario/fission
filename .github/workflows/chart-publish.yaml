@@ -1,0 +1,64 @@
+name: Release Charts
+
+on:
+  push:
+    branches:
+      - release/custom-v3.0
+    paths:
+      - 'charts/**'
+      - '.github/workflows/chart-publish.yaml'
+  workflow_dispatch:
+
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
+      # Releases every chart whose version has no `<name>-<version>` release
+      # yet. Not chart-releaser's "changed since the latest tag": cr.sh
+      # re-fetches ALL tags, so an image tag (vX.Y.Z-watch-all-namespaces)
+      # pushed onto the release commit became "the latest tag" and 1.28.1
+      # was skipped with "No chart changes detected" (2026-11-04).
+      - name: Install chart-releaser
+        uses: helm/chart-releaser-action@v1.5.0
+        with:
+          install_only: true
+
+      - name: Release unreleased chart versions
+        env:
+          CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          rm -rf .cr-release-packages .cr-index
+          mkdir -p .cr-release-packages .cr-index
+          for chart in charts/*/; do
+            [ -f "$chart/Chart.yaml" ] || continue
+            name=$(awk '/^name:/{print $2; exit}' "$chart/Chart.yaml")
+            version=$(awk '/^version:/{print $2; exit}' "$chart/Chart.yaml")
+            if git rev-parse -q --verify "refs/tags/$name-$version" > /dev/null; then
+              echo "$name $version is already released"
+              continue
+            fi
+            echo "Packaging $name $version"
+            cr package "$chart" --package-path .cr-release-packages
+          done
+          if [ -z "$(ls -A .cr-release-packages)" ]; then
+            echo "Nothing to release."
+            exit 0
+          fi
+          cr upload -o "$owner" -r "$repo" -c "$(git rev-parse HEAD)" --package-path .cr-release-packages --token "$CR_TOKEN"
+          cr index -o "$owner" -r "$repo" -c "https://$owner.github.io/$repo" --package-path .cr-release-packages --index-path .cr-index/index.yaml --push --token "$CR_TOKEN"

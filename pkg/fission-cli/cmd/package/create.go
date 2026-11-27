@@ -49,6 +49,10 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 		}
 	}
 
+	if err := ValidateWatchNotSpecMode(input); err != nil {
+		return err
+	}
+
 	envName := input.String(flagkey.PkgEnvironment)
 
 	userProvidedNS, pkgNamespace, err := opts.GetResourceNamespace(input)
@@ -70,7 +74,7 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 		noZip = true
 	}
 
-	if err := ValidateArchiveSources(code, srcArchiveFiles, deployArchiveFiles, ociImage); err != nil {
+	if err := ValidateArchiveSources(code, srcArchiveFiles, deployArchiveFiles, ociImage, input.String(flagkey.PkgSrcOCI)); err != nil {
 		return err
 	}
 
@@ -88,7 +92,7 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 		if err != nil {
 			return fmt.Errorf("error reading spec in '%v': %w", specDir, err)
 		}
-		exists, err := fr.ExistsInSpecs(fv1.Environment{
+		exists, err := fr.ExistsInSpecs(&fv1.Environment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      envName,
 				Namespace: userProvidedNS,
@@ -106,10 +110,16 @@ func (opts *CreateSubCommand) run(input cli.Input) error {
 		specFile = fmt.Sprintf("package-%s.yaml", pkgName)
 	}
 
-	_, err = CreatePackage(input, opts.Client(), pkgName, pkgNamespace, envName,
+	pkgMeta, err := CreatePackage(input, opts.Client(), pkgName, pkgNamespace, envName,
 		srcArchiveFiles, deployArchiveFiles, buildcmd, specDir, specFile, noZip, userProvidedNS, ociImage)
+	if err != nil {
+		return err
+	}
 
-	return err
+	if input.Bool(flagkey.PkgWatch) {
+		return WatchPackageBuild(input, opts.Client(), pkgMeta.Namespace, pkgMeta.Name)
+	}
+	return nil
 }
 
 // ValidateArchiveSources enforces that --oci is not combined with
@@ -138,12 +148,29 @@ func splitImageDigest(ref string) (image, digest string) {
 	return ref, ""
 }
 
-func ValidateArchiveSources(code string, srcArchiveFiles, deployArchiveFiles []string, ociImage string) error {
-	if len(ociImage) > 0 && (len(code) > 0 || len(srcArchiveFiles) > 0 || len(deployArchiveFiles) > 0) {
-		return fmt.Errorf("--%v cannot be combined with --%v, --%v, or --%v", flagkey.PkgOCI, flagkey.PkgCode, flagkey.PkgSrcArchive, flagkey.PkgDeployArchive)
+// ValidateWatchNotSpecMode rejects --watch combined with --spec-save or
+// --spec-dry: a spec file does not trigger a build, so there is nothing to
+// watch. Shared by `package create` and `fn create`, like
+// ValidateArchiveSources.
+func ValidateWatchNotSpecMode(input cli.Input) error {
+	if input.Bool(flagkey.PkgWatch) && (input.Bool(flagkey.SpecSave) || input.Bool(flagkey.SpecDry)) {
+		return fmt.Errorf("--%v cannot be combined with --%v or --%v: a spec file does not trigger a build",
+			flagkey.PkgWatch, flagkey.SpecSave, flagkey.SpecDry)
 	}
-	if len(code) == 0 && len(srcArchiveFiles) == 0 && len(deployArchiveFiles) == 0 && len(ociImage) == 0 {
-		return fmt.Errorf("need --%v or --%v or --%v or --%v argument", flagkey.PkgCode, flagkey.PkgSrcArchive, flagkey.PkgDeployArchive, flagkey.PkgOCI)
+	return nil
+}
+
+func ValidateArchiveSources(code string, srcArchiveFiles, deployArchiveFiles []string, ociImage string, srcOCIImage string) error {
+	if len(ociImage) > 0 && (len(code) > 0 || len(srcArchiveFiles) > 0 || len(deployArchiveFiles) > 0 || len(srcOCIImage) > 0) {
+		return fmt.Errorf("--%v cannot be combined with --%v, --%v, --%v, or --%v", flagkey.PkgOCI, flagkey.PkgCode, flagkey.PkgSrcArchive, flagkey.PkgDeployArchive, flagkey.PkgSrcOCI)
+	}
+	// A source OCI image IS the source tree: it excludes the other source
+	// forms but may ride with --deploy (same as --src + --deploy today).
+	if len(srcOCIImage) > 0 && (len(code) > 0 || len(srcArchiveFiles) > 0) {
+		return fmt.Errorf("--%v cannot be combined with --%v or --%v", flagkey.PkgSrcOCI, flagkey.PkgCode, flagkey.PkgSrcArchive)
+	}
+	if len(code) == 0 && len(srcArchiveFiles) == 0 && len(deployArchiveFiles) == 0 && len(ociImage) == 0 && len(srcOCIImage) == 0 {
+		return fmt.Errorf("need --%v or --%v or --%v or --%v or --%v argument", flagkey.PkgCode, flagkey.PkgSrcArchive, flagkey.PkgDeployArchive, flagkey.PkgOCI, flagkey.PkgSrcOCI)
 	}
 	return nil
 }
@@ -155,6 +182,19 @@ func CreatePackage(input cli.Input, client cmd.Client, pkgName string, pkgNamesp
 	insecure := input.Bool(flagkey.PkgInsecure)
 	deployChecksum := input.String(flagkey.PkgDeployChecksum)
 	srcChecksum := input.String(flagkey.PkgSrcChecksum)
+	deploySecret := input.String(flagkey.PkgDeploySecret)
+	srcSecret := input.String(flagkey.PkgSrcSecret)
+
+	// A credential flag that names no URL archive to ride on is a silent
+	// no-op otherwise — the exact silent-credential-drop the fetcher's
+	// parser is designed to prevent. Reject it up front rather than create a
+	// Package with no SecretRef that 401s on first fetch.
+	if deploySecret != "" && len(deployArchiveFiles) == 0 {
+		return nil, fmt.Errorf("--%v requires a URL --%v archive", flagkey.PkgDeploySecret, flagkey.PkgDeployArchive)
+	}
+	if srcSecret != "" && len(srcArchiveFiles) == 0 {
+		return nil, fmt.Errorf("--%v requires a URL --%v archive", flagkey.PkgSrcSecret, flagkey.PkgSrcArchive)
+	}
 
 	pkgSpec := fv1.PackageSpec{
 		Environment: fv1.EnvironmentReference{
@@ -171,7 +211,7 @@ func CreatePackage(input cli.Input, client cmd.Client, pkgName string, pkgNamesp
 		}
 	}
 
-	var pkgStatus fv1.BuildStatus = fv1.BuildStatusSucceeded
+	pkgStatus := fv1.BuildStatusSucceeded
 
 	if len(ociImage) > 0 {
 		// The OCI archive is built inline: no file globbing, zipping, or
@@ -201,9 +241,17 @@ func CreatePackage(input cli.Input, client cmd.Client, pkgName string, pkgNamesp
 		if len(specFile) > 0 { // we should do this in all cases, i think
 			pkgStatus = fv1.BuildStatusNone
 		}
-		deployment, err := CreateArchive(client, input, deployArchiveFiles, noZip, insecure, deployChecksum, specDir, specFile, pkgNamespace)
+		if deploySecret != "" {
+			if err := secretFlagRequiresURL(flagkey.PkgDeploySecret, flagkey.PkgDeployArchive, deployArchiveFiles); err != nil {
+				return nil, err
+			}
+		}
+		deployment, err := CreateArchive(client, input, deployArchiveFiles, noZip, insecure || deploySecret != "", deployChecksum, specDir, specFile, pkgNamespace)
 		if err != nil {
 			return nil, fmt.Errorf("error creating deploy archive: %w", err)
+		}
+		if deploySecret != "" {
+			attachArchiveSecret(deployment, deploySecret, deployChecksum)
 		}
 		pkgSpec.Deployment = *deployment
 		if len(pkgName) == 0 {
@@ -211,14 +259,40 @@ func CreatePackage(input cli.Input, client cmd.Client, pkgName string, pkgNamesp
 		}
 	}
 	if len(srcArchiveFiles) > 0 {
-		source, err := CreateArchive(client, input, srcArchiveFiles, false, insecure, srcChecksum, specDir, specFile, pkgNamespace)
+		if srcSecret != "" {
+			if err := secretFlagRequiresURL(flagkey.PkgSrcSecret, flagkey.PkgSrcArchive, srcArchiveFiles); err != nil {
+				return nil, err
+			}
+		}
+		source, err := CreateArchive(client, input, srcArchiveFiles, false, insecure || srcSecret != "", srcChecksum, specDir, specFile, pkgNamespace)
 		if err != nil {
 			return nil, fmt.Errorf("error creating source archive: %w", err)
+		}
+		if srcSecret != "" {
+			attachArchiveSecret(source, srcSecret, srcChecksum)
 		}
 		pkgSpec.Source = *source
 		pkgStatus = fv1.BuildStatusPending // set package build status to pending
 		if len(pkgName) == 0 {
 			pkgName = util.KubifyName(fmt.Sprintf("%v-%v", path.Base(srcArchiveFiles[0]), uniuri.NewLen(4)))
+		}
+	}
+
+	// Source-OCI runs AFTER the deploy block (like the file-source block
+	// above) so a package with both a registry source and a deploy archive
+	// records BuildStatusPending — a source means the builder must run,
+	// which must not be overwritten by the deploy block's None (RFC-0031).
+	if srcOCI := input.String(flagkey.PkgSrcOCI); len(srcOCI) > 0 {
+		// No cluster-DNS warning here — source pulls always go through the
+		// fetcher (a pod), never the kubelet.
+		image, digest := splitImageDigest(srcOCI)
+		pkgSpec.Source = fv1.Archive{
+			Type: fv1.ArchiveTypeOCI,
+			OCI:  &fv1.OCIArchive{Image: image, Digest: digest},
+		}
+		pkgStatus = fv1.BuildStatusPending
+		if len(pkgName) == 0 {
+			pkgName = util.KubifyName(fmt.Sprintf("%v-%v", path.Base(srcOCI), uniuri.NewLen(4)))
 		}
 	}
 
@@ -243,7 +317,7 @@ func CreatePackage(input cli.Input, client cmd.Client, pkgName string, pkgNamesp
 	}
 
 	if input.Bool(flagkey.SpecDry) {
-		return &pkg.ObjectMeta, spec.SpecDry(*pkg)
+		return &pkg.ObjectMeta, spec.SpecDry(pkg)
 	}
 
 	if input.Bool(flagkey.SpecSave) {
@@ -253,14 +327,12 @@ func CreatePackage(input cli.Input, client cmd.Client, pkgName string, pkgNamesp
 			return nil, fmt.Errorf("error reading specs: %w", err)
 		}
 
-		obj := fr.SpecExists(pkg, true, true)
-		if obj != nil {
-			pkg := obj.(*fv1.Package)
-			fmt.Printf("Re-using previously created package %v\n", pkg.Name)
-			return &pkg.ObjectMeta, nil
+		if existing := fr.PackageInSpecs(pkg, true, true); existing != nil {
+			fmt.Printf("Re-using previously created package %v\n", existing.Name)
+			return &existing.ObjectMeta, nil
 		}
 
-		err = spec.SpecSave(*pkg, specFile, false)
+		err = spec.SpecSave(pkg, specFile, false)
 		if err != nil {
 			return nil, fmt.Errorf("error saving package spec: %w", err)
 		}

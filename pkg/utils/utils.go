@@ -31,12 +31,88 @@ const (
 	ENV_DISABLE_OWNER_REFERENCES string = "DISABLE_OWNER_REFERENCES"
 )
 
+// HeaderRouteMiss marks a 404 as produced by the ROUTER'S OWN not-found path
+// on the internal listener — no /fission-function/... route matched the
+// request — as opposed to a 404 a function chose to return as its response.
+// The router sets it (value "1") ONLY in the internal mux's not-found handler
+// (pkg/router/routeshape.go, wired inside newListenerMuxes so it survives the
+// atomic mux swap) and STRIPS it from every function-proxied response
+// (functionHandler's ModifyResponse), so consumers can trust it: the async
+// deliverer's RFC-0025 version-pin fallback re-delivers to the bare-name route
+// only on a marked 404, and `fission function test` upgrades a marked 404 on a
+// `:<alias>`/`:<version>` route into the not-yet-materialized hint.
+const HeaderRouteMiss = "X-Fission-Route-Miss"
+
+// ServiceFQDN returns the ABSOLUTE in-cluster DNS name for a Service:
+// "<name>.<namespace>.svc.<cluster-domain>." — trailing dot included.
+//
+// The short "<name>.<namespace>" form resolves only through the pod's
+// resolv.conf search path (ndots:5), so every resolution first walks the
+// search domains: up to three extra name attempts, each an A/AAAA query
+// pair, before the one that hits. Under parallel load those extra UDP round
+// trips through kube-proxy's DNAT are exactly the queries that get dropped
+// (the conntrack race behind "lookup <svc>.<ns>: i/o timeout" cascades that
+// fail dozens of in-flight requests at once). An absolute name is answered
+// in a single attempt and never touches the search path.
+//
+// The cluster domain comes from CLUSTER_DOMAIN (the chart sets it from
+// .Values.clusterDomain on the components that build these names); unset
+// falls back to the near-universal default "cluster.local".
+func ServiceFQDN(name, namespace string) string {
+	return serviceFQDN(name, namespace, os.Getenv("CLUSTER_DOMAIN"))
+}
+
+func serviceFQDN(name, namespace, domain string) string {
+	if domain == "" {
+		domain = "cluster.local"
+	}
+	return fmt.Sprintf("%s.%s.svc.%s.", name, namespace, domain)
+}
+
 func UrlForFunction(name, namespace string) string {
 	prefix := "/fission-function"
 	if namespace != metav1.NamespaceDefault {
 		prefix = fmt.Sprintf("/fission-function/%s", namespace)
 	}
 	return fmt.Sprintf("%s/%s", prefix, name)
+}
+
+// UrlForFunctionRef is UrlForFunction with a router alias/version suffix
+// (":<suffix>") appended when suffix is non-empty -- the same "name:tag"
+// grammar the router's internal `:<alias>`/`:<version>` routes register at
+// (pkg/router/routeshape.go). Callers pass a FunctionReference's Alias if
+// set, else its Version (the two are mutually exclusive -- CEL/webhook
+// enforced, see FunctionReference's doc comment in pkg/apis/core/v1/types.go);
+// a bare reference (neither set) gets exactly UrlForFunction's result.
+//
+// This exists so every RFC-0025-aware publisher (timer, kubewatcher,
+// mqtrigger's kafka/statestore/scalermanager backends) builds the suffixed
+// URL the same one way, rather than five copies of the same
+// `if suffix != "" { url += ":" + suffix }` -- resolution of what the suffix
+// actually routes to stays entirely router-side; publishers only ever build
+// a URL string.
+func UrlForFunctionRef(name, namespace, suffix string) string {
+	url := UrlForFunction(name, namespace)
+	if suffix != "" {
+		url += ":" + suffix
+	}
+	return url
+}
+
+// UrlForFunctionReference is UrlForFunctionRef with the alias/version suffix
+// selection folded in: it reads ref.Alias, falling back to ref.Version, and
+// builds the URL in one call. The two fields are mutually exclusive
+// (CEL/webhook enforced -- see FunctionReference's doc comment in
+// pkg/apis/core/v1/types.go), so this is the one place that picks between
+// them; every RFC-0025-aware publisher (timer, kubewatcher, mqtrigger's
+// kafka/statestore/scalermanager backends) should call this instead of
+// repeating the alias-else-version selection at the call site.
+func UrlForFunctionReference(ref fv1.FunctionReference, namespace string) string {
+	suffix := ref.Alias
+	if suffix == "" {
+		suffix = ref.Version
+	}
+	return UrlForFunctionRef(ref.Name, namespace, suffix)
 }
 
 // GetFunctionIstioServiceName return service name of function for istio feature
@@ -160,6 +236,16 @@ func IsURL(str string) bool {
 	return strings.HasPrefix(str, "http://") || strings.HasPrefix(str, "https://")
 }
 
+// HTTPStatusError is the non-2xx response of a download. Its message is the
+// bare status line, as before; StatusCode lets callers tell a permanent 4xx
+// from a retryable 5xx.
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPStatusError) Error() string { return e.Status }
+
 func isHttp2xxSuccessful(status int) bool {
 	return status >= 200 && status < 300
 }
@@ -186,7 +272,7 @@ func DownloadUrl(ctx context.Context, httpClient *http.Client, targetURL string,
 	defer resp.Body.Close()
 
 	if !isHttp2xxSuccessful(resp.StatusCode) {
-		return errors.New(resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	w, err := os.OpenFile(localPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -236,7 +322,7 @@ func DownloadUrlToRoot(ctx context.Context, httpClient *http.Client, targetURL s
 	defer resp.Body.Close()
 
 	if !isHttp2xxSuccessful(resp.StatusCode) {
-		return errors.New(resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	w, err := RootOpenFile(base, localPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)

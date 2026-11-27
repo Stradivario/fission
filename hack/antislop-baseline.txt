@@ -1,0 +1,30 @@
+# antislop findings accepted for this tree, written by 'antislop -baseline <file> -update'.
+#
+# Format: <count> <file> <analyzer>. No line numbers on purpose, so an edit
+# above a finding does not churn this file.
+#
+# The gate fails when a file/analyzer pair is missing from this list or its
+# count grows; a pair that shrinks passes. Every line is a claim that the
+# pattern is right for that file — justify new ones in review.
+1 pkg/mcp/tracing_test.go noanycontainers
+1 pkg/workflow/decide_test.go noanycontainers
+1 pkg/workflow/decide_test.go nountypedunmarshal
+3 pkg/workflow/engine_branch_test.go noanycontainers
+3 pkg/workflow/engine_branch_test.go nountypedunmarshal
+2 pkg/workflow/engine_branch_test.go safetycomment
+2 pkg/workflow/expr/eval.go noanyparams
+2 pkg/workflow/expr/eval.go noanyreturns
+18 pkg/workflow/expr/eval_test.go noanycontainers
+1 pkg/workflow/expr/eval_test.go noanyfields
+1 pkg/workflow/fold.go noanyfields
+1 pkg/workflow/fold.go noanyreturns
+2 pkg/workflow/fold.go noknownwidening
+1 pkg/workflow/fold.go nonarrowany
+1 pkg/workflow/fold.go nountypedunmarshal
+1 pkg/workflow/fold_branch_test.go noanycontainers
+1 pkg/workflow/fold_branch_test.go nountypedunmarshal
+3 pkg/workflow/invoker.go nountypedunmarshal
+6 pkg/workflow/paths.go noanyparams
+2 pkg/workflow/paths.go noanyreturns
+3 pkg/workflow/paths.go nonarrowany
+10 pkg/workflow/paths_test.go noanycontainers

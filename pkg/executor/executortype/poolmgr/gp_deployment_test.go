@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apiv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/executor/util"
@@ -29,7 +28,7 @@ func TestGenDeploymentSpecPreStopLifecycle(t *testing.T) {
 		t.Parallel()
 		gp := newTestGenericPool(t)
 		env := newTestEnv()
-		env.Spec.TerminationGracePeriod = 360
+		env.Spec.TerminationGracePeriod = new(int64(360))
 
 		deploymentSpec, err := gp.genDeploymentSpec(env)
 		require.NoError(t, err)
@@ -52,11 +51,11 @@ func TestGenDeploymentSpecPreStopLifecycle(t *testing.T) {
 		assert.Equal(t, int64(360), preStop.Sleep.Seconds, "PreStop.Sleep.Seconds must equal the environment TerminationGracePeriod")
 	})
 
-	t.Run("zero grace period produces nil lifecycle", func(t *testing.T) {
+	t.Run("explicit zero grace period produces nil lifecycle", func(t *testing.T) {
 		t.Parallel()
 		gp := newTestGenericPool(t)
 		env := newTestEnv()
-		env.Spec.TerminationGracePeriod = 0
+		env.Spec.TerminationGracePeriod = new(int64(0))
 
 		deploymentSpec, err := gp.genDeploymentSpec(env)
 		require.NoError(t, err)
@@ -72,32 +71,47 @@ func TestGenDeploymentSpecPreStopLifecycle(t *testing.T) {
 		assert.Nil(t, runtimeContainer.Lifecycle,
 			"runtime container Lifecycle must be nil when TerminationGracePeriod is 0 (no drain window, Sleep.Seconds>=1 is required by the API)")
 	})
+
+	t.Run("nil grace period drains for the mirrored CRD default", func(t *testing.T) {
+		t.Parallel()
+		gp := newTestGenericPool(t)
+		env := newTestEnv() // TerminationGracePeriod left nil on purpose
+
+		deploymentSpec, err := gp.genDeploymentSpec(env)
+		require.NoError(t, err)
+
+		var runtimeContainer *apiv1.Container
+		for i := range deploymentSpec.Template.Spec.Containers {
+			if deploymentSpec.Template.Spec.Containers[i].Name == envContainerName {
+				runtimeContainer = &deploymentSpec.Template.Spec.Containers[i]
+				break
+			}
+		}
+		require.NotNil(t, runtimeContainer, "runtime container must be present in the deployment spec")
+		require.NotNil(t, runtimeContainer.Lifecycle, "nil grace must behave as the default, not as zero")
+		require.NotNil(t, runtimeContainer.Lifecycle.PreStop)
+		require.NotNil(t, runtimeContainer.Lifecycle.PreStop.Sleep)
+		assert.Equal(t, fv1.DefaultTerminationGracePeriod, runtimeContainer.Lifecycle.PreStop.Sleep.Seconds,
+			"an unset grace period must drain for the in-process mirror of the CRD default")
+	})
 }
 
 const envContainerName = "test-env"
 
 func TestGetPoolName(t *testing.T) {
 	longEnv := &fv1.Environment{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       fv1.CRD_NAME_ENVIRONMENT,
-			APIVersion: fv1.CRD_VERSION,
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "justtryingtoincreasethenumberofcharactersinthisstring",
-			Namespace:       "checkingifthegetpoolfunctionworkswithcharactersmorethan18",
-			ResourceVersion: "2518",
-		},
+		Kind:            fv1.CRD_NAME_ENVIRONMENT,
+		APIVersion:      fv1.CRD_VERSION,
+		Name:            "justtryingtoincreasethenumberofcharactersinthisstring",
+		Namespace:       "checkingifthegetpoolfunctionworkswithcharactersmorethan18",
+		ResourceVersion: "2518",
 	}
 	shortEnv := &fv1.Environment{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       fv1.CRD_NAME_ENVIRONMENT,
-			APIVersion: fv1.CRD_VERSION,
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "test",
-			Namespace:       "testns",
-			ResourceVersion: "2517",
-		},
+		Kind:            fv1.CRD_NAME_ENVIRONMENT,
+		APIVersion:      fv1.CRD_VERSION,
+		Name:            "test",
+		Namespace:       "testns",
+		ResourceVersion: "2517",
 	}
 	tests := []struct {
 		name      string
@@ -137,10 +151,8 @@ func newTestGenericPool(t *testing.T) *GenericPool {
 
 func newTestEnv() *fv1.Environment {
 	return &fv1.Environment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      envContainerName,
-			Namespace: "default",
-		},
+		Name:      envContainerName,
+		Namespace: "default",
 		Spec: fv1.EnvironmentSpec{
 			Version: 1,
 			Runtime: fv1.Runtime{
@@ -308,6 +320,61 @@ func TestGenericPoolPodSpecRuntimePodSpecCannotIntroduceDuplicateSATokenMount(t 
 		"fetcher container must have exactly one mount at the SA token path; user-supplied mount at the same path must be stripped by MountFetcherSATokenOnFetcher")
 	assert.Equal(t, util.FetcherSATokenVolumeName, mountVolumeName,
 		"the surviving mount must be backed by the projected SA token volume, not the user-supplied one")
+}
+
+// TestGenDeploymentSpecRuntimeClassFieldOnly asserts that
+// env.Spec.RuntimeClassName reaches the pod template's RuntimeClassName when
+// NO env.Spec.Runtime.PodSpec is set at all — the common case, and the one
+// that would silently pass if ApplyEnvRuntimeClass were wired inside the
+// "if env.Spec.Runtime.PodSpec != nil" block instead of unconditionally.
+func TestGenDeploymentSpecRuntimeClassFieldOnly(t *testing.T) {
+	t.Parallel()
+	gp := newTestGenericPool(t)
+	env := newTestEnv()
+	env.Spec.RuntimeClassName = new("gvisor")
+	require.Nil(t, env.Spec.Runtime.PodSpec, "this test must exercise the no-PodSpec path")
+
+	deploymentSpec, err := gp.genDeploymentSpec(env)
+	require.NoError(t, err)
+
+	require.NotNil(t, deploymentSpec.Template.Spec.RuntimeClassName)
+	assert.Equal(t, "gvisor", *deploymentSpec.Template.Spec.RuntimeClassName)
+}
+
+// TestGenDeploymentSpecRuntimeClassNilWhenUnset asserts that an env with no
+// RuntimeClassName leaves the pod template's RuntimeClassName nil (omitted),
+// not defaulted to some empty string.
+func TestGenDeploymentSpecRuntimeClassNilWhenUnset(t *testing.T) {
+	t.Parallel()
+	gp := newTestGenericPool(t)
+	env := newTestEnv()
+
+	deploymentSpec, err := gp.genDeploymentSpec(env)
+	require.NoError(t, err)
+
+	assert.Nil(t, deploymentSpec.Template.Spec.RuntimeClassName)
+}
+
+// TestGenDeploymentSpecRuntimeClassPodSpecOverridesField pins the precedence
+// rule: when both env.Spec.RuntimeClassName and env.Spec.Runtime.PodSpec.
+// RuntimeClassName are set to different values, the PodSpec's value wins —
+// Runtime.PodSpec is the documented full-override escape hatch, and
+// ApplyEnvRuntimeClass is fill-if-nil, applied AFTER MergePodSpec.
+func TestGenDeploymentSpecRuntimeClassPodSpecOverridesField(t *testing.T) {
+	t.Parallel()
+	gp := newTestGenericPool(t)
+	env := newTestEnv()
+	env.Spec.RuntimeClassName = new("gvisor")
+	env.Spec.Runtime.PodSpec = &apiv1.PodSpec{
+		RuntimeClassName: new("kata"),
+	}
+
+	deploymentSpec, err := gp.genDeploymentSpec(env)
+	require.NoError(t, err)
+
+	require.NotNil(t, deploymentSpec.Template.Spec.RuntimeClassName)
+	assert.Equal(t, "kata", *deploymentSpec.Template.Spec.RuntimeClassName,
+		"env.Spec.Runtime.PodSpec.RuntimeClassName must win over env.Spec.RuntimeClassName")
 }
 
 // newTestOCIPool returns a GenericPool configured as a per-image image-volume

@@ -8,9 +8,17 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/fission-cli/cmd"
+	spectypes "github.com/fission/fission/pkg/fission-cli/cmd/spec/types"
+	fissionfake "github.com/fission/fission/pkg/generated/clientset/versioned/fake"
 )
 
 // TestPackageEqual exercises the equal() closure used by applyPackages to decide
@@ -44,7 +52,7 @@ func TestPackageEqual(t *testing.T) {
 
 	sourcePkg := func(buildStatus fv1.BuildStatus, deployURL string) *fv1.Package {
 		return &fv1.Package{
-			ObjectMeta: metav1.ObjectMeta{Name: "mypkg", Namespace: "default"},
+			Name: "mypkg", Namespace: "default",
 			Spec: fv1.PackageSpec{
 				Environment:  fv1.EnvironmentReference{Name: "python", Namespace: "default"},
 				Source:       fv1.Archive{URL: "http://storagesvc/src.zip"},
@@ -57,7 +65,7 @@ func TestPackageEqual(t *testing.T) {
 
 	desiredSourcePkg := func() *fv1.Package {
 		return &fv1.Package{
-			ObjectMeta: metav1.ObjectMeta{Name: "mypkg", Namespace: "default"},
+			Name: "mypkg", Namespace: "default",
 			Spec: fv1.PackageSpec{
 				Environment:  fv1.EnvironmentReference{Name: "python", Namespace: "default"},
 				Source:       fv1.Archive{URL: "http://storagesvc/src.zip"},
@@ -69,7 +77,7 @@ func TestPackageEqual(t *testing.T) {
 
 	deployPkg := func(buildStatus fv1.BuildStatus) *fv1.Package {
 		return &fv1.Package{
-			ObjectMeta: metav1.ObjectMeta{Name: "deploypkg", Namespace: "default"},
+			Name: "deploypkg", Namespace: "default",
 			Spec: fv1.PackageSpec{
 				Environment: fv1.EnvironmentReference{Name: "python", Namespace: "default"},
 				Deployment:  fv1.Archive{URL: "http://storagesvc/deploy.zip"},
@@ -118,7 +126,7 @@ func TestPackageEqual(t *testing.T) {
 			name:     "deploy-archive package with status none is equal",
 			existing: deployPkg(fv1.BuildStatusNone),
 			desired: &fv1.Package{
-				ObjectMeta: metav1.ObjectMeta{Name: "deploypkg", Namespace: "default"},
+				Name: "deploypkg", Namespace: "default",
 				Spec: fv1.PackageSpec{
 					Environment: fv1.EnvironmentReference{Name: "python", Namespace: "default"},
 					Deployment:  fv1.Archive{URL: "http://storagesvc/deploy.zip"},
@@ -130,7 +138,7 @@ func TestPackageEqual(t *testing.T) {
 			name:     "source changed triggers update",
 			existing: sourcePkg(fv1.BuildStatusSucceeded, "http://storagesvc/deploy.zip"),
 			desired: &fv1.Package{
-				ObjectMeta: metav1.ObjectMeta{Name: "mypkg", Namespace: "default"},
+				Name: "mypkg", Namespace: "default",
 				Spec: fv1.PackageSpec{
 					Environment:  fv1.EnvironmentReference{Name: "python", Namespace: "default"},
 					Source:       fv1.Archive{URL: "http://storagesvc/src-v2.zip"}, // changed
@@ -253,4 +261,216 @@ func TestPackageRetriggerDecision(t *testing.T) {
 			}
 		})
 	}
+}
+
+// aliasFR builds a minimal FissionResources carrying the given aliases,
+// stamped with the test deployment UID (mirrors frWith in resourcetype_test.go).
+func aliasFR(aliases ...fv1.FunctionAlias) *FissionResources {
+	fr := &FissionResources{FunctionAliases: aliases}
+	fr.DeploymentConfig.UID = testDeployUID
+	fr.DeploymentConfig.Name = "test-deploy"
+	return fr
+}
+
+// TestApplyFunctionAliasesCreateSetsOwnerRefWhenFunctionExists exercises the
+// create closure's ownerRef wiring: when the target Function already exists
+// on the cluster, the created alias must carry an ownerRef pinning its UID
+// (mirrors `fission alias create`'s functionOwnerRef), so it is garbage
+// collected along with the Function.
+func TestApplyFunctionAliasesCreateSetsOwnerRefWhenFunctionExists(t *testing.T) {
+	fn := &fv1.Function{
+		Name: "hello", Namespace: "default", UID: types.UID("fn-uid"),
+	}
+	fc := fissionfake.NewSimpleClientset(fn) //nolint:staticcheck // FunctionAlias SMD schema not yet generated for NewClientset, see k8s#126850
+	fr := aliasFR(fv1.FunctionAlias{
+		Name: "prod", Namespace: "default",
+		Spec: fv1.FunctionAliasSpec{FunctionName: "hello", Version: "hello-v1"},
+	})
+
+	_, ras, err := applyFunctionAliases(t.Context(), cmd.Client{FissionClientSet: fc}, fr, false, false, false)
+	require.NoError(t, err)
+	require.Len(t, ras.Created, 1)
+
+	got, err := fc.CoreV1().FunctionAliases("default").Get(t.Context(), "prod", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Len(t, got.OwnerReferences, 1)
+	assert.Equal(t, "Function", got.OwnerReferences[0].Kind)
+	assert.Equal(t, "hello", got.OwnerReferences[0].Name)
+	assert.Equal(t, types.UID("fn-uid"), got.OwnerReferences[0].UID)
+	// The generic reconciler stamps the deployment-UID annotation on every
+	// spec-applied object; that's what makes the alias prunable later.
+	assert.Equal(t, testDeployUID, got.Annotations[FISSION_DEPLOYMENT_UID_KEY])
+	// applyFunctionAliases stamps the function-name label on the desired
+	// object before create, mirroring `fission alias create`.
+	assert.Equal(t, "hello", got.Labels[fv1.VersionFunctionNameLabel])
+}
+
+// TestApplyFunctionAliasesCreateWithoutFunctionIsUnowned covers the
+// eventual-consistency path: a digest-pinned alias may be applied before its
+// Function exists. The create must still succeed, just without an ownerRef.
+func TestApplyFunctionAliasesCreateWithoutFunctionIsUnowned(t *testing.T) {
+	fc := fissionfake.NewSimpleClientset() //nolint:staticcheck // see k8s#126850
+	fr := aliasFR(fv1.FunctionAlias{
+		Name: "prod", Namespace: "default",
+		Spec: fv1.FunctionAliasSpec{FunctionName: "not-yet-created", PackageDigest: "sha256:" + repeatHexChar('a', 64)},
+	})
+
+	_, ras, err := applyFunctionAliases(t.Context(), cmd.Client{FissionClientSet: fc}, fr, false, false, false)
+	require.NoError(t, err)
+	require.Len(t, ras.Created, 1)
+
+	got, err := fc.CoreV1().FunctionAliases("default").Get(t.Context(), "prod", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, got.OwnerReferences)
+}
+
+func repeatHexChar(c byte, n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = c
+	}
+	return string(b)
+}
+
+// TestApplyFunctionAliasesUpdateInPlacePreservesStatus proves the update
+// closure changes spec.* without ever deleting the object (a delete-recreate
+// would lose the alias's UID and its controller-written status), and that it
+// never touches Status directly — that's the /status subresource, owned by
+// the alias-reconciler.
+func TestApplyFunctionAliasesUpdateInPlacePreservesStatus(t *testing.T) {
+	existing := &fv1.FunctionAlias{
+		Name:            "prod",
+		Namespace:       "default",
+		UID:             types.UID("alias-uid-1"),
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Function", Name: "hello", UID: types.UID("fn-uid")}},
+		Annotations:     map[string]string{FISSION_DEPLOYMENT_UID_KEY: testDeployUID},
+		Spec:            fv1.FunctionAliasSpec{FunctionName: "hello", Version: "hello-v1"},
+		Status:          fv1.FunctionAliasStatus{ResolvedVersion: "hello-v1"},
+	}
+	fc := fissionfake.NewSimpleClientset(existing) //nolint:staticcheck // see k8s#126850
+
+	// A delete would break the "update in place" contract; fail loudly if the
+	// apply ever issues one.
+	fc.PrependReactor("delete", "functionaliases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		t.Fatal("update-in-place must not delete the FunctionAlias")
+		return false, nil, nil
+	})
+
+	fr := aliasFR(fv1.FunctionAlias{
+		Name: "prod", Namespace: "default",
+		// spec.Version changed -- this is the update trigger.
+		Spec: fv1.FunctionAliasSpec{FunctionName: "hello", Version: "hello-v2"},
+	})
+
+	_, ras, err := applyFunctionAliases(t.Context(), cmd.Client{FissionClientSet: fc}, fr, false, false, false)
+	require.NoError(t, err)
+	require.Len(t, ras.Updated, 1)
+	require.Empty(t, ras.Created)
+
+	got, err := fc.CoreV1().FunctionAliases("default").Get(t.Context(), "prod", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "hello-v2", got.Spec.Version, "spec must be updated")
+	assert.Equal(t, "hello-v1", got.Status.ResolvedVersion, "status must survive the spec update untouched")
+	assert.Equal(t, types.UID("alias-uid-1"), got.UID, "identity must survive: never delete-recreate")
+	require.Len(t, got.OwnerReferences, 1, "ownerRef set at create time must survive an unrelated spec update")
+	assert.Equal(t, "hello", got.OwnerReferences[0].Name)
+	// The function-name label is stamped on the desired object every apply,
+	// so it comes through *cur = *d on the update-in-place path too, and
+	// stays stable across the resulting no-op re-apply (both sides of
+	// isObjectMetaEqual now see it).
+	assert.Equal(t, "hello", got.Labels[fv1.VersionFunctionNameLabel])
+}
+
+// TestApplyFunctionAliasesPruneOnlyWithDeploymentUID proves --delete only
+// removes aliases this spec deployment owns (carrying its deployment-UID
+// annotation); an alias without it (or with a different deployment's UID) is
+// left alone, matching every other spec-managed kind's prune semantics.
+func TestApplyFunctionAliasesPruneOnlyWithDeploymentUID(t *testing.T) {
+	owned := &fv1.FunctionAlias{
+		Name: "owned", Namespace: "default",
+		Annotations: map[string]string{FISSION_DEPLOYMENT_UID_KEY: testDeployUID},
+		Spec:        fv1.FunctionAliasSpec{FunctionName: "hello", Version: "hello-v1"},
+	}
+	foreign := &fv1.FunctionAlias{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foreign", Namespace: "default",
+			// No deployment-UID annotation: not owned by this spec deployment.
+		},
+		Spec: fv1.FunctionAliasSpec{FunctionName: "hello", Version: "hello-v1"},
+	}
+	fc := fissionfake.NewSimpleClientset(owned, foreign) //nolint:staticcheck // see k8s#126850
+
+	fr := aliasFR() // empty desired state: both aliases are absent from the spec
+	_, ras, err := applyFunctionAliases(t.Context(), cmd.Client{FissionClientSet: fc}, fr, true /* delete */, false, false)
+	require.NoError(t, err)
+	require.Len(t, ras.Deleted, 1)
+	assert.Equal(t, "owned", ras.Deleted[0].Name)
+
+	_, err = fc.CoreV1().FunctionAliases("default").Get(t.Context(), "owned", metav1.GetOptions{})
+	assert.Error(t, err, "owned alias must be pruned")
+
+	_, err = fc.CoreV1().FunctionAliases("default").Get(t.Context(), "foreign", metav1.GetOptions{})
+	assert.NoError(t, err, "foreign alias must survive prune")
+}
+
+// TestSpecApplyListsPackagesOnce pins the single cluster-wide Package
+// enumeration per apply. applyArchives (archive de-duplication) and
+// applyPackages (the create/update/delete diff) both need the full list; they
+// used to fetch it independently, so every apply paid for two full listings of
+// every Package in every namespace. Both now read one snapshot taken in
+// applyResources.
+//
+// Two assertions, guarding two different regressions:
+//
+//   - the *count*, because collapsing two lists into one is invisible in the
+//     apply result — it only costs the apiserver twice;
+//   - the resulting *diff*, because the count alone does not pin that the
+//     snapshot actually reaches applyPackages. Threading nil instead of
+//     livePkgs still lists exactly once, but the diff then sees an empty
+//     cluster and reports this already-live package as a would-create.
+//
+// The fixture is a re-apply of an unchanged package, so a correctly threaded
+// snapshot makes it a no-op: the annotations below are exactly what
+// setDeploymentUID stamps (both the name and UID keys — isObjectMetaEqual
+// compares the whole map), and BuildStatusSucceeded satisfies equal()'s
+// readiness check.
+func TestSpecApplyListsPackagesOnce(t *testing.T) {
+	t.Parallel()
+
+	live := &fv1.Package{
+		Name: "hello", Namespace: "default",
+		Annotations: map[string]string{
+			FISSION_DEPLOYMENT_NAME_KEY: "test",
+			FISSION_DEPLOYMENT_UID_KEY:  "uid-1",
+		},
+		Spec:   fv1.PackageSpec{Environment: fv1.EnvironmentReference{Name: "node", Namespace: "default"}},
+		Status: fv1.PackageStatus{BuildStatus: fv1.BuildStatusSucceeded},
+	}
+	fc := fissionfake.NewSimpleClientset(live) //nolint:staticcheck // see k8s#126850
+
+	var pkgLists int
+	fc.PrependReactor("list", "packages", func(k8stesting.Action) (bool, runtime.Object, error) {
+		pkgLists++
+		return false, nil, nil // fall through to the default object tracker
+	})
+
+	fr := &FissionResources{
+		DeploymentConfig: spectypes.DeploymentConfig{Name: "test", UID: "uid-1"},
+		Packages:         []fv1.Package{*live.DeepCopy()},
+	}
+
+	// dryRun: the listing this asserts on happens on the read-only path too, so
+	// the count is pinned without mutating the fake cluster.
+	_, applyStatus, err := applyResources(
+		fakeInput{ctx: t.Context()}, cmd.Client{FissionClientSet: fc}, "",
+		fr, false /* delete */, false /* allowConflicts */, true /* dryRun */)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, pkgLists, "applyResources must enumerate cluster-wide Packages exactly once")
+
+	pkgStatus, ok := applyStatus["package"]
+	require.True(t, ok, "apply status must carry a package entry")
+	assert.Empty(t, pkgStatus.Created, "an unchanged package must not be reported as a would-create — the snapshot did not reach applyPackages")
+	assert.Empty(t, pkgStatus.Updated, "an unchanged package must not be reported as a would-update")
+	assert.Empty(t, pkgStatus.Deleted, "nothing must be pruned when the spec matches the cluster")
 }

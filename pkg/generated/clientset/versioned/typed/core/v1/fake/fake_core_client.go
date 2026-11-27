@@ -32,6 +32,14 @@ func (c *FakeCoreV1) Functions(namespace string) v1.FunctionInterface {
 	return newFakeFunctions(c, namespace)
 }
 
+func (c *FakeCoreV1) FunctionAliases(namespace string) v1.FunctionAliasInterface {
+	return newFakeFunctionAliases(c, namespace)
+}
+
+func (c *FakeCoreV1) FunctionVersions(namespace string) v1.FunctionVersionInterface {
+	return newFakeFunctionVersions(c, namespace)
+}
+
 func (c *FakeCoreV1) HTTPTriggers(namespace string) v1.HTTPTriggerInterface {
 	return newFakeHTTPTriggers(c, namespace)
 }
@@ -50,6 +58,14 @@ func (c *FakeCoreV1) Packages(namespace string) v1.PackageInterface {
 
 func (c *FakeCoreV1) TimeTriggers(namespace string) v1.TimeTriggerInterface {
 	return newFakeTimeTriggers(c, namespace)
+}
+
+func (c *FakeCoreV1) Workflows(namespace string) v1.WorkflowInterface {
+	return newFakeWorkflows(c, namespace)
+}
+
+func (c *FakeCoreV1) WorkflowRuns(namespace string) v1.WorkflowRunInterface {
+	return newFakeWorkflowRuns(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

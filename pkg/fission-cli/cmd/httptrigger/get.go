@@ -40,22 +40,12 @@ func (opts *GetSubCommand) run(input cli.Input) (err error) {
 		return fmt.Errorf("error getting http trigger: %w", err)
 	}
 
-	format, err := util.ParseOutputFormat(input.String(flagkey.Output))
-	if err != nil {
-		return err
-	}
-	if handled, err := util.PrintStructured(format, ht); err != nil || handled {
-		return err
-	}
-
 	// describe renders the plain table (no -o wide AGE column), consistent with
-	// the other describe commands; json/yaml are handled above.
-	if err := printHtSummary(util.OutputTable, []fv1.HTTPTrigger{*ht}); err != nil {
-		return err
-	}
-	util.PrintConditions(ht.Status.Conditions)
-
-	return nil
+	// the other describe commands; json/yaml are handled by PrintGet.
+	_, err = util.PrintGet(input, ht, func() error {
+		return printHtSummary(util.OutputTable, []fv1.HTTPTrigger{*ht})
+	})
+	return err
 }
 
 func printHtSummary(format util.OutputFormat, triggers []fv1.HTTPTrigger) error {
@@ -64,6 +54,16 @@ func printHtSummary(format util.OutputFormat, triggers []fv1.HTTPTrigger) error 
 		function := ""
 		if trigger.Spec.FunctionReference.Type == fv1.FunctionReferenceTypeFunctionName {
 			function = trigger.Spec.FunctionReference.Name
+			// RFC-0025: an alias/version-pinned reference renders as
+			// "<fn>:<tag>", matching the router's own route grammar (see
+			// pkg/router/rewrite.go's trimFunctionPrefix) rather than
+			// silently showing just the live function name.
+			switch {
+			case trigger.Spec.FunctionReference.Alias != "":
+				function += ":" + trigger.Spec.FunctionReference.Alias
+			case trigger.Spec.FunctionReference.Version != "":
+				function += ":" + trigger.Spec.FunctionReference.Version
+			}
 		} else {
 			for k, v := range trigger.Spec.FunctionReference.FunctionWeights {
 				function += fmt.Sprintf("%s:%v ", k, v)

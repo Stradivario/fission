@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.21.0
+    controller-gen.kubebuilder.io/version: v0.22.0
   name: packages.fission.io
 spec:
   group: fission.io
@@ -76,10 +76,12 @@ spec:
                     type: string
                   oci:
                     description: |-
-                      OCI references an OCI image holding the deployment code.
-                      Mutually exclusive with Literal and URL. Supported only on
-                      PackageSpec.Deployment; PackageSpec.Validate rejects it on Source
-                      (source archives feed the builder, which has no OCI pull path).
+                      OCI references an OCI image holding the archive contents.
+                      Mutually exclusive with Literal and URL. Valid on both
+                      PackageSpec.Deployment and PackageSpec.Source (RFC-0031): a
+                      source OCI archive is pulled by the builder pod's fetcher, whose
+                      keychain resolves the builder pod's ServiceAccount
+                      imagePullSecrets plus the archive's ImagePullSecrets.
                     properties:
                       digest:
                         description: Digest is an optional content hash validated
@@ -126,6 +128,29 @@ spec:
                     required:
                     - image
                     type: object
+                  secretref:
+                    description: |-
+                      SecretRef names a Secret holding credentials for fetching URL.
+                      Keys: username+password (basic auth), token (bearer), headers
+                      (extra headers, one "Name: Value" per line). Like
+                      OCIArchive.ImagePullSecrets it is resolved in the namespace of
+                      the pod that performs the fetch: the function pod's namespace
+                      for deployment archives, the builder pod's namespace for source
+                      archives. Valid only for a url archive whose URL is not a
+                      storagesvc archive URL; credentials are attached only to
+                      requests to the URL's exact origin.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   type:
                     description: |-
                       Type defines how the package is specified: literal, URL, or OCI.
@@ -146,6 +171,9 @@ spec:
                 x-kubernetes-validations:
                 - message: at most one of literal, url, or oci may be set
                   rule: '!has(self.oci) || !has(self.url) || self.url == '''''
+                - message: secretref requires a url archive
+                  rule: '!has(self.secretref) || (has(self.url) && self.url != ''''
+                    && !has(self.oci))'
               environment:
                 description: Environment is a reference to the environment for building
                   source archive.
@@ -197,10 +225,12 @@ spec:
                     type: string
                   oci:
                     description: |-
-                      OCI references an OCI image holding the deployment code.
-                      Mutually exclusive with Literal and URL. Supported only on
-                      PackageSpec.Deployment; PackageSpec.Validate rejects it on Source
-                      (source archives feed the builder, which has no OCI pull path).
+                      OCI references an OCI image holding the archive contents.
+                      Mutually exclusive with Literal and URL. Valid on both
+                      PackageSpec.Deployment and PackageSpec.Source (RFC-0031): a
+                      source OCI archive is pulled by the builder pod's fetcher, whose
+                      keychain resolves the builder pod's ServiceAccount
+                      imagePullSecrets plus the archive's ImagePullSecrets.
                     properties:
                       digest:
                         description: Digest is an optional content hash validated
@@ -247,6 +277,29 @@ spec:
                     required:
                     - image
                     type: object
+                  secretref:
+                    description: |-
+                      SecretRef names a Secret holding credentials for fetching URL.
+                      Keys: username+password (basic auth), token (bearer), headers
+                      (extra headers, one "Name: Value" per line). Like
+                      OCIArchive.ImagePullSecrets it is resolved in the namespace of
+                      the pod that performs the fetch: the function pod's namespace
+                      for deployment archives, the builder pod's namespace for source
+                      archives. Valid only for a url archive whose URL is not a
+                      storagesvc archive URL; credentials are attached only to
+                      requests to the URL's exact origin.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   type:
                     description: |-
                       Type defines how the package is specified: literal, URL, or OCI.
@@ -267,6 +320,9 @@ spec:
                 x-kubernetes-validations:
                 - message: at most one of literal, url, or oci may be set
                   rule: '!has(self.oci) || !has(self.url) || self.url == '''''
+                - message: secretref requires a url archive
+                  rule: '!has(self.secretref) || (has(self.url) && self.url != ''''
+                    && !has(self.oci))'
             required:
             - environment
             type: object
@@ -348,6 +404,30 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              contentHash:
+                description: |-
+                  ContentHash fingerprints the package's INPUT content (RFC-0029 §3):
+                  the source archive when one is present, otherwise the deployment
+                  archive. A source package's deployment is the build's own product,
+                  so folding it in would make every successful build look like a
+                  fresh change and rebuild forever.
+
+                  It is what makes a Git-applied Package
+                  converge without the CLI: buildermgr compares the spec's current
+                  hash against this one to decide whether the content actually
+                  changed, rather than relying on the CLI's status->pending poke.
+
+                  It also covers packages that never build. A deploy-only or OCI
+                  package settles at BuildStatusNone, so the build-success path that
+                  re-stamps referencing Functions never runs for it — exactly the
+                  digest-pinned-OCI-in-Git golden path. Keying the re-stamp on this
+                  hash instead covers both shapes on one code path.
+
+                  An EMPTY value means "not yet recorded" and must never read as
+                  "changed": every package has an empty hash on the first reconcile
+                  after this ships, and treating that as a change would rebuild the
+                  whole cluster at once. The reconciler seeds it without rebuilding.
+                type: string
               lastUpdateTimestamp:
                 description: |-
                   LastUpdateTimestamp will store the timestamp the package was last updated

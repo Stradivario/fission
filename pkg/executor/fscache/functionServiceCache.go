@@ -43,20 +43,30 @@ type (
 
 	// FunctionServiceCache represents the function service cache
 	FunctionServiceCache struct {
-		logger            logr.Logger
-		byFunction        *cache.Cache[crd.CacheKeyUR, *FuncSvc]
-		byAddress         *cache.Cache[string, metav1.ObjectMeta]
-		byFunctionUID     *cache.Cache[types.UID, metav1.ObjectMeta]
+		logger     logr.Logger
+		byFunction *cache.Cache[crd.CacheKeyUG, *FuncSvc]
+		byAddress  *cache.Cache[string, metav1.ObjectMeta]
+		// byFunctionUG is the UID-scoped secondary index over byFunction,
+		// keyed — like byFunction itself — by (UID, Generation). It must NOT
+		// collapse to a bare-UID key: RFC-0025 versioned projections share the
+		// live Function's UID while pinning distinct Generations, each backed
+		// by its own entry (and, for newdeploy/container, its own
+		// Deployment/Service/HPA). A single-entry-per-UID index made a
+		// version-pinned lookup return whichever generation's fsvc was written
+		// last (wrong code served), and deleting one generation's entry
+		// destroyed the index entry every sibling generation depended on
+		// (survivors invisible to ListOld, so never idle-reaped).
+		byFunctionUG      *cache.Cache[crd.CacheKeyUG, metav1.ObjectMeta]
 		connFunctionCache *PoolCache // function-key -> funcSvc : map[string]*funcSvc
 		PodToFsvc         sync.Map   // pod-name -> funcSvc: map[string]*FuncSvc
 		WebsocketFsvc     sync.Map   // funcSvc-name -> bool: map[string]bool
 		// lock serializes the composite read/modify operations that the
 		// removed single-goroutine actor used to mutually exclude: the
 		// _touchByAddress Atime write against the ListOld/ListOldForPool/Log
-		// scans. The per-key stores (byFunction/byAddress/byFunctionUID and
+		// scans. The per-key stores (byFunction/byAddress/byFunctionUG and
 		// connFunctionCache) are independently synchronized.
 		//
-		// Boundary note: GetByFunction/GetFuncSvc/GetByFunctionUID/AddFunc
+		// Boundary note: GetByFunction/GetFuncSvc/GetLiveByFunctionUID/AddFunc
 		// also refresh fsvc.Atime, but WITHOUT this lock. That race predates
 		// the actor's removal (the actor never covered those paths either) and
 		// is intentionally left out of scope here; a new Atime writer that
@@ -85,9 +95,9 @@ func IsNameExistError(err error) bool {
 func MakeFunctionServiceCache(logger logr.Logger) *FunctionServiceCache {
 	return &FunctionServiceCache{
 		logger:            logger.WithName("function_service_cache"),
-		byFunction:        cache.MakeCache[crd.CacheKeyUR, *FuncSvc](0, 0),
+		byFunction:        cache.MakeCache[crd.CacheKeyUG, *FuncSvc](0, 0),
 		byAddress:         cache.MakeCache[string, metav1.ObjectMeta](0, 0),
-		byFunctionUID:     cache.MakeCache[types.UID, metav1.ObjectMeta](0, 0),
+		byFunctionUG:      cache.MakeCache[crd.CacheKeyUG, metav1.ObjectMeta](0, 0),
 		connFunctionCache: NewPoolCache(logger.WithName("conn_function_cache")),
 	}
 }
@@ -114,8 +124,14 @@ func (fsc *FunctionServiceCache) DumpDebugInfo(ctx context.Context) error {
 }
 
 // GetByFunction gets a function service from cache using function key.
+//
+// The key is UID+Generation, not ResourceVersion (see #3596): RV moves on
+// status-only writes (not just spec changes), and a caller's view of the
+// function can lag the writer's (informer cache lag across components) —
+// an RV-keyed lookup would miss the entry Add()/DeleteEntry() operate on,
+// splitting one function's cache entry across RV churn.
 func (fsc *FunctionServiceCache) GetByFunction(m *metav1.ObjectMeta) (*FuncSvc, error) {
-	key := crd.CacheKeyURFromMeta(m)
+	key := crd.CacheKeyUGFromMeta(m)
 
 	fsvc, err := fsc.byFunction.Get(key)
 	if err != nil {
@@ -132,13 +148,13 @@ func (fsc *FunctionServiceCache) GetByFunction(m *metav1.ObjectMeta) (*FuncSvc, 
 // ReserveCapacity atomically checks the function's concurrency cap and
 // reserves one in-flight specialization in the pool cache (RFC-0002
 // ensureCapacity); returns a TooManyRequests ferror at the cap.
-func (fsc *FunctionServiceCache) ReserveCapacity(key crd.CacheKeyURG, concurrency, maxPending int) error {
+func (fsc *FunctionServiceCache) ReserveCapacity(key crd.CacheKeyUG, concurrency, maxPending int) error {
 	return fsc.connFunctionCache.ReserveCapacity(key, concurrency, maxPending)
 }
 
 // GetFuncSvc gets a function service from pool cache using function key and returns number of active instances of function pod
 func (fsc *FunctionServiceCache) GetFuncSvc(ctx context.Context, m *metav1.ObjectMeta, requestsPerPod int, concurrency int) (*FuncSvc, error) {
-	key := crd.CacheKeyURGFromMeta(m)
+	key := crd.CacheKeyUGFromMeta(m)
 
 	fsvc, err := fsc.connFunctionCache.GetSvcValue(ctx, key, requestsPerPod, concurrency)
 	if err != nil {
@@ -153,14 +169,86 @@ func (fsc *FunctionServiceCache) GetFuncSvc(ctx context.Context, m *metav1.Objec
 	return &fsvcCopy, nil
 }
 
-// GetByFunctionUID gets a function service from cache using function UUID.
-func (fsc *FunctionServiceCache) GetByFunctionUID(uid types.UID) (*FuncSvc, error) {
-	m, err := fsc.byFunctionUID.Get(uid)
-	if err != nil {
-		return nil, err
+// ListByFunctionUID returns every cached function service whose Function
+// carries the given UID — one per cached (UID, Generation). With RFC-0025
+// a UID can back several entries at once (the live function plus versioned
+// projections pinning older Generations), so there is deliberately no
+// "get any entry for this UID" accessor: callers that mean a specific
+// version's entry must use GetByFunction with that projection's metadata,
+// and callers acting on the live function's entry use GetLiveByFunctionUID.
+// Entries' Atime is not refreshed — this is an administrative enumeration,
+// not a request-path hit.
+func (fsc *FunctionServiceCache) ListByFunctionUID(uid types.UID) []*FuncSvc {
+	index := fsc.byFunctionUG.Copy()
+	fsvcs := make([]*FuncSvc, 0, 1)
+	for key := range index {
+		if key.UID != uid {
+			continue
+		}
+		fsvc, err := fsc.byFunction.Get(key)
+		if err != nil {
+			// Transient TOCTOU gap with a concurrent delete; skip.
+			continue
+		}
+		fsvcCopy := *fsvc
+		fsvcs = append(fsvcs, &fsvcCopy)
+	}
+	return fsvcs
+}
+
+// ListByFunctionVersion returns every cached function service whose Function
+// metadata is a versioned projection of the named FunctionVersion: its
+// fv1.FUNCTION_VERSION label equals versionName and its namespace (the
+// function's own resource namespace, which is also the FunctionVersion CR's
+// namespace) equals namespace. Used by the executor's version-GC teardown
+// (CleanupFunctionVersion) — when a FunctionVersion CR is deleted, its entry
+// must be evicted alongside its per-version Deployment/Service/HPA or the
+// idle reaper keeps erroring on the vanished Deployment forever. Entries'
+// Atime is not refreshed — administrative enumeration, not a request-path
+// hit.
+func (fsc *FunctionServiceCache) ListByFunctionVersion(namespace, versionName string) []*FuncSvc {
+	index := fsc.byFunctionUG.Copy()
+	fsvcs := make([]*FuncSvc, 0, 1)
+	for key, m := range index {
+		if m.Namespace != namespace || m.Labels[fv1.FUNCTION_VERSION] != versionName {
+			continue
+		}
+		fsvc, err := fsc.byFunction.Get(key)
+		if err != nil {
+			// Transient TOCTOU gap with a concurrent delete; skip.
+			continue
+		}
+		fsvcCopy := *fsvc
+		fsvcs = append(fsvcs, &fsvcCopy)
+	}
+	return fsvcs
+}
+
+// GetLiveByFunctionUID gets the function service cached for the UID's LIVE
+// function — the entry whose Function metadata carries no
+// fv1.FUNCTION_VERSION label. Versioned projections sharing the UID are
+// ignored: they are immutable per-version snapshots, and the update/HPA
+// paths that call this must never act on one just because it was cached
+// last. If live entries exist at several Generations (spec updated, then
+// re-specialized), the newest Generation wins.
+func (fsc *FunctionServiceCache) GetLiveByFunctionUID(uid types.UID) (*FuncSvc, error) {
+	index := fsc.byFunctionUG.Copy()
+	var liveKey *crd.CacheKeyUG
+	for key, m := range index {
+		if key.UID != uid || m.Labels[fv1.FUNCTION_VERSION] != "" {
+			continue
+		}
+		if liveKey == nil || key.Generation > liveKey.Generation {
+			k := key
+			liveKey = &k
+		}
+	}
+	if liveKey == nil {
+		return nil, ferror.MakeError(ferror.ErrorNotFound,
+			fmt.Sprintf("no live function service cached for function uid %q", uid))
 	}
 
-	fsvc, err := fsc.byFunction.Get(crd.CacheKeyURFromMeta(&m))
+	fsvc, err := fsc.byFunction.Get(*liveKey)
 	if err != nil {
 		return nil, err
 	}
@@ -174,33 +262,33 @@ func (fsc *FunctionServiceCache) GetByFunctionUID(uid types.UID) (*FuncSvc, erro
 
 // AddFunc adds a function service to pool cache.
 func (fsc *FunctionServiceCache) AddFunc(ctx context.Context, fsvc FuncSvc, requestsPerPod, svcsRetain int) {
-	fsc.connFunctionCache.SetSvcValue(ctx, crd.CacheKeyURGFromMeta(fsvc.Function), fsvc.Address, &fsvc, fsvc.CPULimit, requestsPerPod, svcsRetain)
+	fsc.connFunctionCache.SetSvcValue(ctx, crd.CacheKeyUGFromMeta(fsvc.Function), fsvc.Address, &fsvc, fsvc.CPULimit, requestsPerPod, svcsRetain)
 	now := time.Now()
 	fsvc.Ctime = now
 	fsvc.Atime = now
 }
 
-func (fsc *FunctionServiceCache) MarkFuncDeleted(key crd.CacheKeyURG) {
+func (fsc *FunctionServiceCache) MarkFuncDeleted(key crd.CacheKeyUG) {
 	fsc.connFunctionCache.MarkFuncDeleted(key)
 }
 
 // SetCPUUtilizaton updates/sets CPUutilization in the pool cache
-func (fsc *FunctionServiceCache) SetCPUUtilizaton(key crd.CacheKeyURG, svcHost string, cpuUsage resource.Quantity) {
+func (fsc *FunctionServiceCache) SetCPUUtilizaton(key crd.CacheKeyUG, svcHost string, cpuUsage resource.Quantity) {
 	fsc.connFunctionCache.SetCPUUtilization(key, svcHost, cpuUsage)
 }
 
 // MarkAvailable marks the value at key [function][address] as available.
-func (fsc *FunctionServiceCache) MarkAvailable(key crd.CacheKeyURG, svcHost string) {
+func (fsc *FunctionServiceCache) MarkAvailable(key crd.CacheKeyUG, svcHost string) {
 	fsc.connFunctionCache.MarkAvailable(key, svcHost)
 }
 
-func (fsc *FunctionServiceCache) MarkSpecializationFailure(key crd.CacheKeyURG) {
+func (fsc *FunctionServiceCache) MarkSpecializationFailure(key crd.CacheKeyUG) {
 	fsc.connFunctionCache.MarkSpecializationFailure(key)
 }
 
 // Add adds a function service to cache if it does not exist already.
 func (fsc *FunctionServiceCache) Add(fsvc FuncSvc) (*FuncSvc, error) {
-	existing, err := fsc.byFunction.Set(crd.CacheKeyURFromMeta(fsvc.Function), &fsvc)
+	existing, err := fsc.byFunction.Set(crd.CacheKeyUGFromMeta(fsvc.Function), &fsvc)
 	if err != nil {
 		if IsNameExistError(err) {
 			err2 := fsc.TouchByAddress(existing.Address)
@@ -220,9 +308,12 @@ func (fsc *FunctionServiceCache) Add(fsvc FuncSvc) (*FuncSvc, error) {
 	// because of multiple-specialization. See issue #331.
 	fsc.byAddress.Upsert(fsvc.Address, *fsvc.Function)
 
-	// Add to byFunctionUID cache. Ignore NameExists errors
+	// Add to byFunctionUG index. Ignore NameExists errors
 	// because of multiple-specialization. See issue #331.
-	fsc.byFunctionUID.Upsert(fsvc.Function.UID, *fsvc.Function)
+	// Keyed (UID, Generation) like byFunction: a versioned projection's
+	// entry must not clobber the live function's index entry (or vice
+	// versa) — see the byFunctionUG field doc.
+	fsc.byFunctionUG.Upsert(crd.CacheKeyUGFromMeta(fsvc.Function), *fsvc.Function)
 
 	return nil, nil
 }
@@ -255,7 +346,7 @@ func (fsc *FunctionServiceCache) _touchByAddress(address string) error {
 	if err != nil {
 		return err
 	}
-	fsvc, err := fsc.byFunction.Get(crd.CacheKeyURFromMeta(&m))
+	fsvc, err := fsc.byFunction.Get(crd.CacheKeyUGFromMeta(&m))
 	if err != nil {
 		return err
 	}
@@ -263,17 +354,54 @@ func (fsc *FunctionServiceCache) _touchByAddress(address string) error {
 	return nil
 }
 
-// DeleteEntry deletes a function service from cache.
+// DeleteEntry deletes a function service from cache. The byFunctionUG
+// delete is scoped to this fsvc's own (UID, Generation): evicting one
+// version's entry must leave sibling generations sharing the UID reachable
+// through the index (GetLiveByFunctionUID/ListByFunctionUID/ListOld) — a
+// bare-UID delete destroyed the survivors' only index entry, so e.g. a
+// still-live minScale-0 Deployment was never idle-reaped again.
+// Rekey moves fsvc's entry to the (UID, Generation) of fn: for executors whose
+// live objects are updated in place (newdeploy, container) the entry describes
+// the new spec once the update has landed. Left under the old Generation, it
+// would also answer an RFC-0025 versioned projection pinning that Generation —
+// serving the live (updated) code for an alias/version route, and preventing
+// the projection's own -v<seq> objects from ever being created.
+func (fsc *FunctionServiceCache) Rekey(fsvc *FuncSvc, fn *metav1.ObjectMeta) error {
+	if crd.CacheKeyUGFromMeta(fsvc.Function) == crd.CacheKeyUGFromMeta(fn) {
+		return nil
+	}
+	fsc.DeleteEntry(fsvc)
+	moved := *fsvc
+	moved.Function = fn.DeepCopy()
+	_, err := fsc.Add(moved)
+	return err
+}
+
+// GetByFunctionVersion is GetByFunction for executors whose live objects are
+// updated in place (newdeploy, container): an entry only answers a lookup for
+// the same RFC-0025 version — the live function ("") or one published
+// FunctionVersion — even when (UID, Generation) match.
+func (fsc *FunctionServiceCache) GetByFunctionVersion(m *metav1.ObjectMeta) (*FuncSvc, error) {
+	fsvc, err := fsc.GetByFunction(m)
+	if err != nil {
+		return nil, err
+	}
+	if fsvc.Function.Labels[fv1.FUNCTION_VERSION] != m.Labels[fv1.FUNCTION_VERSION] {
+		return nil, ferror.MakeError(ferror.ErrorNotFound, "cached function service belongs to a different function version")
+	}
+	return fsvc, nil
+}
+
 func (fsc *FunctionServiceCache) DeleteEntry(fsvc *FuncSvc) {
-	fsc.byFunction.Delete(crd.CacheKeyURFromMeta(fsvc.Function))
+	fsc.byFunction.Delete(crd.CacheKeyUGFromMeta(fsvc.Function))
 	fsc.byAddress.Delete(fsvc.Address)
-	fsc.byFunctionUID.Delete(fsvc.Function.UID)
+	fsc.byFunctionUG.Delete(crd.CacheKeyUGFromMeta(fsvc.Function))
 	metrics.ObserveFunctionRunningSeconds(context.Background(), fsvc.Function.Name, fsvc.Function.Namespace, fsvc.Atime.Sub(fsvc.Ctime).Seconds())
 }
 
 // DeleteFunctionSvc deletes a function service at key composed of [function][address].
 func (fsc *FunctionServiceCache) DeleteFunctionSvc(ctx context.Context, fsvc *FuncSvc) {
-	err := fsc.connFunctionCache.DeleteValue(ctx, crd.CacheKeyURGFromMeta(fsvc.Function), fsvc.Address)
+	err := fsc.connFunctionCache.DeleteValue(ctx, crd.CacheKeyUGFromMeta(fsvc.Function), fsvc.Address)
 	if err != nil {
 		fsc.logger.Error(err,
 			"error deleting function service", "function", fsvc.Function.Name,
@@ -311,17 +439,20 @@ func (fsc *FunctionServiceCache) DeleteOldPoolCache(ctx context.Context, fsvc *F
 	return true, nil
 }
 
-// ListOld returns a list of aged function services in cache.
+// ListOld returns a list of aged function services in cache. The
+// byFunctionUG walk enumerates every cached (UID, Generation) entry, so a
+// UID with several live generations (RFC-0025 versioned projections) has
+// each generation's service aged independently.
 func (fsc *FunctionServiceCache) ListOld(age time.Duration) ([]*FuncSvc, error) {
 	fsc.lock.Lock()
 	defer fsc.lock.Unlock()
 
-	fscs := fsc.byFunctionUID.Copy()
+	fscs := fsc.byFunctionUG.Copy()
 	funcObjects := make([]*FuncSvc, 0, len(fscs))
-	for _, m := range fscs {
-		fsvc, err := fsc.byFunction.Get(crd.CacheKeyURFromMeta(&m))
+	for key := range fscs {
+		fsvc, err := fsc.byFunction.Get(key)
 		if err != nil {
-			// A byFunctionUID entry without a byFunction entry is a transient
+			// A byFunctionUG entry without a byFunction entry is a transient
 			// TOCTOU gap (concurrent delete). Skip it and return what we have;
 			// the previous actor implementation aborted the whole service loop
 			// here, which silently wedged every future cache request.
@@ -335,12 +466,15 @@ func (fsc *FunctionServiceCache) ListOld(age time.Duration) ([]*FuncSvc, error) 
 	return funcObjects, nil
 }
 
-// ListOldForPool returns a list of aged function services in cache for pooling.
-func (fsc *FunctionServiceCache) ListOldForPool(age time.Duration) ([]*FuncSvc, error) {
+// ListOldForPool returns a list of aged function services in cache for
+// pooling. retained is forwarded to PoolCache.ListAvailableValue — see its
+// doc for the RFC-0025 alias-retain semantics; nil keeps the pre-RFC-0025
+// behaviour.
+func (fsc *FunctionServiceCache) ListOldForPool(age time.Duration, retained func(uid types.UID, gen int64) bool) ([]*FuncSvc, error) {
 	fsc.lock.Lock()
 	defer fsc.lock.Unlock()
 
-	fscs := fsc.connFunctionCache.ListAvailableValue()
+	fscs := fsc.connFunctionCache.ListAvailableValue(retained)
 	funcObjects := make([]*FuncSvc, 0, len(fscs))
 	for _, fsvc := range fscs {
 		if time.Since(fsvc.Atime) > age {

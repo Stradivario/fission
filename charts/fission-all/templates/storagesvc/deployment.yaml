@@ -48,6 +48,13 @@ spec:
         {{- if .Values.storagesvc.archivePruner.enabled }}
         - name: PRUNE_INTERVAL
           value: "{{.Values.storagesvc.archivePruner.interval}}"
+        - name: PRUNE_MAX_ORPHANS_PER_CYCLE
+          value: "{{.Values.storagesvc.archivePruner.maxOrphansPerCycle}}"
+        - name: PRUNE_DRY_RUN
+          # only an explicit false turns the dry run off (`default` would treat false as unset)
+          value: {{ if eq (toString .Values.storagesvc.archivePruner.dryRun) "false" }}"false"{{ else }}"true"{{ end }}
+        - name: PRUNE_MIN_AGE_HOURS
+          value: {{ .Values.storagesvc.archivePruner.minAgeHours | default 168 | quote }}
         {{- end }}
         - name: DEBUG_ENV
           value: {{ .Values.debugEnv | quote }}

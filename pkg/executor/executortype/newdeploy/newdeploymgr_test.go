@@ -54,6 +54,7 @@ func TestRefreshFuncPods(t *testing.T) {
 	executor, err := MakeNewDeploy(ctx, logger, fissionClient, kubernetesClient, fetcherConfig, "test", nil)
 	require.NoError(t, err, "new deploy manager creation failed")
 
+	// SAFETY: MakeNewDeploy returns a *NewDeploy behind the executortype interface.
 	ndm := executor.(*NewDeploy)
 
 	nsResolver := utils.NamespaceResolver{
@@ -68,11 +69,9 @@ func TestRefreshFuncPods(t *testing.T) {
 	// the kubernetesClient directly, so no informer factory is needed here.
 
 	envSpec := &fv1.Environment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      envName,
-			Namespace: defaultNamespace,
-			UID:       "83c82da2-81e9-4ebd-867e-f383e65e603f",
-		},
+		Name:      envName,
+		Namespace: defaultNamespace,
+		UID:       "83c82da2-81e9-4ebd-867e-f383e65e603f",
 		Spec: fv1.EnvironmentSpec{
 			Version: 1,
 			Runtime: fv1.Runtime{
@@ -89,11 +88,9 @@ func TestRefreshFuncPods(t *testing.T) {
 	require.Equal(t, envRes.Name, envName)
 
 	funcSpec := fv1.Function{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      functionName,
-			Namespace: defaultNamespace,
-			UID:       uuid.NewUUID(),
-		},
+		Name:      functionName,
+		Namespace: defaultNamespace,
+		UID:       uuid.NewUUID(),
 		Spec: fv1.FunctionSpec{
 			Environment: fv1.EnvironmentReference{
 				Name:      envName,
@@ -197,16 +194,12 @@ func FakeResourceVersion() string {
 
 func BuildConfigMap(ctx context.Context, kubernetesClient *fake.Clientset, namespace, name string, data map[string]string) error {
 	testConfigMap := apiv1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ConfigMap",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            name,
-			Namespace:       namespace,
-			ResourceVersion: FakeResourceVersion(),
-		},
-		Data: data,
+		Kind:            "ConfigMap",
+		APIVersion:      "v1",
+		Name:            name,
+		Namespace:       namespace,
+		ResourceVersion: FakeResourceVersion(),
+		Data:            data,
 	}
 	_, err := kubernetesClient.CoreV1().ConfigMaps(namespace).Create(ctx, &testConfigMap, metav1.CreateOptions{})
 	return err

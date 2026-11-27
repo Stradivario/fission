@@ -16,6 +16,11 @@ helm repo update
 
 _See [helm repo](https://helm.sh/docs/helm/helm_repo/) for command documentation._
 
+This fork's `X.Y.Z-watch-all-namespaces` charts are published to
+`https://stradivario.github.io/fission` by `.github/workflows/chart-publish.yaml`
+on every push to `release/custom-v3.0` that changes `charts/`; the images come
+from the matching `vX.Y.Z-watch-all-namespaces` tag.
+
 ## Install Chart
 
 Replace `{{appVersion}}` with [the latest Fission version](https://github.com/fission/fission/releases/latest).

@@ -17,6 +17,7 @@ import (
 	cnwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/fission/fission/cmd/fission-bundle/mqtrigger"
+	fv1 "github.com/fission/fission/pkg/apis/core/v1"
 	"github.com/fission/fission/pkg/buildermgr"
 	"github.com/fission/fission/pkg/canaryconfigmgr"
 	"github.com/fission/fission/pkg/crd"
@@ -27,6 +28,8 @@ import (
 	"github.com/fission/fission/pkg/mcp"
 	mqt "github.com/fission/fission/pkg/mqtrigger"
 	"github.com/fission/fission/pkg/router"
+	"github.com/fission/fission/pkg/statestore/statestoresvc"
+	"github.com/fission/fission/pkg/statesvc"
 	"github.com/fission/fission/pkg/storagesvc"
 	storagesvcClient "github.com/fission/fission/pkg/storagesvc/client"
 	"github.com/fission/fission/pkg/svcinfo"
@@ -37,6 +40,7 @@ import (
 	"github.com/fission/fission/pkg/utils/otel"
 	"github.com/fission/fission/pkg/utils/profile"
 	"github.com/fission/fission/pkg/webhook"
+	"github.com/fission/fission/pkg/workflow"
 )
 
 // Command line arguments
@@ -59,6 +63,9 @@ type CommandLineArgs struct {
 	executorPort       int
 	storageServicePort int
 	mcpPort            int
+	statestorePort     int
+	workflowPort       int
+	stateAPIPort       int
 
 	// URL values — empty means "not set": the resolver derives the
 	// in-cluster default from POD_NAMESPACE (see svcinfo.AddressResolver)
@@ -135,6 +142,14 @@ func main() {
 	// Initialize logger
 	logger := loggerfactory.GetLogger()
 
+	// Fail closed on a present-but-empty internal-auth key before ANY
+	// subsystem constructs a verifier — every --<flag> this binary dispatches
+	// to reads the same environment, so this one check covers them all.
+	if err := fv1.ValidateInternalAuthEnv(); err != nil {
+		logger.Error(err, "invalid internal-auth environment")
+		os.Exit(1)
+	}
+
 	// GOMAXPROCS is left to the runtime: Go ≥1.25 derives it from the cgroup
 	// CPU quota (including on in-place resize); automaxprocs would regress that.
 
@@ -202,6 +217,9 @@ func setupCommandLineArgs() *CommandLineArgs {
 	flag.IntVar(&args.executorPort, "executorPort", 0, "Port that the executor should listen on")
 	flag.IntVar(&args.storageServicePort, "storageServicePort", 0, "Port that the storage service should listen on")
 	flag.IntVar(&args.mcpPort, "mcpPort", 0, "Port that the MCP tool server should listen on")
+	flag.IntVar(&args.statestorePort, "statestorePort", 0, "Port that the embedded statestore should listen on (RFC-0021 embedded mode)")
+	flag.IntVar(&args.workflowPort, "workflowPort", 0, "Port that the workflow engine should listen on (RFC-0022)")
+	flag.IntVar(&args.stateAPIPort, "stateApiPort", 0, "Port that the statesvc function-facing state API should listen on (RFC-0023)")
 
 	// URL flags
 	flag.StringVar(&args.executorUrl, "executorUrl", "", "Executor URL (default http://executor.<POD_NAMESPACE>)")
@@ -332,6 +350,37 @@ func bundleServices() []bundleService {
 			selected: func(a *CommandLineArgs) bool { return a.mcpPort != 0 },
 			run: func(ctx context.Context, d bundleDeps) error {
 				return mcp.Start(ctx, d.clientGen, d.logger, d.mgr, mcp.Options{Port: d.args.mcpPort, RouterInternalURL: d.resolver.RouterInternalURL()})
+			},
+		},
+		{
+			// The workflow engine (RFC-0022) invokes functions on the router
+			// internal listener like the other publishers; its statestore
+			// config arrives via env (STATESTORE_DRIVER/DSN).
+			name:     "Fission-Workflow",
+			selected: func(a *CommandLineArgs) bool { return a.workflowPort != 0 },
+			run: func(ctx context.Context, d bundleDeps) error {
+				return workflow.Start(ctx, d.clientGen, d.logger, d.mgr, workflow.Options{Port: d.args.workflowPort, RouterInternalURL: d.resolver.RouterInternalURL()})
+			},
+		},
+		{
+			// The embedded statestore (RFC-0021) owns a PVC-backed SQLite file and
+			// serves the capability API over the ServiceStatestore HMAC-verified
+			// listener. It reads its DSN and secrets from the environment.
+			name:     "Fission-Statestore",
+			selected: func(a *CommandLineArgs) bool { return a.statestorePort != 0 },
+			run: func(ctx context.Context, d bundleDeps) error {
+				return statestoresvc.Start(ctx, d.clientGen, d.logger, d.mgr, statestoresvc.Options{Port: d.args.statestorePort})
+			},
+		},
+		{
+			// statesvc (RFC-0023) is the SCOPED function-facing keyed-state head:
+			// per-keyspace token auth over the statestore via the scoped wrapper.
+			// Deliberately separate from the raw statestore head above, which must
+			// never be reachable from function pods.
+			name:     "Fission-StateSvc",
+			selected: func(a *CommandLineArgs) bool { return a.stateAPIPort != 0 },
+			run: func(ctx context.Context, d bundleDeps) error {
+				return statesvc.Start(ctx, d.clientGen, d.logger, d.mgr, statesvc.Options{Port: d.args.stateAPIPort})
 			},
 		},
 		{

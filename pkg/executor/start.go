@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
@@ -43,6 +44,8 @@ import (
 	"github.com/fission/fission/pkg/executor/funcreconciler"
 	"github.com/fission/fission/pkg/executor/reaper/idle"
 	"github.com/fission/fission/pkg/executor/util"
+	"github.com/fission/fission/pkg/executor/versiongc"
+	"github.com/fission/fission/pkg/executor/versionretain"
 	fetcherConfig "github.com/fission/fission/pkg/fetcher/config"
 	"github.com/fission/fission/pkg/generated/clientset/versioned/scheme"
 	"github.com/fission/fission/pkg/svcinfo"
@@ -123,8 +126,9 @@ func executorCacheOptions() crcache.Options {
 		// Secret cache would mirror every Secret in the cluster into the executor's
 		// memory, the one read the design forbids. Override the per-type namespaces
 		// to the env-seeded set, leaving the cluster-wide default to the Tier-A CRDs
-		// only. (Operators needing Tier-B reads in arbitrary runtime-onboarded
-		// namespaces use cluster mode, which goes cluster-wide above.)
+		// only. The executor's Secret/ConfigMap change reconcilers do not use this
+		// cache in dynamic mode: tenantwatch.Watcher runs per-tenant metadata-only
+		// watches that follow the live tenant set instead.
 		byObject[&corev1.Secret{}] = crcache.ByObject{Namespaces: nsConfig}
 		byObject[&corev1.ConfigMap{}] = crcache.ByObject{Namespaces: nsConfig}
 		// ReplicaSets (poolmgr's specialized-pod cleanup watch) are not label-bounded
@@ -167,6 +171,9 @@ type executorControllers struct {
 	executorTypes  map[fv1.ExecutorType]executortype.ExecutorType
 	waitForSync    func(ctx context.Context) bool
 	adoptResources bool
+	// syncTenants loads the live tenant set into the resolver (dynamic/cluster
+	// tenancy only; nil otherwise). See syncTenantsBeforeAdopt.
+	syncTenants func(ctx context.Context) error
 }
 
 func (c *executorControllers) NeedLeaderElection() bool { return true }
@@ -188,7 +195,9 @@ func (c *executorControllers) Start(ctx context.Context) error {
 	idleReaper := idle.NewReaper(c.logger, strategies...)
 	gm.Go(func() error { idleReaper.Start(ctx); return nil })
 
-	runAdoptCleanup(ctx, c.executorTypes, c.adoptResources)
+	if syncTenantsBeforeAdopt(ctx, c.logger, c.syncTenants, adoptCleanupMaxWait, time.Second) {
+		runAdoptCleanup(ctx, c.executorTypes, c.adoptResources)
+	}
 
 	c.api.isLeader.Store(true)
 	go c.markSyncedWhenCachesWarm(ctx)
@@ -232,6 +241,31 @@ func (a *executorAPIServer) Start(ctx context.Context) error {
 // CleanupOldExecutorObjects runs after AdoptExistingResources within each
 // goroutine regardless, so it never reaps objects adopt hasn't re-stamped.
 const adoptCleanupMaxWait = 30 * time.Second
+
+// syncTenantsBeforeAdopt loads the tenant set into the resolver before the
+// adopt + cleanup pass, retrying until it succeeds or timeout passes. Adopt and
+// the stale-instanceID reaper each snapshot the resolver's namespaces; at startup
+// the resolver-sync controller fills the tenant set concurrently, so adopt saw
+// only the env seed while the reaper, moments later, saw the tenants and deleted
+// every Deployment adopt had not re-stamped (every function's Deployment in
+// every tenant namespace, on each executor restart). It returns false when the
+// set could not be loaded: the pass is then skipped — leaving orphans is safe,
+// reaping against a partial tenant set is not.
+func syncTenantsBeforeAdopt(ctx context.Context, logger logr.Logger, sync func(context.Context) error, timeout, interval time.Duration) bool {
+	if sync == nil {
+		return true
+	}
+	var lastErr error
+	err := wait.PollUntilContextTimeout(ctx, interval, timeout, true, func(ctx context.Context) (bool, error) {
+		lastErr = sync(ctx)
+		return lastErr == nil, nil
+	})
+	if err != nil {
+		logger.Error(lastErr, "could not load the tenant set; skipping adopt and orphan cleanup of existing executor objects")
+		return false
+	}
+	return true
+}
 
 // runAdoptCleanup adopts pre-existing resources (optional) and cleans up stale
 // executor objects. Runs on the leader.
@@ -319,6 +353,17 @@ func StartExecutor(ctx context.Context, clientGen crd.ClientGeneratorInterface, 
 		podSpecPatch)
 	if err != nil {
 		return fmt.Errorf("pool manager creation failed: %w", err)
+	}
+
+	// versionRetainView answers, for the poolmgr idle reaper, whether a live
+	// FunctionAlias still references a (function UID, generation) pin
+	// (RFC-0025 "warm rollback" correction). It starts empty and is fed by
+	// RegisterReconcilers below once the Manager exists; wiring it into gpm
+	// now (before the reaper ever runs) is safe regardless of registration
+	// order since the View itself needs no Manager.
+	versionRetainView := versionretain.New()
+	if gpmTyped, ok := gpm.(*poolmgr.GenericPoolManager); ok {
+		gpmTyped.SetVersionRetain(versionRetainView.Retained)
 	}
 
 	// newdeploy/container read Deployments/Services from the Manager cache (their
@@ -430,6 +475,33 @@ func StartExecutor(ctx context.Context, clientGen crd.ClientGeneratorInterface, 
 		return err
 	}
 
+	// versionRetainView's reconcilers (RFC-0025): watch FunctionAlias and
+	// FunctionVersion, rebuilding the retain set on any event so the poolmgr
+	// idle reaper (wired above via SetVersionRetain) does not drain a
+	// generation an alias still points at. See versionretain.RegisterReconcilers.
+	if err := versionretain.RegisterReconcilers(crMgr, versionRetainView); err != nil {
+		return err
+	}
+
+	// versiongc (RFC-0025): when a FunctionVersion CR is deleted (retention GC
+	// sweep or manual delete), tear down that version's per-version
+	// Deployment/Service/HPA set for the newdeploy and container executor
+	// types — nothing else removes it before the whole Function is deleted.
+	// Label-driven, not ownerRef-driven; see versiongc's package doc for the
+	// cross-namespace (functionNamespace) analysis. Poolmgr is deliberately
+	// absent: its per-version pods are pool-managed and idle-reaped via
+	// versionretain.
+	versionCleaners := make([]versiongc.VersionObjectCleaner, 0, 2)
+	if nd, ok := ndm.(*newdeploy.NewDeploy); ok {
+		versionCleaners = append(versionCleaners, nd)
+	}
+	if cn, ok := cnm.(*container.Container); ok {
+		versionCleaners = append(versionCleaners, cn)
+	}
+	if err := versiongc.RegisterReconciler(crMgr, logger, versionCleaners...); err != nil {
+		return err
+	}
+
 	// Cross-process propagation: under dynamic tenancy keep the executor's resolver
 	// in step with the FissionTenant set so a namespace onboarded at runtime is
 	// admitted by the func/env membership predicates (and gets pooled/specialized)
@@ -457,6 +529,11 @@ func StartExecutor(ctx context.Context, clientGen crd.ClientGeneratorInterface, 
 		executorTypes:  executorTypes,
 		waitForSync:    waitForSync,
 		adoptResources: adoptExistingResources,
+	}
+	if utils.CrdWatchClusterWide() {
+		controllers.syncTenants = func(ctx context.Context) error {
+			return tenant.SyncResolverFromTenants(ctx, crMgr.GetAPIReader(), utils.DefaultNSResolver())
+		}
 	}
 	if err := crMgr.Add(controllers); err != nil {
 		return fmt.Errorf("unable to add executor controllers: %w", err)

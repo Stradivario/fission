@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
@@ -23,8 +22,8 @@ import (
 func TestUpdateOnConflictRetriesAndReapplies(t *testing.T) {
 	t.Parallel()
 	tt := &fv1.TimeTrigger{
-		ObjectMeta: metav1.ObjectMeta{Name: "tt", Namespace: "default"},
-		Spec:       fv1.TimeTriggerSpec{Cron: "@every 1h"},
+		Name: "tt", Namespace: "default",
+		Spec: fv1.TimeTriggerSpec{Cron: "@every 1h"},
 	}
 	cs := fissionfake.NewClientset(tt)
 
@@ -41,6 +40,7 @@ func TestUpdateOnConflictRetriesAndReapplies(t *testing.T) {
 		// Echo the submitted object back (handled here rather than falling
 		// through, since the fake tracker's apply/SMD path can't convert CRD
 		// types).
+		// SAFETY: this reactor is registered for "update", so the action is an UpdateAction.
 		return true, action.(k8stesting.UpdateAction).GetObject(), nil
 	})
 

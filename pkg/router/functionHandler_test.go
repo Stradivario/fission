@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
+	"github.com/fission/fission/pkg/crd"
 	ferror "github.com/fission/fission/pkg/error"
 	"github.com/fission/fission/pkg/generated/clientset/versioned/scheme"
 	"github.com/fission/fission/pkg/utils/correlation"
@@ -37,10 +39,8 @@ func TestProxyErrorHandler(t *testing.T) {
 	fh := &functionHandler{
 		logger: logger,
 		function: &fv1.Function{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "dummy",
-				Namespace: "dummy-bar",
-			},
+			Name:      "dummy",
+			Namespace: "dummy-bar",
 		},
 	}
 
@@ -107,7 +107,7 @@ func TestClassifyFunctionError(t *testing.T) {
 // failure. Verbose Message is gated behind debug.
 func TestProxyErrorHandlerStructuredBody(t *testing.T) {
 	logger := loggerfactory.GetLogger()
-	fn := &fv1.Function{ObjectMeta: metav1.ObjectMeta{Name: "dummy", Namespace: "dummy-bar"}}
+	fn := &fv1.Function{Name: "dummy", Namespace: "dummy-bar"}
 
 	newHandler := func(debug bool) func(http.ResponseWriter, *http.Request, error) {
 		fh := &functionHandler{logger: logger, function: fn, structuredErrors: true, isDebugEnv: debug}
@@ -182,7 +182,7 @@ func (r *recordingExecutor) EnsureCapacity(context.Context, *fv1.Function, int, 
 }
 
 func fnWithPkg(rv, pkg string) *fv1.Function {
-	fn := &fv1.Function{ObjectMeta: metav1.ObjectMeta{Name: "fn", Namespace: "default", ResourceVersion: rv}}
+	fn := &fv1.Function{Name: "fn", Namespace: "default", ResourceVersion: rv}
 	fn.Spec.Package.PackageRef.Name = pkg
 	return fn
 }
@@ -205,6 +205,37 @@ func TestResolverFromExecutorReReadsCurrentFunction(t *testing.T) {
 	require.NotNil(t, exec.gotFn)
 	assert.Equal(t, "pkg-v2", exec.gotFn.Spec.Package.PackageRef.Name, "executor must get the re-read function, not the stale snapshot")
 	assert.Equal(t, "2", exec.gotFn.ResourceVersion)
+}
+
+// TestResolverVersionedProjectionPassesThrough guards the RFC-0025 pin:
+// a version-pinned projection (fv1.FUNCTION_VERSION label present) must reach
+// the executor AS-IS — Spec, Generation, and label intact — even when the
+// Manager cache holds a diverged live Function. The version snapshot is
+// immutable, so the currentFunction staleness re-read must not apply;
+// substituting the live Function specializes the wrong version's code.
+func TestResolverVersionedProjectionPassesThrough(t *testing.T) {
+	logger := loggerfactory.GetLogger()
+
+	live := fnWithPkg("7", "pkg-live-v2") // what the Manager cache holds (diverged)
+	live.Generation = 2
+
+	// The alias/version-pinned projection versioning.VersionedFunction builds:
+	// same identity, snapshot Spec, pinned Generation, version label.
+	pinned := fnWithPkg("7", "pkg-snapshot-v1")
+	pinned.Generation = 1
+	pinned.Labels = map[string]string{fv1.FUNCTION_VERSION: "fn-v1"}
+
+	reader := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(live).Build()
+	exec := &recordingExecutor{}
+	r := &executorResolver{logger: logger, reader: reader, executor: exec}
+
+	_, err := r.fromExecutor(t.Context(), pinned)
+	require.NoError(t, err)
+	require.NotNil(t, exec.gotFn)
+	assert.Same(t, pinned, exec.gotFn, "the projection must pass through unmodified — no re-read substitution")
+	assert.Equal(t, "pkg-snapshot-v1", exec.gotFn.Spec.Package.PackageRef.Name, "executor must get the pinned snapshot spec, not the live spec")
+	assert.Equal(t, int64(1), exec.gotFn.Generation, "executor must get the pinned generation")
+	assert.Equal(t, "fn-v1", exec.gotFn.Labels[fv1.FUNCTION_VERSION], "the version label must survive to the executor")
 }
 
 // TestResolverFromExecutorFallsBackToSnapshot: with no reader the captured
@@ -235,19 +266,20 @@ func TestPrecomputedPolicyParity(t *testing.T) {
 	stream.Spec.Streaming = &fv1.StreamingConfig{IdleTimeoutSeconds: 7}
 
 	fns := map[string]*fv1.Function{classic.Name: classic, stream.Name: stream}
-	timeouts := map[k8stypes.UID]int{classic.GetUID(): 42} // stream falls to default
+	timeouts := map[crd.CacheKeyUG]int{crd.CacheKeyUGFromMeta(&classic.ObjectMeta): 42} // stream falls to default
 	const idleDefault = 33 * time.Second
 
 	policies := precomputePolicies(fns, timeouts, idleDefault)
 	require.Len(t, policies, 2)
 
 	for _, fn := range fns {
-		fnTimeout := timeouts[fn.GetUID()]
+		key := crd.CacheKeyUGFromMeta(&fn.ObjectMeta)
+		fnTimeout := timeouts[key]
 		if fnTimeout == 0 {
 			fnTimeout = fv1.DEFAULT_FUNCTION_TIMEOUT
 		}
 		want := resolveProxyPolicy(fn, time.Duration(fnTimeout)*time.Second, idleDefault)
-		assert.Equal(t, want, policies[fn.GetUID()], "hoisted policy must match per-request computation for %s", fn.Name)
+		assert.Equal(t, want, policies[key], "hoisted policy must match per-request computation for %s", fn.Name)
 	}
 
 	// The handler-side lookup helper returns the hoisted entry, and falls back
@@ -256,10 +288,158 @@ func TestPrecomputedPolicyParity(t *testing.T) {
 		tsRoundTripperParams: &tsRoundTripperParams{streamIdleDefault: idleDefault},
 		policyByUID:          policies,
 	}
-	assert.Equal(t, policies[stream.GetUID()], fh.proxyPolicyFor(stream, time.Duration(fv1.DEFAULT_FUNCTION_TIMEOUT)*time.Second))
+	assert.Equal(t, policies[crd.CacheKeyUGFromMeta(&stream.ObjectMeta)], fh.proxyPolicyFor(stream, time.Duration(fv1.DEFAULT_FUNCTION_TIMEOUT)*time.Second))
 	bare := &functionHandler{tsRoundTripperParams: &tsRoundTripperParams{streamIdleDefault: idleDefault}}
 	assert.Equal(t,
 		resolveProxyPolicy(classic, 42*time.Second, idleDefault),
 		bare.proxyPolicyFor(classic, 42*time.Second),
 		"missing map must fall back to direct computation")
+}
+
+// TestPerVersionTimeoutAndPolicyDoNotCollideOnSharedUID pins the RFC-0025
+// invariant that two resolved *fv1.Function snapshots of the same versioned
+// function -- e.g. a weighted alias's primary and secondary target -- share
+// a UID (versioning.VersionedFunction always copies live's identity) but
+// differ in Generation (each pins a different FunctionVersion). Keying
+// functionTimeoutMap/policyByUID on UID alone would collapse the two into
+// one entry and silently serve one snapshot's timeout/streaming policy to
+// the other; keying on crd.CacheKeyUG (UID, Generation) keeps them distinct.
+func TestPerVersionTimeoutAndPolicyDoNotCollideOnSharedUID(t *testing.T) {
+	sharedUID := k8stypes.UID("shared-fn-uid")
+
+	primary := &fv1.Function{
+		Name: "hello", Namespace: "default", UID: sharedUID, Generation: 1,
+		Spec: fv1.FunctionSpec{FunctionTimeout: 10},
+	}
+	secondary := &fv1.Function{
+		Name: "hello", Namespace: "default", UID: sharedUID, Generation: 2,
+		Spec: fv1.FunctionSpec{
+			FunctionTimeout: 99,
+			Streaming:       &fv1.StreamingConfig{IdleTimeoutSeconds: 3},
+		},
+	}
+	require.Equal(t, primary.UID, secondary.UID, "precondition: both snapshots share one UID")
+	require.NotEqual(t, primary.Generation, secondary.Generation, "precondition: Generations differ")
+
+	primaryKey := crd.CacheKeyUGFromMeta(&primary.ObjectMeta)
+	secondaryKey := crd.CacheKeyUGFromMeta(&secondary.ObjectMeta)
+	require.NotEqual(t, primaryKey, secondaryKey, "CacheKeyUG must differ even though the UID is shared")
+
+	fnTimeoutMap := map[crd.CacheKeyUG]int{primaryKey: 10, secondaryKey: 99}
+	const idleDefault = 20 * time.Second
+	policies := precomputePolicies(
+		map[string]*fv1.Function{"primary": primary, "secondary": secondary},
+		fnTimeoutMap, idleDefault)
+	require.Len(t, policies, 2, "both snapshots must get their own policy entry")
+
+	fh := &functionHandler{
+		tsRoundTripperParams: &tsRoundTripperParams{streamIdleDefault: idleDefault},
+		functionTimeoutMap:   fnTimeoutMap,
+		policyByUID:          policies,
+	}
+
+	assert.Equal(t, 10, fh.functionTimeoutMap[primaryKey])
+	assert.Equal(t, 99, fh.functionTimeoutMap[secondaryKey])
+
+	primaryPolicy := fh.proxyPolicyFor(primary, 10*time.Second)
+	secondaryPolicy := fh.proxyPolicyFor(secondary, 99*time.Second)
+	assert.Equal(t, 10*time.Second, primaryPolicy.maxDuration, "primary's own timeout, not collapsed with secondary's")
+	assert.False(t, primaryPolicy.streaming, "primary snapshot has no Streaming config")
+	assert.True(t, secondaryPolicy.streaming, "secondary snapshot's Streaming config must not be shadowed by primary's")
+	assert.Equal(t, 3*time.Second, secondaryPolicy.idleTimeout, "secondary's own idle timeout, not collapsed with primary's (no streaming)")
+}
+
+// roundTripperFunc adapts a func to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestDirectorParityRewrite pins what a function actually receives through the
+// proxy. It exists because the Director -> Rewrite migration silently changed
+// three things, and nothing caught it: httputil.ReverseProxy deletes the whole
+// forwarding set before calling a Rewrite hook (Director passed it through) and
+// runs cleanQueryParams unconditionally (Director ran it only when outreq.Form
+// was non-nil, which the router never sets). The pre-existing coverage tested
+// addForwardedHostHeader on a hand-built request, never through a proxy, so an
+// ingress's X-Forwarded-Host silently became the router's own host.
+//
+// The assertions below are the DIRECTOR-era values. Anything that changes what
+// reaches the function must fail here.
+func TestDirectorParityRewrite(t *testing.T) {
+	t.Parallel()
+
+	// captureRT stands in for RetryingRoundTripper, which calls
+	// addForwardedHostHeader (transport.go) after the Rewrite hook has run.
+	type captured struct {
+		header http.Header
+		query  string
+	}
+	proxyThrough := func(t *testing.T, in *http.Request) captured {
+		t.Helper()
+		var got captured
+		rt := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			addForwardedHostHeader(req)
+			got = captured{header: req.Header.Clone(), query: req.URL.RawQuery}
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}, nil
+		})
+		proxy := &httputil.ReverseProxy{Rewrite: directorParityRewrite, Transport: rt}
+		proxy.ServeHTTP(httptest.NewRecorder(), in)
+		return got
+	}
+
+	t.Run("an ingress's forwarding headers reach the function untouched", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodGet, "http://router.fission/fission-function/hello", nil)
+		req.Host = "router.fission"
+		req.RemoteAddr = "10.0.0.9:1234"
+		req.Header.Set("X-Forwarded-Host", "myapp.example.com")
+		req.Header.Set("X-Forwarded-Proto", "https")
+		req.Header.Set("Forwarded", "host=myapp.example.com;proto=https")
+		req.Header.Set("X-Forwarded-For", "203.0.113.7")
+		req.URL.Scheme, req.URL.Host = "http", "backend.local"
+
+		got := proxyThrough(t, req)
+
+		// The user-facing host, NOT router.fission: a function building an
+		// absolute callback or OAuth redirect URI depends on these.
+		assert.Equal(t, "myapp.example.com", got.header.Get("X-Forwarded-Host"))
+		assert.Equal(t, "https", got.header.Get("X-Forwarded-Proto"))
+		assert.Equal(t, "host=myapp.example.com;proto=https", got.header.Get("Forwarded"))
+		// The client IP is appended to the inbound chain, not replacing it.
+		assert.Equal(t, "203.0.113.7, 10.0.0.9", got.header.Get("X-Forwarded-For"))
+	})
+
+	t.Run("without an upstream proxy the router synthesizes its own host", func(t *testing.T) {
+		t.Parallel()
+		req := httptest.NewRequest(http.MethodGet, "http://router.fission/fission-function/hello", nil)
+		req.Host = "router.fission"
+		req.RemoteAddr = "10.0.0.9:1234"
+		req.URL.Scheme, req.URL.Host = "http", "backend.local"
+
+		got := proxyThrough(t, req)
+
+		// addForwardedHostHeader fills these in when no external proxy did.
+		assert.Equal(t, "router.fission", got.header.Get("X-Forwarded-Host"))
+		assert.Equal(t, "host=router.fission;", got.header.Get("Forwarded"))
+		assert.Empty(t, got.header.Get("X-Forwarded-Proto"), "nothing synthesizes a scheme")
+		assert.Equal(t, "10.0.0.9", got.header.Get("X-Forwarded-For"))
+	})
+
+	t.Run("query strings reach the function verbatim", func(t *testing.T) {
+		t.Parallel()
+		// Each of these trips httputil's cleanQueryParams, which re-encodes via
+		// url.ParseQuery: pairs get dropped and the survivors sorted.
+		for _, raw := range []string{"a=1;b=2", "z=9&a=1&bad=%zz", "b=2&a=1"} {
+			t.Run(raw, func(t *testing.T) {
+				t.Parallel()
+				req := httptest.NewRequest(http.MethodGet, "http://router.fission/fission-function/hello?"+raw, nil)
+				req.Host = "router.fission"
+				req.RemoteAddr = "10.0.0.9:1234"
+				req.URL.Scheme, req.URL.Host = "http", "backend.local"
+
+				assert.Equal(t, raw, proxyThrough(t, req).query,
+					"the function must receive the query byte-for-byte, unsorted and unfiltered")
+			})
+		}
+	})
 }

@@ -7,6 +7,7 @@ package flag
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	fv1 "github.com/fission/fission/pkg/apis/core/v1"
@@ -25,12 +26,21 @@ type (
 	}
 
 	Flag struct {
-		Name         string
-		Type         FlagType
-		Short        string // one-letter abbreviated flag
-		Aliases      []string
-		Usage        string
-		DefaultValue any
+		Name    string
+		Type    FlagType
+		Short   string // one-letter abbreviated flag
+		Aliases []string
+		Usage   string
+
+		// Default value, in the field that matches Type. Flag kinds without a
+		// field here (IntSlice, Int64Slice, Float32, Float64) default to their
+		// zero value.
+		DefaultBool     bool
+		DefaultString   string
+		DefaultStrings  []string
+		DefaultInt      int
+		DefaultInt64    int64
+		DefaultDuration time.Duration
 
 		// If a flag is marked as deprecated, it will hidden from
 		// the help message automatically. Hence, a flag cannot be
@@ -41,6 +51,60 @@ type (
 		Substitute string
 	}
 )
+
+// defaultFieldFor pairs a FlagType with the one Default* field that carries
+// its default. It is the single place that mapping is written down.
+var defaultFieldFor = map[FlagType]string{
+	Bool:        "DefaultBool",
+	String:      "DefaultString",
+	StringSlice: "DefaultStrings",
+	Int:         "DefaultInt",
+	Int64:       "DefaultInt64",
+	Duration:    "DefaultDuration",
+}
+
+// CheckDefault rejects a default written into a field that does not match the
+// flag's Type.
+//
+// Type is the discriminator and the Default* fields are its variants, but the
+// compiler cannot tie them together: `Flag{Type: Duration, DefaultInt: 30}`
+// builds fine and toCobraFlag then registers the flag with a zero default,
+// silently. That is the same failure this struct exists to fix — an untyped
+// `DefaultValue: 90` on an Int64 flag landed in an `any`, failed the int64
+// assertion, and both --graceperiod flags registered as 0 for years.
+// Enforcing the pairing at construction keeps the class closed.
+func (f Flag) CheckDefault() error {
+	var set []string
+	if f.DefaultBool {
+		set = append(set, "DefaultBool")
+	}
+	if f.DefaultString != "" {
+		set = append(set, "DefaultString")
+	}
+	if f.DefaultStrings != nil {
+		set = append(set, "DefaultStrings")
+	}
+	if f.DefaultInt != 0 {
+		set = append(set, "DefaultInt")
+	}
+	if f.DefaultInt64 != 0 {
+		set = append(set, "DefaultInt64")
+	}
+	if f.DefaultDuration != 0 {
+		set = append(set, "DefaultDuration")
+	}
+	if len(set) == 0 {
+		return nil
+	}
+	want, ok := defaultFieldFor[f.Type]
+	if !ok {
+		return fmt.Errorf("flag %q: this kind takes no default, but %s is set", f.Name, strings.Join(set, ", "))
+	}
+	if len(set) > 1 || set[0] != want {
+		return fmt.Errorf("flag %q: this kind reads %s, but %s is set", f.Name, want, strings.Join(set, ", "))
+	}
+	return nil
+}
 
 const (
 	Bool FlagType = iota + 1
@@ -56,93 +120,171 @@ const (
 )
 
 var (
-	GlobalVerbosity = Flag{Type: Int, Name: flagkey.Verbosity, Short: "v", Usage: "CLI verbosity (0 is quiet, 1 is the default, 2 is verbose)", DefaultValue: 1}
+	GlobalVerbosity = Flag{Type: Int, Name: flagkey.Verbosity, Short: "v", Usage: "CLI verbosity (0 is quiet, 1 is the default, 2 is verbose)", DefaultInt: 1}
 
 	ClientOnly = Flag{Type: Bool, Name: flagkey.ClientOnly, Usage: "If set, the CLI won't connect to remote server"}
 
 	PreCheckOnly = Flag{Type: Bool, Name: flagkey.PreCheckOnly, Usage: "Only run pre-installation checks, to determine if fission can be installed"}
 
-	KubeContext = Flag{Type: String, Name: flagkey.KubeContext, Usage: "Kubernetes context to be used for the execution of Fission commands", DefaultValue: ""}
+	KubeContext = Flag{Type: String, Name: flagkey.KubeContext, Usage: "Kubernetes context to be used for the execution of Fission commands", DefaultString: ""}
 
-	IgnoreNotFound = Flag{Type: Bool, Name: flagkey.IgnoreNotFound, Usage: "Treat \"resource not found\" as a successful delete.", DefaultValue: false}
+	IgnoreNotFound = Flag{Type: Bool, Name: flagkey.IgnoreNotFound, Usage: "Treat \"resource not found\" as a successful delete.", DefaultBool: false}
 
 	Labels     = Flag{Type: String, Name: flagkey.Labels, Usage: "Comma separated labels to apply to the function. E.g. --labels=\"environment=dev,application=analytics\""}
 	Annotation = Flag{Type: StringSlice, Name: flagkey.Annotation, Usage: "Annotation to apply to the function. To mention multiple annotations --annotation=\"abc.com/team=dev\" --annotation=\"foo=bar\""}
 
 	Namespace = Flag{Type: String, Name: flagkey.Namespace, Short: "n", Usage: "If present, the namespace scope for this CLI request"}
 
-	ForceNamespace     = Flag{Type: Bool, Name: flagkey.ForceNamespace, Aliases: []string{"force"}, Usage: "If true, resources will be created in namespace provided by (--namespace flag ) even if spec file contains some other namespace", DefaultValue: false}
+	ForceNamespace     = Flag{Type: Bool, Name: flagkey.ForceNamespace, Aliases: []string{"force"}, Usage: "If true, resources will be created in namespace provided by (--namespace flag ) even if spec file contains some other namespace", DefaultBool: false}
 	ForceDelete        = Flag{Type: Bool, Name: flagkey.ForceDelete, Aliases: []string{"force"}, Usage: "Delete all resources across all namespaces present in spec"}
 	AllNamespaces      = Flag{Type: Bool, Name: flagkey.AllNamespaces, Short: "A", Usage: "Fetch resources from all namespaces"}
 	Output             = Flag{Type: String, Name: flagkey.Output, Short: "o", Usage: "Output format: wide, json or yaml (default: table)"}
 	WaitFor            = Flag{Type: String, Name: flagkey.WaitFor, Usage: "Condition to wait for, e.g. condition=Ready or condition=Ready=False"}
-	WaitTimeout        = Flag{Type: Duration, Name: flagkey.WaitTimeout, DefaultValue: util.DefaultWaitTimeout, Usage: "Maximum time to wait for the condition before giving up"}
+	WaitTimeout        = Flag{Type: Duration, Name: flagkey.WaitTimeout, DefaultDuration: util.DefaultWaitTimeout, Usage: "Maximum time to wait for the condition before giving up"}
 	RunTimeMinCPU      = Flag{Type: Int, Name: flagkey.RuntimeMincpu, Usage: "Minimum CPU to be assigned to pod (In millicore, minimum 1)"}
 	RunTimeMaxCPU      = Flag{Type: Int, Name: flagkey.RuntimeMaxcpu, Usage: "Maximum CPU to be assigned to pod (In millicore, minimum 1)"}
-	RunTimeTargetCPU   = Flag{Type: Int, Name: flagkey.RuntimeTargetcpu, Usage: "Target average CPU usage percentage across pods for scaling", DefaultValue: 80}
+	RunTimeTargetCPU   = Flag{Type: Int, Name: flagkey.RuntimeTargetcpu, Usage: "Target average CPU usage percentage across pods for scaling", DefaultInt: 80}
 	RunTimeMinMemory   = Flag{Type: Int, Name: flagkey.RuntimeMinmemory, Usage: "Minimum memory to be assigned to pod (In megabyte)"}
 	RunTimeMaxMemory   = Flag{Type: Int, Name: flagkey.RuntimeMaxmemory, Usage: "Maximum memory to be assigned to pod (In megabyte)"}
 	RunImagePullSecret = Flag{Type: String, Name: flagkey.RunImagePullSecret, Usage: "Secret for Kubernetes to pull an image from a private registry"}
 
-	ReplicasMin = Flag{Type: Int, Name: flagkey.ReplicasMinscale, Usage: "Minimum number of pods (Uses resource inputs to configure HPA)", DefaultValue: 1}
-	ReplicasMax = Flag{Type: Int, Name: flagkey.ReplicasMaxscale, Usage: "Maximum number of pods (Uses resource inputs to configure HPA)", DefaultValue: 1}
+	ReplicasMin = Flag{Type: Int, Name: flagkey.ReplicasMinscale, Usage: "Minimum number of pods (Uses resource inputs to configure HPA)", DefaultInt: 1}
+	ReplicasMax = Flag{Type: Int, Name: flagkey.ReplicasMaxscale, Usage: "Maximum number of pods (Uses resource inputs to configure HPA)", DefaultInt: 1}
 
 	FnName                  = Flag{Type: String, Name: flagkey.FnName, Usage: "Function name"}
-	FnSpecializationTimeout = Flag{Type: Int, Name: flagkey.FnSpecializationTimeout, Aliases: []string{"st"}, Usage: "Timeout for executor to wait for function pod creation", DefaultValue: fv1.DefaultSpecializationTimeOut}
+	FnSpecializationTimeout = Flag{Type: Int, Name: flagkey.FnSpecializationTimeout, Aliases: []string{"st"}, Usage: "Timeout for executor to wait for function pod creation", DefaultInt: fv1.DefaultSpecializationTimeOut}
 	FnEnvName               = Flag{Type: String, Name: flagkey.FnEnvironmentName, Usage: "Environment name for function"}
 	FnPkgName               = Flag{Type: String, Name: flagkey.FnPackageName, Aliases: []string{"pkg"}, Usage: "Name of the existing package (--deploy and --src and --env will be ignored), should be in the same namespace as the function"}
 	FnImageName             = Flag{Type: String, Name: flagkey.FnImageName, Usage: "Name of the Docker image to be deployed as a function. Valid only when executorType is set to 'container'"}
-	FnPort                  = Flag{Type: Int, Name: flagkey.FnPort, Usage: "Port where the application is running", DefaultValue: svcinfo.PortEnvRuntime}
+	FnPort                  = Flag{Type: Int, Name: flagkey.FnPort, Usage: "Port where the application is running", DefaultInt: svcinfo.PortEnvRuntime}
 	FnCommand               = Flag{Type: String, Name: flagkey.FnCommand, Usage: "Command to be passed to the container. If not specified , the ones defined in the image are used"}
 	FnArgs                  = Flag{Type: String, Name: flagkey.FnArgs, Usage: "Args to be passed to the command on the container. If not specified , the ones defined in the image are used"}
 	FnEntryPoint            = Flag{Type: String, Name: flagkey.FnEntrypoint, Aliases: []string{"entry"}, Usage: "Entry point for environment v2 to load with"}
 	FnBuildCmd              = Flag{Type: String, Name: flagkey.FnBuildCmd, Usage: "Package build command for builder to run with"}
 	FnSecret                = Flag{Type: StringSlice, Name: flagkey.FnSecret, Usage: "Function access to secret, should be present in the same namespace as the function. You can provide multiple secrets using multiple --secrets flags. In the case of fn update the secrets will be replaced by the provided list of secrets."}
 	FnCfgMap                = Flag{Type: StringSlice, Name: flagkey.FnCfgMap, Usage: "Function access to configmap, should be present in the same namespace as the function. You can provide multiple configmaps using multiple --configmap flags. In case of fn update the configmaps will be replaced by the provided list of configmaps."}
-	FnExecutorType          = Flag{Type: String, Name: flagkey.FnExecutorType, Usage: "Executor type for execution; one of 'poolmgr', 'newdeploy'", DefaultValue: string(fv1.ExecutorTypePoolmgr)}
-	FnExecutionTimeout      = Flag{Type: Int, Name: flagkey.FnExecutionTimeout, Aliases: []string{"ft"}, Usage: "Maximum time for a request to wait for the response from the function", DefaultValue: 60}
-	FnLogPod                = Flag{Type: String, Name: flagkey.FnLogPod, Usage: "Function pod name (use the latest pod name if unspecified)"}
-	FnLogFollow             = Flag{Type: Bool, Name: flagkey.FnLogFollow, Short: "f", Usage: "Specify if the logs should be streamed"}
-	FnLogDetail             = Flag{Type: Bool, Name: flagkey.FnLogDetail, Short: "d", Usage: "Display detailed information"}
-	FnLogDBType             = Flag{Type: String, Name: flagkey.FnLogDBType, Usage: "Log database type: kubernetes (default) or loki", DefaultValue: "kubernetes"}
-	FnLogReverseQuery       = Flag{Type: Bool, Name: flagkey.FnLogReverseQuery, Short: "r", Usage: "Specify the log reverse query base on time, it will be invalid if the 'follow' flag is specified. valid for dbtype as loki"}
-	FnLogCount              = Flag{Type: Int, Name: flagkey.FnLogCount, Usage: "Get N most recent log records", DefaultValue: 20}
-	FnLogRequestID          = Flag{Type: String, Name: flagkey.FnLogRequestID, Usage: "Filter logs to a single invocation by its X-Fission-Request-ID (loki dbtype)"}
-	FnLogTraceID            = Flag{Type: String, Name: flagkey.FnLogTraceID, Usage: "Filter logs by trace id (loki dbtype)"}
-	FnLogLevel              = Flag{Type: String, Name: flagkey.FnLogLevel, Usage: "Filter logs by level, e.g. error (loki dbtype)"}
-	NamespacePod            = Flag{Type: String, Name: flagkey.NamespacePod, Usage: "Namespace in which function's pod are created. If not specified, function's namespace is used. Note: version <1.18 used fission-function as pod's default ns."}
-	FnTestBody              = Flag{Type: String, Name: flagkey.FnTestBody, Short: "b", Usage: "Request body"}
-	FnTestTimeout           = Flag{Type: Duration, Name: flagkey.FnTestTimeout, Short: "t", Usage: "Length of time to wait for the response. If set to zero or negative number, no timeout is set", DefaultValue: 60 * time.Second}
-	FnTestHeader            = Flag{Type: StringSlice, Name: flagkey.FnTestHeader, Short: "H", Usage: "Request headers"}
-	FnTestQuery             = Flag{Type: StringSlice, Name: flagkey.FnTestQuery, Short: "q", Usage: "Request query parameters: -q key1=value1 -q key2=value2"}
-	FnIdleTimeout           = Flag{Type: Int, Name: flagkey.FnIdleTimeout, Usage: "The length of time (in seconds) that a function is idle before pod(s) are eligible for recycling", DefaultValue: 120}
-	FnStreaming             = Flag{Type: Bool, Name: flagkey.FnStreaming, Usage: "Enable streaming (SSE/chunked/WebSocket) responses for this function; the response is flushed incrementally and not cut by the function timeout"}
-	FnStreamingProtocol     = Flag{Type: String, Name: flagkey.FnStreamingProtocol, Usage: "Streaming protocol when --streaming is set; one of 'auto', 'sse', 'chunked', 'websocket'", DefaultValue: "auto"}
-	FnStreamingIdleTimeout  = Flag{Type: Int, Name: flagkey.FnStreamingIdleTimeout, Usage: "Idle timeout (seconds) for a streaming response before it is aborted; reset on each chunk", DefaultValue: 60}
-	FnStreamingMaxDuration  = Flag{Type: Int, Name: flagkey.FnStreamingMaxDuration, Usage: "Hard ceiling (seconds) on total streaming response lifetime; 0 means no ceiling (the idle timeout governs)", DefaultValue: 0}
-	FnExposeAsMCP           = Flag{Type: Bool, Name: flagkey.FnExposeAsMCP, Usage: "Advertise this function as a Model Context Protocol (MCP) tool on the MCP server"}
-	FnToolDescription       = Flag{Type: String, Name: flagkey.FnToolDescription, Usage: "Agent-facing tool description (required with --expose-as-mcp)"}
-	FnToolInputSchema       = Flag{Type: String, Name: flagkey.FnToolInputSchema, Usage: "Path to a JSON Schema file describing the tool's arguments; advertised verbatim as the MCP tool inputSchema"}
-	FnToolName              = Flag{Type: String, Name: flagkey.FnToolName, Usage: "Override the advertised MCP tool name (defaults to <namespace>-<function name>)"}
-	FnConcurrency           = Flag{Type: Int, Name: flagkey.FnConcurrency, Aliases: []string{"con"}, Usage: "Maximum number of pods specialized concurrently to serve requests (Only valid for executortype; `poolmgr`)", DefaultValue: 500}
-	FnRequestsPerPod        = Flag{Type: Int, Name: flagkey.FnRequestsPerPod, Aliases: []string{"rpp"}, Usage: "Maximum number of concurrent requests that can be served by a specialized pod (Only valid for executortype; `poolmgr`)", DefaultValue: 1}
-	FnOnceOnly              = Flag{Type: Bool, Name: flagkey.FnOnceOnly, Aliases: []string{"yolo"}, Usage: "Specifies if specialized pod will serve exactly one request in its lifetime (Only valid for executortype; `poolmgr`)"}
-	FnSubPath               = Flag{Type: String, Name: flagkey.FnSubPath, Usage: "Sub Path to check if function internally supports routing"}
-	FnRunEnvVersion         = Flag{Type: Int, Name: flagkey.FnRunEnvVersion, Usage: "Environment API version of the runtime image when running locally with --image (ignored when --env resolves it)", DefaultValue: 2}
-	FnRunKeep               = Flag{Type: Bool, Name: flagkey.FnRunKeep, Usage: "Keep the local function container and mount running after the invocation instead of tearing it down"}
-	FnRunWatch              = Flag{Type: Bool, Name: flagkey.FnRunWatch, Short: "w", Usage: "Serve the function locally and re-specialize on source change (hot reload); env executors only"}
-	FnRunDebugPort          = Flag{Type: Int, Name: flagkey.FnRunDebugPort, Usage: "Publish an additional container port for a debugger (delve/debugpy) to attach to"}
-	FnRunEnvVar             = Flag{Type: StringSlice, Name: flagkey.FnRunEnvVar, Short: "e", Usage: "Set a runtime env var KEY=VALUE in the local container (repeatable)"}
-	FnRunEnvFile            = Flag{Type: String, Name: flagkey.FnRunEnvFile, Usage: "Read runtime env vars from a file (one KEY=VALUE per line); -e overrides"}
-	FnRunBuild              = Flag{Type: Bool, Name: flagkey.FnRunBuild, Usage: "Compile the source with the environment builder image before running (compiled environments)"}
-	FnRunBuilderImage       = Flag{Type: String, Name: flagkey.FnRunBuilderImage, Usage: "Builder image to use with --build when running cluster-less (defaults to the environment's builder image)"}
-	FnLogAllPods            = Flag{Type: Bool, Name: flagkey.FnLogAllPods, Usage: "Get all pod's logs in the function."}
-	FnRetainPods            = Flag{Type: Int, Name: flagkey.FnRetainPods, Usage: "Number of pods to retain after pods specialization.", DefaultValue: 0}
+	// RFC-0030 §4 files mode. A separate flag rather than extending --secret:
+	// ':' already means "rename to" in --env-from (secret/key:ALIAS), so
+	// overloading it across flags in one CLI would be a trap.
+	FnSecretMount      = Flag{Type: StringSlice, Name: flagkey.FnSecretMount, Usage: "Mount a secret at a path relative to /secrets, matching the function's spec.secrets[].mountPath in-cluster. Format NAME=PATH, e.g. --secret-mount db-creds=app/creds. Repeatable. Without this a secret lands at the default /secrets/<namespace>/<name>."}
+	FnCfgMapMount      = Flag{Type: StringSlice, Name: flagkey.FnCfgMapMount, Usage: "Mount a configmap at a path relative to /configs, matching the function's spec.configmaps[].mountPath in-cluster. Format NAME=PATH, e.g. --configmap-mount app-config=app/conf. Repeatable. Without this a configmap lands at the default /configs/<namespace>/<name>."}
+	FnEnvVar           = Flag{Type: StringSlice, Name: flagkey.FnEnvVar, Short: "e", Usage: "Per-function environment variable as KEY=VALUE; repeatable. On fn update the provided list replaces the function's env vars. (--env keeps meaning the Environment name.)"}
+	FnEnvFromSecret    = Flag{Type: StringSlice, Name: flagkey.FnEnvFromSecret, Usage: "Project a same-namespace Secret into the function's environment: 'name' for the whole object, 'name/key' for one key (variable named after the key), 'name/key:ENV' to rename it; repeatable. On fn update the provided list replaces the previous one."}
+	FnEnvFromConfigMap = Flag{Type: StringSlice, Name: flagkey.FnEnvFromConfigMap, Usage: "Project a same-namespace ConfigMap into the function's environment: 'name' for the whole object, 'name/key' for one key (variable named after the key), 'name/key:ENV' to rename it; repeatable. On fn update the provided list replaces the previous one."}
+	FnExecutorType     = Flag{Type: String, Name: flagkey.FnExecutorType, Usage: "Executor type for execution; one of 'poolmgr', 'newdeploy'", DefaultString: string(fv1.ExecutorTypePoolmgr)}
+	FnExecutionTimeout = Flag{Type: Int, Name: flagkey.FnExecutionTimeout, Aliases: []string{"ft"}, Usage: "Maximum time for a request to wait for the response from the function", DefaultInt: 60}
+	FnLogPod           = Flag{Type: String, Name: flagkey.FnLogPod, Usage: "Function pod name (use the latest pod name if unspecified)"}
+	FnLogFollow        = Flag{Type: Bool, Name: flagkey.FnLogFollow, Short: "f", Usage: "Specify if the logs should be streamed"}
+	FnLogDetail        = Flag{Type: Bool, Name: flagkey.FnLogDetail, Short: "d", Usage: "Display detailed information"}
+	FnLogDBType        = Flag{Type: String, Name: flagkey.FnLogDBType, Usage: "Log database type: kubernetes (default) or loki", DefaultString: "kubernetes"}
+	FnLogReverseQuery  = Flag{Type: Bool, Name: flagkey.FnLogReverseQuery, Short: "r", Usage: "Specify the log reverse query base on time, it will be invalid if the 'follow' flag is specified. valid for dbtype as loki"}
+	FnLogCount         = Flag{Type: Int, Name: flagkey.FnLogCount, Usage: "Get N most recent log records", DefaultInt: 20}
+	FnLogRequestID     = Flag{Type: String, Name: flagkey.FnLogRequestID, Usage: "Filter logs to a single invocation by its X-Fission-Request-ID (loki dbtype)"}
+	FnLogTraceID       = Flag{Type: String, Name: flagkey.FnLogTraceID, Usage: "Filter logs by trace id (loki dbtype)"}
+	FnLogLevel         = Flag{Type: String, Name: flagkey.FnLogLevel, Usage: "Filter logs by level, e.g. error (loki dbtype)"}
+	NamespacePod       = Flag{Type: String, Name: flagkey.NamespacePod, Usage: "Namespace in which function's pod are created. If not specified, function's namespace is used. Note: version <1.18 used fission-function as pod's default ns."}
+	FnTestBody         = Flag{Type: String, Name: flagkey.FnTestBody, Short: "b", Usage: "Request body"}
+	FnTestTimeout      = Flag{Type: Duration, Name: flagkey.FnTestTimeout, Short: "t", Usage: "Length of time to wait for the response. If set to zero or negative number, no timeout is set", DefaultDuration: 60 * time.Second}
+	FnTestHeader       = Flag{Type: StringSlice, Name: flagkey.FnTestHeader, Short: "H", Usage: "Request headers"}
+	FnTestQuery        = Flag{Type: StringSlice, Name: flagkey.FnTestQuery, Short: "q", Usage: "Request query parameters: -q key1=value1 -q key2=value2"}
+	FnTestAsync        = Flag{Type: Bool, Name: flagkey.FnTestAsync, Usage: "Invoke asynchronously (X-Fission-Invoke-Mode: async); prints the invocation id instead of waiting for the response. Set FISSION_INTERNAL_AUTH_SECRET when authentication is enabled."}
+	FnTestAlias        = Flag{Type: String, Name: flagkey.FnTestAlias, Usage: "Test a specific alias (e.g. prod) instead of the live function; mutually exclusive with --version"}
+	FnTestVersion      = Flag{Type: String, Name: flagkey.FnTestVersion, Usage: "Test a specific pinned FunctionVersion instead of the live function; mutually exclusive with --alias"}
+	// RFC-0025 `fission fn pods --alias`/`--version`: filter the pod list to
+	// one alias's resolved target or a pinned FunctionVersion. The flag names
+	// (flagkey.FnTestAlias/FnTestVersion, "alias"/"version") are reused from
+	// `fn test`; flag names are scoped per-subcommand, so this is safe.
+	FnPodsAlias   = Flag{Type: String, Name: flagkey.FnTestAlias, Usage: "List only pods for a specific alias's (e.g. prod) resolved version; mutually exclusive with --version"}
+	FnPodsVersion = Flag{Type: String, Name: flagkey.FnTestVersion, Usage: "List only pods for a specific pinned FunctionVersion; mutually exclusive with --alias"}
+	// RFC-0025 `fission fn describe --version`: render the SNAPSHOT inspector
+	// (sequence, digest, description, env observation vs live, ALIASED-BY)
+	// for one pinned FunctionVersion instead of the live function view.
+	FnDescribeVersion = Flag{Type: String, Name: flagkey.FnDescribeVersion, Usage: "Describe a specific pinned FunctionVersion's snapshot instead of the live function"}
+	// RFC-0025 `fission fn get --version`: render a specific pinned
+	// FunctionVersion's SNAPSHOT deployment source instead of the live
+	// function's. The flag name (flagkey.FnTestVersion, "version") is reused
+	// from `fn test`/`fn describe`/`fn pods`/`fn logs`; flag names are scoped
+	// per-subcommand, so this is safe (see the FnTestAlias comment above).
+	FnGetVersion           = Flag{Type: String, Name: flagkey.FnTestVersion, Usage: "Get a specific pinned FunctionVersion's snapshot source instead of the live function"}
+	FnIdleTimeout          = Flag{Type: Int, Name: flagkey.FnIdleTimeout, Usage: "The length of time (in seconds) that a function is idle before pod(s) are eligible for recycling", DefaultInt: 120}
+	FnStreaming            = Flag{Type: Bool, Name: flagkey.FnStreaming, Usage: "Enable streaming (SSE/chunked/WebSocket) responses for this function; the response is flushed incrementally and not cut by the function timeout"}
+	FnStreamingProtocol    = Flag{Type: String, Name: flagkey.FnStreamingProtocol, Usage: "Streaming protocol when --streaming is set; one of 'auto', 'sse', 'chunked', 'websocket'", DefaultString: "auto"}
+	FnStreamingIdleTimeout = Flag{Type: Int, Name: flagkey.FnStreamingIdleTimeout, Usage: "Idle timeout (seconds) for a streaming response before it is aborted; reset on each chunk", DefaultInt: 60}
+	FnStreamingMaxDuration = Flag{Type: Int, Name: flagkey.FnStreamingMaxDuration, Usage: "Hard ceiling (seconds) on total streaming response lifetime; 0 means no ceiling (the idle timeout governs)", DefaultInt: 0}
+	FnExposeAsMCP          = Flag{Type: Bool, Name: flagkey.FnExposeAsMCP, Usage: "Advertise this function as a Model Context Protocol (MCP) tool on the MCP server"}
+	FnToolDescription      = Flag{Type: String, Name: flagkey.FnToolDescription, Usage: "Agent-facing tool description (required with --expose-as-mcp)"}
+	FnToolInputSchema      = Flag{Type: String, Name: flagkey.FnToolInputSchema, Usage: "Path to a JSON Schema file describing the tool's arguments; advertised verbatim as the MCP tool inputSchema"}
+	FnToolName             = Flag{Type: String, Name: flagkey.FnToolName, Usage: "Override the advertised MCP tool name (defaults to <namespace>-<function name>)"}
+	FnConcurrency          = Flag{Type: Int, Name: flagkey.FnConcurrency, Aliases: []string{"con"}, Usage: "Maximum number of pods specialized concurrently to serve requests (Only valid for executortype; `poolmgr`)", DefaultInt: 500}
+	FnRequestsPerPod       = Flag{Type: Int, Name: flagkey.FnRequestsPerPod, Aliases: []string{"rpp"}, Usage: "Maximum number of concurrent requests that can be served by a specialized pod (Only valid for executortype; `poolmgr`)", DefaultInt: 1}
+	FnOnceOnly             = Flag{Type: Bool, Name: flagkey.FnOnceOnly, Aliases: []string{"yolo"}, Usage: "Specifies if specialized pod will serve exactly one request in its lifetime (Only valid for executortype; `poolmgr`)"}
+	FnSubPath              = Flag{Type: String, Name: flagkey.FnSubPath, Usage: "Sub Path to check if function internally supports routing"}
+	FnRunEnvVersion        = Flag{Type: Int, Name: flagkey.FnRunEnvVersion, Usage: "Environment API version of the runtime image when running locally with --image (ignored when --env resolves it)", DefaultInt: 2}
+	FnRunKeep              = Flag{Type: Bool, Name: flagkey.FnRunKeep, Usage: "Keep the local function container and mount running after the invocation instead of tearing it down"}
+	FnRunWatch             = Flag{Type: Bool, Name: flagkey.FnRunWatch, Short: "w", Usage: "Serve the function locally and re-specialize on source change (hot reload); env executors only"}
+	FnRunDebugPort         = Flag{Type: Int, Name: flagkey.FnRunDebugPort, Usage: "Publish an additional container port for a debugger (delve/debugpy) to attach to"}
+	FnRunEnvVar            = Flag{Type: StringSlice, Name: flagkey.FnRunEnvVar, Short: "e", Usage: "Set a runtime env var KEY=VALUE in the local container (repeatable)"}
+	FnRunEnvFile           = Flag{Type: String, Name: flagkey.FnRunEnvFile, Usage: "Read runtime env vars from a file (one KEY=VALUE per line); -e overrides"}
+	FnRunBuild             = Flag{Type: Bool, Name: flagkey.FnRunBuild, Usage: "Compile the source with the environment builder image before running (compiled environments)"}
+	FnRunBuilderImage      = Flag{Type: String, Name: flagkey.FnRunBuilderImage, Usage: "Builder image to use with --build when running cluster-less (defaults to the environment's builder image)"}
+	FnLogAllPods           = Flag{Type: Bool, Name: flagkey.FnLogAllPods, Usage: "Get all pod's logs in the function."}
+	// RFC-0025 `fission fn logs --alias`/`--version`: same resolution as
+	// FnPodsAlias/FnPodsVersion above, restricting which pods' logs are read.
+	// Only the kubernetes dbtype applies this filter; the loki dbtype warns
+	// and ignores it (same gating as --request-id/--trace-id/--level, which
+	// only loki applies).
+	FnLogAlias               = Flag{Type: String, Name: flagkey.FnTestAlias, Usage: "Show logs for a specific alias's (e.g. prod) resolved version instead of the live function; mutually exclusive with --version; kubernetes dbtype only"}
+	FnLogVersion             = Flag{Type: String, Name: flagkey.FnTestVersion, Usage: "Show logs for a specific pinned FunctionVersion instead of the live function; mutually exclusive with --alias; kubernetes dbtype only"}
+	FnRetainPods             = Flag{Type: Int, Name: flagkey.FnRetainPods, Usage: "Number of pods to retain after pods specialization.", DefaultInt: 0}
+	FnProvisionedConcurrency = Flag{Type: Int, Name: flagkey.FnProvisionedConcurrency, Usage: "Number of warm specialized pods to maintain eagerly (poolmgr only). 0 (default)=no provisioned concurrency", DefaultInt: 0}
+	FnProvisionedSchedule    = Flag{Type: StringSlice, Name: flagkey.FnProvisionedSchedule, Usage: "name=<window-name>;start=<cron(0 9 * * *)>;duration=<10h(time.Duration)>;target=<number of pods>", DefaultStrings: []string{}}
+	FnVersioning             = Flag{Type: String, Name: flagkey.FnVersioning, Usage: "Opt the function into immutable version snapshots and named aliases; one of 'auto' (mint a version on every runtime-affecting update), 'manual' (mint only on `fission fn publish`), or 'off' (disable, update only)"}
+	FnRetainVersions         = Flag{Type: Int, Name: flagkey.FnRetainVersions, Usage: "Number of unaliased versions to keep per function before older ones are garbage collected (requires --versioning auto|manual, or an existing versioning config); disambiguates from --retainpods, which retains specialized pods rather than function versions"}
+
+	// RFC-0027 `fission topic` dev commands.
+	TopicName        = Flag{Type: String, Name: flagkey.TopicName, Usage: "Topic name"}
+	TopicData        = Flag{Type: String, Name: flagkey.TopicData, Usage: "Event payload to publish"}
+	TopicContentType = Flag{Type: String, Name: flagkey.TopicContentType, Usage: "Content type the payload travels with (consuming triggers replay it)", DefaultString: "application/json"}
+	TopicMQType      = Flag{Type: String, Name: flagkey.TopicMQType, Usage: "Message queue provider: statestore (built-in, namespace-scoped), or a broker type with an egress head (kafka — broker topics are cluster-flat, like kafka mqtriggers)", DefaultString: "statestore"}
+	TopicLimit       = Flag{Type: Int, Name: flagkey.TopicLimit, Usage: "Maximum events to peek", DefaultInt: 10}
+
+	// RFC-0024 async dead-letter-queue admin flags.
+	DlqQueue = Flag{Type: String, Name: flagkey.DlqQueue, Usage: "Dead-letter queue to operate on: empty for async invocations, or a broker egress queue (mq-egress-<type>, e.g. mq-egress-kafka)"}
+	DlqID    = Flag{Type: String, Name: flagkey.DlqID, Usage: "Durable invocation id of a dead-lettered async invocation"}
+	DlqAll   = Flag{Type: Bool, Name: flagkey.DlqAll, Usage: "Apply to every dead-lettered invocation"}
+	DlqLimit = Flag{Type: Int, Name: flagkey.DlqLimit, Usage: "Maximum number of dead-lettered invocations to list", DefaultInt: 100}
+
+	// RFC-0023 keyed-state config (fn create/update).
+	FnState              = Flag{Type: Bool, Name: flagkey.FnState, Usage: "Opt the function into the keyed-state API"}
+	FnStateKeyspace      = Flag{Type: String, Name: flagkey.FnStateKeyspace, Usage: "State keyspace name (defaults to the function name; explicit so a rename keeps the data)"}
+	FnStateMaxKeys       = Flag{Type: Int, Name: flagkey.FnStateMaxKeys, Usage: "Max live keys in the keyspace (0 = platform default)"}
+	FnStateMaxValueBytes = Flag{Type: Int, Name: flagkey.FnStateMaxValueBytes, Usage: "Max size of one state value in bytes (0 = platform default)"}
+	FnStateTTL           = Flag{Type: Duration, Name: flagkey.FnStateTTL, Usage: "Default TTL applied to state writes without an explicit TTL (0 = keys do not expire)"}
+	FnStateStickySource  = Flag{Type: String, Name: flagkey.FnStateStickySource, Usage: "Sticky routing key source: header or queryparam"}
+	FnStateStickyName    = Flag{Type: String, Name: flagkey.FnStateStickyName, Usage: "Header or query-parameter name holding the sticky routing key"}
+
+	// RFC-0023 `fission fn state` admin flags.
+	StateKey       = Flag{Type: String, Name: flagkey.StateKey, Usage: "State key to operate on"}
+	StateValue     = Flag{Type: String, Name: flagkey.StateValue, Usage: "Value to store"}
+	StatePrefix    = Flag{Type: String, Name: flagkey.StatePrefix, Usage: "Key prefix to list"}
+	StateTTL       = Flag{Type: Duration, Name: flagkey.StateTTL, Usage: "Time-to-live for the written key (e.g. 300s, 1h); 0 uses the keyspace default"}
+	StateIfVersion = Flag{Type: Int, Name: flagkey.StateIfVersion, Usage: "Compare-and-swap version precondition (0 = create-only for set; unset = unconditional)"}
+
+	// RFC-0024 async invocation config (fn create/update).
+	FnAsyncMaxAttempts = Flag{Type: Int, Name: flagkey.FnAsyncMaxAttempts, Usage: "Async delivery attempt budget before dead-lettering"}
+	FnAsyncMaxAge      = Flag{Type: Duration, Name: flagkey.FnAsyncMaxAge, Usage: "Max time an async invocation may wait for successful delivery before it is dead-lettered"}
+	FnAsyncOnSuccess   = Flag{Type: String, Name: flagkey.FnAsyncOnSuccess, Usage: "Same-namespace function to invoke with the result after a successful async delivery; empty clears it"}
+	FnAsyncOnFailure   = Flag{Type: String, Name: flagkey.FnAsyncOnFailure, Usage: "Same-namespace function to invoke with the result after a permanent async failure; empty clears it"}
+	// RFC-0027 statestore topic destinations. Mutually exclusive per condition
+	// with the function-destination flag above.
+	FnAsyncOnSuccessTopic = Flag{Type: String, Name: flagkey.FnAsyncOnSuccessTopic, Usage: "Statestore topic to publish the result envelope to after a successful async delivery; empty clears it"}
+	FnAsyncOnFailureTopic = Flag{Type: String, Name: flagkey.FnAsyncOnFailureTopic, Usage: "Statestore topic to publish the result envelope to after a permanent async failure; empty clears it"}
 	// Termination Grace Period configurable at function creation/update only for container functions
-	FnTerminationGracePeriod = Flag{Type: Int64, Name: flagkey.FnGracePeriod, Usage: "Grace time (in seconds) for pod to perform connection draining before termination (only non-negative values considered)", DefaultValue: 360}
+	FnTerminationGracePeriod = Flag{Type: Int64, Name: flagkey.FnGracePeriod, Usage: "Grace time (in seconds) for pod to perform connection draining before termination (only non-negative values considered)", DefaultInt64: 360}
 
 	HtName              = Flag{Type: String, Name: flagkey.HtName, Usage: "HTTP trigger name"}
-	HtMethod            = Flag{Type: StringSlice, Name: flagkey.HtMethod, Usage: "HTTP Methods: GET,POST,PUT,DELETE,HEAD. To mention single method: --method GET and for multiple methods --method GET --method POST. [DEPRECATED for 'fn create', use 'route create' instead]", DefaultValue: []string{http.MethodGet}}
+	HtMethod            = Flag{Type: StringSlice, Name: flagkey.HtMethod, Usage: "HTTP Methods: GET,POST,PUT,DELETE,HEAD. To mention single method: --method GET and for multiple methods --method GET --method POST. [DEPRECATED for 'fn create', use 'route create' instead]", DefaultStrings: []string{http.MethodGet}}
+	HtInvocationMode    = Flag{Type: String, Name: flagkey.HtInvocationMode, Usage: "'async' makes every request through this trigger asynchronous (durable 202 + invocation id); empty is the default synchronous mode"}
 	HtUrl               = Flag{Type: String, Name: flagkey.HtUrl, Usage: "URL pattern (supports {var} and {var:regexp} path templates) [DEPRECATED for 'fn create', use 'route create' instead]"}
 	HtHost              = Flag{Type: String, Name: flagkey.HtHost, Usage: "Use --ingressrule instead", Deprecated: true, Substitute: flagkey.HtIngressRule}
 	HtIngress           = Flag{Type: Bool, Name: flagkey.HtIngress, Usage: "Creates ingress with same URL [DEPRECATED: the Kubernetes Ingress API is frozen, use --route-provider gateway instead]"}
@@ -157,6 +299,8 @@ var (
 	HtGateway           = Flag{Type: StringSlice, Name: flagkey.HtGateway, Usage: "Parent Gateway the HTTPRoute attaches to (gateway provider): --gateway name or --gateway namespace/name (repeatable)"}
 	HtFnName            = Flag{Type: StringSlice, Name: flagkey.HtFnName, Usage: "Name(s) of the function for this trigger. (If 2 functions are supplied with this flag, traffic gets routed to them based on weights supplied with --weight flag.)"}
 	HtFnWeight          = Flag{Type: IntSlice, Name: flagkey.HtFnWeight, Usage: "Weight for each function supplied with --function flag, in the same order. Used for canary deployment"}
+	HtFnAlias           = Flag{Type: String, Name: flagkey.HtFnAlias, Usage: "Route through this FunctionAlias (RFC-0025) instead of the live function; requires exactly one --function, mutually exclusive with --function-version and with weighted multi-function routing"}
+	HtFnVersion         = Flag{Type: String, Name: flagkey.HtFnVersion, Usage: "Pin the route to this FunctionVersion (RFC-0025) instead of the live function; requires exactly one --function, mutually exclusive with --function-alias and with weighted multi-function routing"}
 	HtFnFilter          = Flag{Type: String, Name: flagkey.HtFilter, Usage: "Name of the function for trigger(s)"}
 	HtPrefix            = Flag{Type: String, Name: flagkey.HtPrefix, Usage: "Prefix with which functions are exposed. NOTE: Prefix takes precedence over URL/RelativeURL [DEPRECATED for 'fn create', use 'route create' instead]"}
 	HtKeepPrefix        = Flag{Type: Bool, Name: flagkey.HtKeepPrefix, Usage: "Keep the prefix in the URL while forwarding request to the function"}
@@ -165,47 +309,70 @@ var (
 	TokPassword = Flag{Type: String, Name: flagkey.TokPassword, Usage: "Password to generate token for function invocation"}
 	TokAuthURI  = Flag{Type: String, Name: flagkey.TokAuthURI, Usage: "Relative URI path to generate token"}
 
+	WfName = Flag{Type: String, Name: flagkey.WfName, Usage: "Name of the workflow"}
+	// WfRunName is the same --name flag scoped to a run: the `workflow runs`
+	// subcommands operate on a WorkflowRun, not a Workflow, so the help must say so.
+	WfRunName  = Flag{Type: String, Name: flagkey.WfName, Usage: "Name of the workflow run"}
+	WfWorkflow = Flag{Type: String, Name: flagkey.WfWorkflow, Usage: "Only show runs of this workflow"}
+	WfFile     = Flag{Type: String, Name: flagkey.WfFile, Short: "f", Usage: "Path to a Workflow manifest (kind: Workflow) or a bare WorkflowSpec YAML"}
+	WfOffline  = Flag{Type: Bool, Name: flagkey.WfOffline, Usage: "Skip cluster checks (e.g. referenced-function existence)"}
+	WfInput    = Flag{Type: String, Name: flagkey.WfInput, Usage: "Run input as inline JSON, or @path/to/file.json"}
+	WfIO       = Flag{Type: Bool, Name: flagkey.WfIO, Usage: "Include step input/output payloads (dereferences spilled documents)"}
+	WfOpen     = Flag{Type: Bool, Name: flagkey.WfOpen, Usage: "Render the diagram in a browser (served locally; the graph never leaves your machine)"}
+
+	HtWorkflow      = Flag{Type: String, Name: flagkey.TriggerWorkflow, Usage: "Start a run of this workflow on every request instead of calling a function (the JSON body is the run input; answers 202 with the run name)"}
+	TtWorkflow      = Flag{Type: String, Name: flagkey.TriggerWorkflow, Usage: "Start a run of this workflow on every tick instead of calling a function"}
+	TtWorkflowInput = Flag{Type: String, Name: flagkey.TriggerWorkflowInput, Usage: "Input of every run a --workflow time trigger starts: inline JSON, or @path/to/file.json (default {})"}
+
 	TtName   = Flag{Type: String, Name: flagkey.TtName, Usage: "Time Trigger name"}
 	TtCron   = Flag{Type: String, Name: flagkey.TtCron, Usage: "Time trigger cron spec with each asterisk representing respectively second, minute, hour, the day of the month, month and day of the week. Also supports readable formats like '@every 5m', '@hourly'"}
 	TtFnName = Flag{Type: String, Name: flagkey.TtFnName, Usage: "Function name"}
-	TtRound  = Flag{Type: Int, Name: flagkey.TtRound, Usage: "Get next N rounds of invocation time", DefaultValue: 1}
+	TtRound  = Flag{Type: Int, Name: flagkey.TtRound, Usage: "Get next N rounds of invocation time", DefaultInt: 1}
 	TtMethod = Flag{Type: String, Name: flagkey.TtMethod, Usage: "HTTP Methods: GET,POST,PUT,DELETE,HEAD."}
 
 	MqtName            = Flag{Type: String, Name: flagkey.MqtName, Usage: "Message queue trigger name"}
 	MqtFnName          = Flag{Type: String, Name: flagkey.MqtFnName, Usage: "Function name"}
-	MqtMQType          = Flag{Type: String, Name: flagkey.MqtMQType, Usage: "For mqtype \"fission\" => kafka\n\t\t\t\t\t For mqtype \"keda\" => kafka, aws-sqs-queue, aws-kinesis-stream, gcp-pubsub, stan, nats-jetstream, rabbitmq, redis", DefaultValue: "kafka"}
+	MqtMQType          = Flag{Type: String, Name: flagkey.MqtMQType, Usage: "For mqtkind \"fission\" => kafka, statestore (the built-in, no-broker option)\n\t\t\t\t\t For mqtkind \"keda\" => kafka, aws-sqs-queue, aws-kinesis-stream, gcp-pubsub, stan, nats-jetstream, rabbitmq, redis", DefaultString: "kafka"}
 	MqtTopic           = Flag{Type: String, Name: flagkey.MqtTopic, Usage: "Message queue Topic the trigger listens on"}
 	MqtRespTopic       = Flag{Type: String, Name: flagkey.MqtRespTopic, Usage: "Topic that the function response is sent on (response discarded if unspecified)"}
 	MqtErrorTopic      = Flag{Type: String, Name: flagkey.MqtErrorTopic, Usage: "Topic that the function error messages are sent to (errors discarded if unspecified"}
-	MqtMaxRetries      = Flag{Type: Int, Name: flagkey.MqtMaxRetries, Usage: "Maximum number of times the function will be retried upon failure", DefaultValue: 0}
-	MqtMsgContentType  = Flag{Type: String, Name: flagkey.MqtMsgContentType, Short: "c", Usage: "Content type of messages that publish to the topic", DefaultValue: "application/json"}
-	MqtPollingInterval = Flag{Type: Int, Name: flagkey.MqtPollingInterval, Usage: "Interval to check the message source for up/down scaling operation of consumers", DefaultValue: 30}
-	MqtCooldownPeriod  = Flag{Type: Int, Name: flagkey.MqtCooldownPeriod, Usage: "The period to wait after the last trigger reported active before scaling the consumer back to 0", DefaultValue: 300}
-	MqtMinReplicaCount = Flag{Type: Int, Name: flagkey.MqtMinReplicaCount, Usage: "Minimum number of replicas of consumers to scale down to", DefaultValue: 0}
-	MqtMaxReplicaCount = Flag{Type: Int, Name: flagkey.MqtMaxReplicaCount, Usage: "Maximum number of replicas of consumers to scale up to", DefaultValue: 100}
+	MqtMaxRetries      = Flag{Type: Int, Name: flagkey.MqtMaxRetries, Usage: "Maximum number of times the function will be retried upon failure", DefaultInt: 0}
+	MqtMsgContentType  = Flag{Type: String, Name: flagkey.MqtMsgContentType, Short: "c", Usage: "Content type of messages that publish to the topic", DefaultString: "application/json"}
+	MqtPollingInterval = Flag{Type: Int, Name: flagkey.MqtPollingInterval, Usage: "Interval to check the message source for up/down scaling operation of consumers", DefaultInt: 30}
+	MqtCooldownPeriod  = Flag{Type: Int, Name: flagkey.MqtCooldownPeriod, Usage: "The period to wait after the last trigger reported active before scaling the consumer back to 0", DefaultInt: 300}
+	MqtMinReplicaCount = Flag{Type: Int, Name: flagkey.MqtMinReplicaCount, Usage: "Minimum number of replicas of consumers to scale down to", DefaultInt: 0}
+	MqtMaxReplicaCount = Flag{Type: Int, Name: flagkey.MqtMaxReplicaCount, Usage: "Maximum number of replicas of consumers to scale up to", DefaultInt: 100}
 	MqtMetadata        = Flag{Type: StringSlice, Name: flagkey.MqtMetadata, Usage: "Metadata needed for connecting to source system in format: --metadata key1=value1 --metadata key2=value2"}
-	MqtSecret          = Flag{Type: String, Name: flagkey.MqtSecret, Usage: "Name of secret object", DefaultValue: ""}
-	MqtKind            = Flag{Type: String, Name: flagkey.MqtKind, Usage: "Kind of Message Queue Trigger, e.g. fission, keda", DefaultValue: "keda"}
+	MqtSecret          = Flag{Type: String, Name: flagkey.MqtSecret, Usage: "Name of secret object", DefaultString: ""}
+	MqtKind            = Flag{Type: String, Name: flagkey.MqtKind, Usage: "Kind of Message Queue Trigger, e.g. fission, keda", DefaultString: "keda"}
 
-	EnvName                   = Flag{Type: String, Name: flagkey.EnvName, Usage: "Environment name"}
-	EnvPoolsize               = Flag{Type: Int, Name: flagkey.EnvPoolsize, Usage: "Size of the pool", DefaultValue: 3}
-	EnvImage                  = Flag{Type: String, Name: flagkey.EnvImage, Usage: "Environment image URL"}
-	EnvBuilderImage           = Flag{Type: String, Name: flagkey.EnvBuilderImage, Usage: "Environment builder image URL"}
-	EnvBuildCmd               = Flag{Type: String, Name: flagkey.EnvBuildcommand, Usage: "Build command for environment builder to build source package"}
-	EnvKeepArchive            = Flag{Type: Bool, Name: flagkey.EnvKeeparchive, Usage: "Keep the archive instead of extracting it into a directory (mainly for the JVM environment because .jar is one kind of zip archive)"}
-	EnvExternalNetwork        = Flag{Type: Bool, Name: flagkey.EnvExternalNetwork, Usage: "Allow pod to access external network (only works when istio feature is enabled)"}
-	EnvTerminationGracePeriod = Flag{Type: Int64, Name: flagkey.EnvGracePeriod, Aliases: []string{"period"}, Usage: "Grace time (in seconds) for pod to perform connection draining before termination (only non-negative values considered)", DefaultValue: 360}
-	EnvVersion                = Flag{Type: Int, Name: flagkey.EnvVersion, Usage: "Environment API version (1 means v1 interface)", DefaultValue: 3}
+	EnvName               = Flag{Type: String, Name: flagkey.EnvName, Usage: "Environment name"}
+	EnvPoolsize           = Flag{Type: Int, Name: flagkey.EnvPoolsize, Usage: "Size of the pool", DefaultInt: 3}
+	EnvImage              = Flag{Type: String, Name: flagkey.EnvImage, Usage: "Environment image URL"}
+	EnvBuilderImage       = Flag{Type: String, Name: flagkey.EnvBuilderImage, Usage: "Environment builder image URL"}
+	EnvBuildCmd           = Flag{Type: String, Name: flagkey.EnvBuildcommand, Usage: "Build command for environment builder to build source package"}
+	EnvBuilderIdleTimeout = Flag{Type: Int64, Name: flagkey.EnvBuilderIdleTimeout, Usage: "The length of time (in seconds) that a builder is idle before it is scaled to zero; 0 disables scale-to-zero (defaults to 600 if unset)"}
+	EnvBuilderPoolsize    = Flag{Type: Int, Name: flagkey.EnvBuilderPoolsize, Usage: "Number of builder pod replicas for concurrent package builds (defaults to 1 if unset)"}
+	EnvKeepArchive        = Flag{Type: Bool, Name: flagkey.EnvKeeparchive, Usage: "Keep the archive instead of extracting it into a directory (mainly for the JVM environment because .jar is one kind of zip archive)"}
+	EnvExternalNetwork    = Flag{Type: Bool, Name: flagkey.EnvExternalNetwork, Usage: "Allow pod to access external network (only works when istio feature is enabled)"}
+	// 90 matches the CRD default (pkg/apis/core/v1/types.go): a terminating
+	// pod serves through the WHOLE grace window before being killed, so this
+	// is per-pod teardown latency — 90s covers the 60s default function
+	// timeout plus endpoint propagation, where the old 360 made every reap,
+	// roll, and upgrade linger six minutes per pod.
+	EnvTerminationGracePeriod = Flag{Type: Int64, Name: flagkey.EnvGracePeriod, Aliases: []string{"period"}, Usage: "Grace time (in seconds) for pod to perform connection draining before termination (only non-negative values considered)", DefaultInt64: 90}
+	EnvVersion                = Flag{Type: Int, Name: flagkey.EnvVersion, Usage: "Environment API version (1 means v1 interface)", DefaultInt: 3}
 	EnvImagePullSecret        = Flag{Type: String, Name: flagkey.EnvImagePullSecret, Usage: "Secret for Kubernetes to pull an image from a private registry"}
 	EnvExecutorType           = Flag{Type: String, Name: flagkey.EnvExecutorType, Usage: "Executor type of pod in environment; one of 'poolmgr', 'newdeploy', 'container'"}
-	EnvForce                  = Flag{Type: Bool, Name: flagkey.EnvForce, Short: "f", Usage: "Force delete env even if one or more functions exist", DefaultValue: false}
+	EnvForce                  = Flag{Type: Bool, Name: flagkey.EnvForce, Short: "f", Usage: "Force delete env even if one or more functions exist", DefaultBool: false}
 	EnvBuilder                = Flag{Type: StringSlice, Name: flagkey.EnvBuilder, Usage: "Environment variable to be set in the builder container"}
 	EnvRuntime                = Flag{Type: StringSlice, Name: flagkey.EnvRuntime, Usage: "Environment variable to be set in the runtime container"}
+	EnvRuntimeClass           = Flag{Type: String, Name: flagkey.EnvRuntimeClass, Aliases: []string{"runtime-class"}, Usage: "RuntimeClass (e.g. gvisor, kata) for this environment's runtime and builder pods; does not apply to container-image functions"}
 
 	KwName      = Flag{Type: String, Name: flagkey.KwName, Usage: "Watch name"}
 	KwFnName    = Flag{Type: String, Name: flagkey.KwFnName, Usage: "Function name"}
 	KwNamespace = Flag{Type: String, Name: flagkey.KwNamespace, Aliases: []string{"ns"}, Usage: "Namespace of resource to watch"}
-	KwObjType   = Flag{Type: String, Name: flagkey.KwObjType, Usage: "Type of resource to watch (Pod, Service, etc.)", DefaultValue: "pod"}
+	KwObjType   = Flag{Type: String, Name: flagkey.KwObjType, Usage: "Type of resource to watch (Pod, Service, etc.)", DefaultString: "pod"}
 	KwLabels    = Flag{Type: String, Name: flagkey.KwLabels, Usage: "Label selector of the form a=b,c=d"}
 
 	PkgName           = Flag{Type: String, Name: flagkey.PkgName, Usage: "Package name"}
@@ -220,8 +387,17 @@ var (
 	PkgDeployChecksum = Flag{Type: String, Name: flagkey.PkgDeployChecksum, Usage: "SHA256 checksum of deploy archive when providing URL"}
 	PkgSrcArchive     = Flag{Type: StringSlice, Name: flagkey.PkgSrcArchive, Aliases: []string{"source", "src"}, Usage: "URL or local paths for source archive"}
 	PkgSrcChecksum    = Flag{Type: String, Name: flagkey.PkgSrcChecksum, Usage: "SHA256 checksum of source archive when providing URL"}
+	PkgSrcSecret      = Flag{Type: String, Name: flagkey.PkgSrcSecret, Usage: "Name of a Secret with credentials for fetching the source archive URL (keys: username+password, token, or headers); checksum generation is skipped — pass --srcchecksum to pin one"}
+	PkgDeploySecret   = Flag{Type: String, Name: flagkey.PkgDeploySecret, Usage: "Name of a Secret with credentials for fetching the deploy archive URL (keys: username+password, token, or headers); checksum generation is skipped — pass --deploychecksum to pin one"}
 	PkgInsecure       = Flag{Type: Bool, Name: flagkey.PkgInsecure, Usage: "Skip generating SHA256 checksum for file integrity validation"}
 	PkgOCI            = Flag{Type: String, Name: flagkey.PkgOCI, Usage: "Pre-built OCI image reference containing the deployment code (registry/repo:tag[@digest])"}
+	PkgSrcOCI         = Flag{Type: String, Name: flagkey.PkgSrcOCI, Usage: "OCI image reference containing the SOURCE tree (registry/repo:tag[@digest]); the environment's builder pulls and builds it"}
+	PkgWatch          = Flag{Type: Bool, Name: flagkey.PkgWatch, Short: "w", Aliases: []string{"follow"}, Usage: "Wait for the package build to finish, streaming builder logs while it runs; exits non-zero if the build fails"}
+	// PkgWatchTimeout shares --timeout's key but defaults to 0 (wait
+	// indefinitely, like `kubectl logs -f`) instead of WaitTimeout's 60s —
+	// a build has no natural upper bound. Never list it in the same
+	// command's flag set as WaitTimeout: they register the same pflag name.
+	PkgWatchTimeout = Flag{Type: Duration, Name: flagkey.WaitTimeout, DefaultDuration: time.Duration(0), Usage: "Maximum time to wait for the build with --watch; 0 waits indefinitely"}
 
 	SpecSave             = Flag{Type: Bool, Name: flagkey.SpecSave, Usage: "Save to the spec directory instead of creating on cluster"}
 	SpecDir              = Flag{Type: String, Name: flagkey.SpecDir, Usage: "Directory to store specs, defaults to ./specs"}
@@ -235,24 +411,47 @@ var (
 	SpecValidation       = Flag{Type: String, Name: flagkey.SpecValidate, Usage: "Turns server side validations of Fission objects on/off"}
 	SpecIgnore           = Flag{Type: String, Name: flagkey.SpecIgnore, Usage: fmt.Sprintf("File containing specs to be ignored inside --specdir, defaults to %v", util.SPEC_IGNORE_FILE)}
 	SpecApplyCommitLabel = Flag{Type: Bool, Name: flagkey.SpecApplyCommitLabel, Usage: "Apply commit label to the resources"}
-	SpecAllowConflicts   = Flag{Type: Bool, Name: flagkey.SpecAllowConflicts, Usage: "If true, spec apply will be forced even if conflicting resources exist", DefaultValue: false}
+	SpecAllowConflicts   = Flag{Type: Bool, Name: flagkey.SpecAllowConflicts, Usage: "If true, spec apply will be forced even if conflicting resources exist", DefaultBool: false}
 
-	SupportOutput = Flag{Type: String, Name: flagkey.SupportOutput, Short: "o", Usage: "Output directory to save dump archive/files", DefaultValue: flagkey.DefaultSpecOutputDir}
+	SupportOutput = Flag{Type: String, Name: flagkey.SupportOutput, Short: "o", Usage: "Output directory to save dump archive/files", DefaultString: flagkey.DefaultSpecOutputDir}
 	SupportNoZip  = Flag{Type: Bool, Name: flagkey.SupportNoZip, Usage: "Save dump information into multiple files instead of single zip file"}
 
 	CanaryName              = Flag{Type: String, Name: flagkey.CanaryName, Usage: "Name for the canary config"}
 	CanaryTriggerName       = Flag{Type: String, Name: flagkey.CanaryHTTPTriggerName, Usage: "Http trigger that this config references"}
 	CanaryNewFunc           = Flag{Type: String, Name: flagkey.CanaryNewFunc, Aliases: []string{"newfn"}, Usage: "New version of the function"}
 	CanaryOldFunc           = Flag{Type: String, Name: flagkey.CanaryOldFunc, Aliases: []string{"oldfn"}, Usage: "Old stable version of the function"}
-	CanaryWeightIncrement   = Flag{Type: Int, Name: flagkey.CanaryWeightIncrement, Aliases: []string{"step"}, Usage: "Weight increment step for function", DefaultValue: 20}
-	CanaryIncrementInterval = Flag{Type: String, Name: flagkey.CanaryIncrementInterval, Aliases: []string{"internal"}, Usage: "Weight increment interval, string representation of time.Duration, ex : 1m, 2h, 2d", DefaultValue: "2m"}
-	CanaryFailureThreshold  = Flag{Type: Int, Name: flagkey.CanaryFailureThreshold, Aliases: []string{"threshold"}, Usage: "Threshold in percentage beyond which the new version of the function is considered unstable", DefaultValue: 10}
+	CanaryWeightIncrement   = Flag{Type: Int, Name: flagkey.CanaryWeightIncrement, Aliases: []string{"step"}, Usage: "Weight increment step for function", DefaultInt: 20}
+	CanaryIncrementInterval = Flag{Type: String, Name: flagkey.CanaryIncrementInterval, Aliases: []string{"internal"}, Usage: "Weight increment interval, string representation of time.Duration, ex : 1m, 2h, 2d", DefaultString: "2m"}
+	CanaryFailureThreshold  = Flag{Type: Int, Name: flagkey.CanaryFailureThreshold, Aliases: []string{"threshold"}, Usage: "Threshold in percentage beyond which the new version of the function is considered unstable", DefaultInt: 10}
 
 	ArchiveName   = Flag{Type: String, Name: flagkey.ArchiveName, Usage: "Name of the archive file"}
 	ArchiveID     = Flag{Type: String, Name: flagkey.ArchiveID, Usage: "Id for the archive file"}
-	ArchiveOutput = Flag{Type: String, Name: flagkey.ArchiveOutput, Usage: "Download file with this name", Aliases: []string{"o"}, DefaultValue: ""}
+	ArchiveOutput = Flag{Type: String, Name: flagkey.ArchiveOutput, Usage: "Download file with this name", Aliases: []string{"o"}, DefaultString: ""}
 
 	TenantFunctionNamespace = Flag{Type: String, Name: flagkey.TenantFunctionNamespace, Usage: "Namespace where this tenant's function pods run (defaults to the tenant namespace)"}
 	TenantBuilderNamespace  = Flag{Type: String, Name: flagkey.TenantBuilderNamespace, Usage: "Namespace where this tenant's builder pods run (defaults to the tenant namespace)"}
-	TenantForce             = Flag{Type: Bool, Name: flagkey.TenantForce, Usage: "Disable the tenant even if it still has functions/triggers (they will stop being served)", DefaultValue: false}
+	TenantForce             = Flag{Type: Bool, Name: flagkey.TenantForce, Usage: "Disable the tenant even if it still has functions/triggers (they will stop being served)", DefaultBool: false}
+
+	// RFC-0025 `fission fn publish`.
+	PublishDescription = Flag{Type: String, Name: flagkey.PublishDescription, Usage: "Human-readable description recorded on the minted FunctionVersion"}
+	PublishWait        = Flag{Type: Bool, Name: flagkey.PublishWait, Usage: "Wait for the function's referenced package build to finish before publishing (see --timeout)"}
+
+	// RFC-0025 `fission alias` (FunctionAlias) commands.
+	AliasName             = Flag{Type: String, Name: flagkey.AliasName, Usage: "Name for the function alias"}
+	AliasFunction         = Flag{Type: String, Name: flagkey.AliasFunction, Usage: "Function this alias points at"}
+	AliasVersion          = Flag{Type: String, Name: flagkey.AliasVersion, Usage: "FunctionVersion name the alias resolves to (exactly one of --version/--package-digest)"}
+	AliasPackageDigest    = Flag{Type: String, Name: flagkey.AliasPackageDigest, Usage: "Package digest (sha256:<hex>) the alias resolves to declaratively (exactly one of --version/--package-digest)"}
+	AliasWeight           = Flag{Type: Int, Name: flagkey.AliasWeight, Usage: "Percentage (0-100) of traffic served by the primary target; the remainder goes to --secondary-version. Requires --secondary-version; omit --weight entirely for 100% to the primary"}
+	AliasSecondaryVersion = Flag{Type: String, Name: flagkey.AliasSecondaryVersion, Usage: "Secondary FunctionVersion name receiving the 100-minus-weight remainder of traffic"}
+	AliasClearWeight      = Flag{Type: Bool, Name: flagkey.AliasClearWeight, Usage: "Clear the weighted split (drop --weight and --secondary-version)"}
+	AliasWait             = Flag{Type: Bool, Name: flagkey.AliasWait, Usage: "Wait for the alias to resolve to its updated target (see --timeout)"}
+
+	// RFC-0025 `fission fn rollback`.
+	FnRollbackAlias  = Flag{Type: String, Name: flagkey.FnRollbackAlias, Usage: "FunctionAlias to roll back"}
+	FnRollbackTo     = Flag{Type: String, Name: flagkey.FnRollbackTo, Usage: "Explicit FunctionVersion name to roll back to (default: the alias's previous target, Status.History's last entry)"}
+	FnRollbackDetach = Flag{Type: Bool, Name: flagkey.FnRollbackDetach, Usage: "Strip `fission spec` (Git) ownership annotations from the alias so a future `spec apply` does not revert the rollback"}
+	FnRollbackWait   = Flag{Type: Bool, Name: flagkey.FnRollbackWait, Usage: "Wait for the alias to resolve to the rollback target (see --timeout)"}
+
+	// RFC-0025 `fission fn gc-versions`.
+	GCVersionsKeep = Flag{Type: Int, Name: flagkey.GCVersionsKeep, Usage: "Override the retain count for this sweep (default: the function's Spec.Versioning.Retain, or 10)"}
 )

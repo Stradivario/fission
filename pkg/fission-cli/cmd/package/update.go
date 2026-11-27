@@ -11,6 +11,7 @@ import (
 
 	"errors"
 
+	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 
@@ -81,6 +82,28 @@ func (opts *UpdateSubCommand) run(input cli.Input) error {
 		}
 	}
 
+	if input.Bool(flagkey.PkgWatch) {
+		// UpdatePackage sets BuildStatusPending synchronously (via
+		// UpdateStatus, which also stamps LastUpdateTimestamp) whenever the
+		// update triggers a rebuild. A fresh read that is still non-terminal
+		// obviously needs watching; a fresh read that is ALREADY terminal is
+		// only "nothing to watch" when the status timestamp did not move —
+		// an advanced timestamp means this update did trigger a build and
+		// buildermgr merely finished (or failed) it before our read, so the
+		// watch must still run to report the outcome and set the exit code.
+		fresh, err := opts.Client().FissionClientSet.CoreV1().Packages(opts.pkgNamespace).Get(input.Context(), newPkgMeta.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("error getting package after update: %w", err)
+		}
+		buildTriggered := IsBuildInFlight(fresh.Status.BuildStatus) ||
+			!fresh.Status.LastUpdateTimestamp.Equal(&pkg.Status.LastUpdateTimestamp)
+		if !buildTriggered {
+			fmt.Fprintf(input.Stdout(), "Update of package '%v' did not trigger a build; nothing to watch\n", fresh.Name)
+			return nil
+		}
+		return WatchPackageBuild(input, opts.Client(), fresh.Namespace, fresh.Name)
+	}
+
 	return nil
 }
 
@@ -92,6 +115,8 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 	insecure := input.Bool(flagkey.PkgInsecure)
 	deployChecksum := input.String(flagkey.PkgDeployChecksum)
 	srcChecksum := input.String(flagkey.PkgSrcChecksum)
+	deploySecret := input.String(flagkey.PkgDeploySecret)
+	srcSecret := input.String(flagkey.PkgSrcSecret)
 	code := input.String(flagkey.PkgCode)
 
 	noZip := false
@@ -112,13 +137,47 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 		needToUpdate = true
 	}
 
+	if input.IsSet(flagkey.PkgSrcOCI) {
+		if input.IsSet(flagkey.PkgCode) || input.IsSet(flagkey.PkgSrcArchive) || input.IsSet(flagkey.PkgOCI) {
+			return nil, fmt.Errorf("--%v cannot be combined with --%v, --%v, or --%v", flagkey.PkgSrcOCI, flagkey.PkgCode, flagkey.PkgSrcArchive, flagkey.PkgOCI)
+		}
+		// Replace the source archive wholesale (RFC-0031 phase 2): an OCI
+		// source carries no literal, URL, checksum, or SecretRef.
+		image, digest := splitImageDigest(input.String(flagkey.PkgSrcOCI))
+		pkg.Spec.Source = fv1.Archive{
+			Type: fv1.ArchiveTypeOCI,
+			OCI:  &fv1.OCIArchive{Image: image, Digest: digest},
+		}
+		needToRebuild = true
+		needToUpdate = true
+	}
+
 	if input.IsSet(flagkey.PkgCode) {
 		deployArchiveFiles = append(deployArchiveFiles, code)
 		noZip = true
 		needToUpdate = true
 	}
 
-	if input.IsSet(flagkey.PkgEnvironment) {
+	if input.IsSet(flagkey.PkgEnvironment) && envName != pkg.Spec.Environment.Name {
+		// `--env` is set unconditionally by every `fission function update`
+		// call (see cmd/function/update.go), whether or not the environment
+		// is actually changing — that command has its own guard for this
+		// exact case ("if the new env specified is the same as the old one,
+		// no need to update package"), but that guard only affects its own
+		// local Function.Spec assignment; it passes the raw, unmodified
+		// input straight into this function, which re-reads the same --env
+		// flag independently and — before this check — only tested whether
+		// the flag was *provided*, not whether the value differed from the
+		// package's current one. That meant EVERY `function update` call
+		// force-rebuilt the referenced package (needToRebuild=true) even
+		// when reusing an already-built package unchanged, which — because
+		// the rebuild's completion re-triggers the Function's own
+		// packageRef.resourceVersion correction in buildermgr's
+		// package_reconciler.go — produced a second, real rollout on every
+		// single function update. Comparing against the current value here
+		// (mirroring cmd/function/update.go's own pattern) closes that gap
+		// at its actual source instead of leaving every caller to work
+		// around it.
 		pkg.Spec.Environment.Name = envName
 		needToRebuild = true
 		needToUpdate = true
@@ -131,11 +190,40 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 	}
 
 	if input.IsSet(flagkey.PkgSrcArchive) {
-		srcArchive, err := CreateArchive(client, input, srcArchiveFiles, noZip, insecure, srcChecksum, "", "", pkg.Namespace)
+		if srcSecret != "" {
+			if err := secretFlagRequiresURL(flagkey.PkgSrcSecret, flagkey.PkgSrcArchive, srcArchiveFiles); err != nil {
+				return nil, err
+			}
+		}
+		srcArchive, err := CreateArchive(client, input, srcArchiveFiles, noZip, insecure || srcSecret != "", srcChecksum, "", "", pkg.Namespace)
 		if err != nil {
 			return nil, fmt.Errorf("error creating source archive: %w", err)
 		}
+		if srcSecret != "" {
+			attachArchiveSecret(srcArchive, srcSecret, srcChecksum)
+		}
 		pkg.Spec.Source = *srcArchive
+		needToRebuild = true
+		needToUpdate = true
+	} else if input.IsSet(flagkey.PkgSrcSecret) {
+		// Attach, rotate, or (with an empty value) detach the credential on
+		// the existing url source archive without re-specifying it. A
+		// checksum passed in the same command is applied too (the else-if
+		// with PkgSrcChecksum below would otherwise be shadowed).
+		if pkg.Spec.Source.URL == "" {
+			return nil, fmt.Errorf("--%v: package has no url source archive to attach credentials to", flagkey.PkgSrcSecret)
+		}
+		if srcSecret == "" {
+			pkg.Spec.Source.SecretRef = nil
+		} else {
+			pkg.Spec.Source.SecretRef = &apiv1.LocalObjectReference{Name: srcSecret}
+		}
+		if input.IsSet(flagkey.PkgSrcChecksum) {
+			pkg.Spec.Source.Checksum = fv1.Checksum{Type: fv1.ChecksumTypeSHA256, Sum: srcChecksum}
+		}
+		// Rotating the source credential is the documented way to fix a build
+		// that failed on a 401: re-queue it, since SecretRef is (by design)
+		// excluded from the content hash so nothing else would.
 		needToRebuild = true
 		needToUpdate = true
 	} else if input.IsSet(flagkey.PkgSrcChecksum) {
@@ -147,14 +235,39 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 	}
 
 	if input.IsSet(flagkey.PkgDeployArchive) || input.IsSet(flagkey.PkgCode) {
-		deployArchive, err := CreateArchive(client, input, deployArchiveFiles, noZip, insecure, deployChecksum, "", "", pkg.Namespace)
+		if deploySecret != "" {
+			if err := secretFlagRequiresURL(flagkey.PkgDeploySecret, flagkey.PkgDeployArchive, deployArchiveFiles); err != nil {
+				return nil, err
+			}
+		}
+		deployArchive, err := CreateArchive(client, input, deployArchiveFiles, noZip, insecure || deploySecret != "", deployChecksum, "", "", pkg.Namespace)
 		if err != nil {
 			return nil, fmt.Errorf("error creating deploy archive: %w", err)
+		}
+		if deploySecret != "" {
+			attachArchiveSecret(deployArchive, deploySecret, deployChecksum)
 		}
 		pkg.Spec.Deployment = *deployArchive
 		// Users may update the env, envNS and deploy archive at the same time,
 		// but without the source archive. In this case, we should set needToBuild to false
 		needToRebuild = false
+		needToUpdate = true
+	} else if input.IsSet(flagkey.PkgDeploySecret) {
+		// Attach, rotate, or (with an empty value) detach the credential on
+		// the existing url deploy archive without re-specifying it. A
+		// checksum passed in the same command is applied too (the else-if
+		// with PkgDeployChecksum below would otherwise be shadowed).
+		if pkg.Spec.Deployment.URL == "" {
+			return nil, fmt.Errorf("--%v: package has no url deploy archive to attach credentials to", flagkey.PkgDeploySecret)
+		}
+		if deploySecret == "" {
+			pkg.Spec.Deployment.SecretRef = nil
+		} else {
+			pkg.Spec.Deployment.SecretRef = &apiv1.LocalObjectReference{Name: deploySecret}
+		}
+		if input.IsSet(flagkey.PkgDeployChecksum) {
+			pkg.Spec.Deployment.Checksum = fv1.Checksum{Type: fv1.ChecksumTypeSHA256, Sum: deployChecksum}
+		}
 		needToUpdate = true
 	} else if input.IsSet(flagkey.PkgDeployChecksum) {
 		pkg.Spec.Deployment.Checksum = fv1.Checksum{
@@ -165,6 +278,12 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 	}
 
 	if !needToUpdate {
+		// NOTE: this returns the CALLER'S OWN ObjectMeta, unchanged — nothing
+		// was written, so there is no new ResourceVersion to report. Callers
+		// must not treat "returned meta == passed-in meta" as "nothing to do":
+		// `fn update --pkg <other-package>` lands here (it re-points a function
+		// at a package it does not modify) and still has to re-stamp the
+		// function's PackageRef, or the function keeps serving the old package.
 		return &pkg.ObjectMeta, nil
 	}
 
@@ -184,14 +303,12 @@ func UpdatePackage(input cli.Input, client cmd.Client, specFile string, pkg *fv1
 			return nil, fmt.Errorf("error reading specs: %w", err)
 		}
 
-		obj := fr.SpecExists(pkg, true, true)
-		if obj != nil {
-			pkg := obj.(*fv1.Package)
-			fmt.Printf("Re-using previously created package %s\n", pkg.Name)
-			return &pkg.ObjectMeta, nil
+		if existing := fr.PackageInSpecs(pkg, true, true); existing != nil {
+			fmt.Printf("Re-using previously created package %s\n", existing.Name)
+			return &existing.ObjectMeta, nil
 		}
 
-		err = spec.SpecSave(*pkg, specFile, true)
+		err = spec.SpecSave(pkg, specFile, true)
 		if err != nil {
 			return nil, fmt.Errorf("error saving package spec: %w", err)
 		}

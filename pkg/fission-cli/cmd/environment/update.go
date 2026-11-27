@@ -73,7 +73,7 @@ func (opts *UpdateSubCommand) run(input cli.Input) error {
 		}
 
 		specFile := fmt.Sprintf("env-%s.yaml", m.Name)
-		err = spec.SpecSave(*opts.env, specFile, true)
+		err = spec.SpecSave(opts.env, specFile, true)
 		if err != nil {
 			return fmt.Errorf("error saving environment spec: %w", err)
 		}
@@ -117,6 +117,16 @@ func updateExistingEnvironmentWithCmd(env *fv1.Environment, input cli.Input) (*f
 		env.Spec.Builder.Command = input.String(flagkey.EnvBuildcommand)
 	}
 
+	if input.IsSet(flagkey.EnvBuilderIdleTimeout) {
+		v := input.Int64(flagkey.EnvBuilderIdleTimeout)
+		env.Spec.Builder.IdleTimeout = &v
+	}
+
+	if input.IsSet(flagkey.EnvBuilderPoolsize) {
+		v := int32(input.Int(flagkey.EnvBuilderPoolsize))
+		env.Spec.Builder.PoolSize = &v
+	}
+
 	if env.Spec.Version == 1 && (len(env.Spec.Builder.Image) > 0 || len(env.Spec.Builder.Command) > 0) {
 		errs = errors.Join(errs, errors.New("version 1 Environments do not support builders. Must specify --version=2"))
 	}
@@ -132,7 +142,7 @@ func updateExistingEnvironmentWithCmd(env *fv1.Environment, input cli.Input) (*f
 	}
 
 	if input.IsSet(flagkey.EnvGracePeriod) {
-		env.Spec.TerminationGracePeriod = input.Int64(flagkey.EnvGracePeriod)
+		env.Spec.TerminationGracePeriod = new(input.Int64(flagkey.EnvGracePeriod))
 	}
 
 	if input.IsSet(flagkey.EnvKeeparchive) {
@@ -141,6 +151,15 @@ func updateExistingEnvironmentWithCmd(env *fv1.Environment, input cli.Input) (*f
 
 	if input.IsSet(flagkey.EnvImagePullSecret) {
 		env.Spec.ImagePullSecret = input.String(flagkey.EnvImagePullSecret)
+	}
+
+	if input.IsSet(flagkey.EnvRuntimeClass) {
+		rc := input.String(flagkey.EnvRuntimeClass)
+		if rc == "" {
+			env.Spec.RuntimeClassName = nil
+		} else {
+			env.Spec.RuntimeClassName = &rc
+		}
 	}
 
 	env.Spec.Resources.Requests = make(v1.ResourceList)
