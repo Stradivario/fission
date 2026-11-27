@@ -718,3 +718,64 @@ func TestGetDeploymentSpecNonOCIUnchanged(t *testing.T) {
 	}
 	assert.Empty(t, dep.Spec.Template.Spec.ImagePullSecrets)
 }
+
+// TestGetDeploymentSpecDrainUntilIdle: an Environment with the drain-path
+// annotation gets an HTTP preStop on the runtime container and a pod grace
+// of functionTimeout + 10 s, while the fetcher keeps sleeping only the
+// environment's window (so an idle pod still stops quickly). Without the
+// annotation everything stays as before.
+func TestGetDeploymentSpecDrainUntilIdle(t *testing.T) {
+	build := func(t *testing.T, annotate bool) *apiv1.PodSpec {
+		deploy := newTestNewDeploy(t)
+		env := newTestNewDeployEnv()
+		window := int64(15)
+		env.Spec.TerminationGracePeriod = &window
+		if annotate {
+			env.Annotations = map[string]string{utils.DrainPathAnnotation: "/__drain"}
+		}
+		fn := newTestNewDeployFunction()
+		fn.Spec.FunctionTimeout = 300
+		replicas := int32(1)
+		deployment, err := deploy.getDeploymentSpec(
+			t.Context(), fn, env, &replicas,
+			"newdeploy-test-fn", "default",
+			map[string]string{"app": "newdeploy-test"}, map[string]string{},
+		)
+		require.NoError(t, err)
+		return &deployment.Spec.Template.Spec
+	}
+	runtimeOf := func(spec *apiv1.PodSpec, env string) *apiv1.Container {
+		for i := range spec.Containers {
+			if spec.Containers[i].Name == env {
+				return &spec.Containers[i]
+			}
+		}
+		return nil
+	}
+	envName := newTestNewDeployEnv().Name
+
+	t.Run("opted in", func(t *testing.T) {
+		spec := build(t, true)
+		require.NotNil(t, spec.TerminationGracePeriodSeconds)
+		assert.Equal(t, int64(310), *spec.TerminationGracePeriodSeconds)
+		rt := runtimeOf(spec, envName)
+		require.NotNil(t, rt)
+		require.NotNil(t, rt.Lifecycle.PreStop.HTTPGet)
+		assert.Equal(t, "/__drain", rt.Lifecycle.PreStop.HTTPGet.Path)
+		for _, c := range spec.Containers {
+			if c.Name != envName && c.Lifecycle != nil && c.Lifecycle.PreStop.Sleep != nil {
+				assert.Equal(t, int64(15), c.Lifecycle.PreStop.Sleep.Seconds,
+					"the fetcher sleeps only the environment's window")
+			}
+		}
+	})
+
+	t.Run("not opted in: today's sleep and grace", func(t *testing.T) {
+		spec := build(t, false)
+		assert.Equal(t, int64(15), *spec.TerminationGracePeriodSeconds)
+		rt := runtimeOf(spec, envName)
+		require.NotNil(t, rt)
+		require.NotNil(t, rt.Lifecycle.PreStop.Sleep)
+		assert.Equal(t, int64(15), rt.Lifecycle.PreStop.Sleep.Seconds)
+	})
+}

@@ -132,8 +132,11 @@ func (gp *GenericPool) genDeploymentSpec(env *fv1.Environment) (*appsv1.Deployme
 		// before its function is known; the fetcher writes the token file at
 		// specialize time (FISSION_STATE_TOKEN_PATH points the SDK at it).
 		Env: util.StateAPIEnvVars(gp.fetcherConfig.SharedMountPath()),
-		// Connection-draining preStop hook; see utils.DrainLifecycle.
-		Lifecycle: utils.DrainLifecycle(gracePeriodSeconds),
+		// Connection-draining preStop hook: drain until idle when the
+		// Environment opts in (utils.DrainPathAnnotation), else the sleep.
+		// Pool pods keep the environment's grace (the idle reaper only reaps
+		// idle pods; a busy one finishes within the window).
+		Lifecycle: utils.RuntimeLifecycle(gracePeriodSeconds, utils.RuntimeDrainPath(env.Annotations), svcinfo.PortEnvRuntime),
 		// https://istio.io/docs/setup/kubernetes/additional-setup/requirements/
 		Ports: []apiv1.ContainerPort{
 			{

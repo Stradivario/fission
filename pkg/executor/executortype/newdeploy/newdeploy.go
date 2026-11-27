@@ -210,8 +210,9 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		Image:                  env.Spec.Runtime.Image,
 		ImagePullPolicy:        deploy.runtimeImagePullPolicy,
 		TerminationMessagePath: "/dev/termination-log",
-		// Connection-draining preStop hook; see utils.DrainLifecycle.
-		Lifecycle: utils.DrainLifecycle(gracePeriodSeconds),
+		// Connection-draining preStop hook: drain until idle when the
+		// Environment opts in (utils.DrainPathAnnotation), else the sleep.
+		Lifecycle: utils.RuntimeLifecycle(gracePeriodSeconds, utils.RuntimeDrainPath(env.Annotations), svcinfo.PortEnvRuntime),
 		Env:       platformEnv,
 		// https://istio.io/docs/setup/kubernetes/additional-setup/requirements/
 		Ports: []apiv1.ContainerPort{
@@ -340,6 +341,19 @@ func (deploy *NewDeploy) getDeploymentSpec(ctx context.Context, fn *fv1.Function
 		// would otherwise re-enable the kubelet auto-mount on the user
 		// container. See GHSA-85g2-pmrx-r49q.
 		deployment.Spec.Template.Spec.AutomountServiceAccountToken = new(false)
+	}
+
+	// Drain until idle: the pod may live until a request that started just
+	// before termination finishes (function timeout + 10 s). Set AFTER the
+	// fetcher was added, so the fetcher's own preStop keeps sleeping only
+	// the environment's window and an idle pod still stops quickly.
+	if utils.RuntimeDrainPath(env.Annotations) != "" {
+		current := gracePeriodSeconds
+		if g := deployment.Spec.Template.Spec.TerminationGracePeriodSeconds; g != nil {
+			current = *g
+		}
+		drainGrace := utils.DrainGrace(current, fn.Spec.FunctionTimeout)
+		deployment.Spec.Template.Spec.TerminationGracePeriodSeconds = &drainGrace
 	}
 
 	// Fill-if-nil: applies env.Spec.RuntimeClassName only when the merge
